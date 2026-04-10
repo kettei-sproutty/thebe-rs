@@ -9,6 +9,9 @@ html {
 }
 
 body {
+  height: 100dvh;;
   margin: 0;
   padding: 0;
+  color: white;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
 }

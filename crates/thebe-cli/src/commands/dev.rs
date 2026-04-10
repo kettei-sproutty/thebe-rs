@@ -1,4 +1,5 @@
 use anyhow::Context;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -34,6 +35,9 @@ pub fn run(watch: bool) -> anyhow::Result<()> {
 
 /// Re-run codegen for every `.trs` file and write `__thebe_routes.rs`.
 fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow::Result<()> {
+  // Parse all `_layout.trs` files first so each route can find its wrapper.
+  let layouts = collect_layouts(routes_dir)?;
+
   let trs_files = collect_trs_files(routes_dir)?;
   anyhow::ensure!(
     !trs_files.is_empty(),
@@ -52,7 +56,11 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
     let route_path = file_to_route_path(trs_path, routes_dir);
     let mod_name = file_to_mod_name(trs_path, routes_dir);
 
-    let generated = thebe_codegen::generate_route(&blocks, &route_path)
+    // Find the nearest `_layout.trs` ancestor for this route.
+    let layout_arg = find_layout(&layouts, trs_path, routes_dir)
+      .map(|(blocks, scope_path)| (blocks, scope_path.as_str()));
+
+    let generated = thebe_codegen::generate_route(&blocks, &route_path, layout_arg)
       .with_context(|| format!("codegen error for {}", trs_path.display()))?;
 
     let rs_path = trs_path.with_extension("rs");
@@ -203,17 +211,99 @@ fn find_project_root() -> anyhow::Result<PathBuf> {
   }
 }
 
-/// Recursively collect `.trs` files from `dir`.
+/// Recursively collect `.trs` route files from `dir`, **excluding** any file
+/// whose stem is `_layout` (those are collected separately by [`collect_layouts`]).
 fn collect_trs_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
   let mut files = Vec::new();
   for entry in WalkDir::new(dir).min_depth(1) {
     let entry = entry.context("failed to read directory entry")?;
     if entry.file_type().is_file() && entry.path().extension().is_some_and(|e| e == "trs") {
-      files.push(entry.into_path());
+      let stem = entry
+        .path()
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+      if stem != "_layout" {
+        files.push(entry.into_path());
+      }
     }
   }
   files.sort();
   Ok(files)
+}
+
+/// Walk `routes_dir` and parse every `_layout.trs` file found.
+///
+/// Returns a map from **directory path** → (parsed `SfcBlocks`, scope path
+/// string).  The scope path is the layout file's path relative to `routes_dir`
+/// (without the `.trs` extension), used as the CSS scope identifier.
+fn collect_layouts(
+  routes_dir: &Path,
+) -> anyhow::Result<HashMap<PathBuf, (thebe_parser::SfcBlocks, String)>> {
+  let mut map = HashMap::new();
+  for entry in WalkDir::new(routes_dir).min_depth(1) {
+    let entry = entry.context("failed to read directory entry")?;
+    if entry.file_type().is_file()
+      && entry.path().extension().is_some_and(|e| e == "trs")
+      && entry
+        .path()
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        == "_layout"
+    {
+      let layout_path = entry.into_path();
+      let source = std::fs::read_to_string(&layout_path)
+        .with_context(|| format!("failed to read {}", layout_path.display()))?;
+      let blocks = thebe_parser::parse_sfc(&source)
+        .with_context(|| format!("parse error in {}", layout_path.display()))?;
+
+      // Derive a stable scope path: relative to routes_dir, no extension.
+      let rel = layout_path
+        .strip_prefix(routes_dir)
+        .unwrap_or(&layout_path);
+      let scope_path = rel
+        .with_extension("")
+        .to_string_lossy()
+        .replace('\\', "/");
+
+      // Key by the directory that contains the layout file.
+      let dir = layout_path
+        .parent()
+        .unwrap_or(routes_dir)
+        .to_path_buf();
+      map.insert(dir, (blocks, scope_path));
+
+      println!("thebe: found layout {}", layout_path.display());
+    }
+  }
+  Ok(map)
+}
+
+/// Find the nearest `_layout.trs` that applies to `route_file`.
+///
+/// Walks up from the route file's directory towards (and including) `routes_dir`
+/// and returns a reference to the first layout found, or `None`.
+fn find_layout<'a>(
+  layouts: &'a HashMap<PathBuf, (thebe_parser::SfcBlocks, String)>,
+  route_file: &Path,
+  routes_dir: &Path,
+) -> Option<(&'a thebe_parser::SfcBlocks, &'a String)> {
+  let mut dir = route_file.parent().unwrap_or(routes_dir).to_path_buf();
+  loop {
+    if let Some((blocks, scope)) = layouts.get(&dir) {
+      return Some((blocks, scope));
+    }
+    // Stop after checking routes_dir itself.
+    if dir == routes_dir {
+      break;
+    }
+    match dir.parent() {
+      Some(parent) => dir = parent.to_path_buf(),
+      None => break,
+    }
+  }
+  None
 }
 
 /// Derive the Axum route path from the file's position under `routes_dir`.

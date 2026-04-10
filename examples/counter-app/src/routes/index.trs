@@ -46,7 +46,6 @@ function reset() {
 }
 </script>
 
-<link rel="stylesheet" href="/global.css">
 <main>
     <h1>{{ title }}, World!</h1>
     <nav>
@@ -71,8 +70,6 @@ main {
   align-items: center;
   justify-content: center;
   font-family: system-ui, sans-serif;
-  color: white;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
 }
 
 h1 {

@@ -51,6 +51,8 @@ struct ModuleLiterals<'a> {
   runtime: &'a str,
   client_script: &'a str,
   style: &'a str,
+  /// Pre-processed layout template, or `None` when no layout wraps this route.
+  layout_template: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -80,11 +82,18 @@ pub struct RouteEntry {
 ///    and returns an `axum::response::Html<String>` with client scripts.
 /// 6. Emits `router()` that wires up the Axum route.
 ///
+/// When `layout` is `Some((layout_blocks, layout_scope_path))` the route body
+/// is wrapped inside the layout template before the full HTML shell is emitted.
+///
 /// # Errors
 ///
 /// Returns [`CodegenError`] when `<script setup>` is absent, no HTTP handler
 /// function is found, or the template contains invalid syntax.
-pub fn generate_route(blocks: &SfcBlocks, route_path: &str) -> Result<String, CodegenError> {
+pub fn generate_route(
+  blocks: &SfcBlocks,
+  route_path: &str,
+  layout: Option<(&SfcBlocks, &str)>,
+) -> Result<String, CodegenError> {
   let setup = blocks
     .script_setup
     .as_deref()
@@ -144,11 +153,38 @@ pub fn generate_route(blocks: &SfcBlocks, route_path: &str) -> Result<String, Co
   let runtime_literal = escape_rust_raw_str(THEBE_CLIENT_RUNTIME);
   let client_script_literal = escape_rust_raw_str(&client_js);
 
+  // Process the optional layout.
+  let layout_processed = layout
+    .map(|(layout_blocks, layout_scope_path)| {
+      process_layout(layout_blocks, layout_scope_path)
+    })
+    .transpose()?;
+
+  // Build the final style literal and optional layout template literal.
+  // When a layout is present, layout style is prepended to the route style.
+  let (final_style_literal, layout_template_opt) = match layout_processed {
+    Some((scoped_layout_tmpl, layout_style)) => {
+      let merged_style = if layout_style.is_empty() {
+        style.clone()
+      } else if style.is_empty() {
+        layout_style
+      } else {
+        format!("{layout_style}\n{style}")
+      };
+      (
+        escape_rust_raw_str(&merged_style),
+        Some(escape_rust_raw_str(&scoped_layout_tmpl)),
+      )
+    }
+    None => (style_literal.clone(), None),
+  };
+
   let literals = ModuleLiterals {
     template: &template_literal,
     runtime: &runtime_literal,
     client_script: &client_script_literal,
-    style: &style_literal,
+    style: &final_style_literal,
+    layout_template: layout_template_opt.as_deref(),
   };
   let wrapper = WrapperSource {
     params: &wrapper_params,
@@ -177,7 +213,11 @@ fn build_route_module(
   source.push_str(setup_with_serde);
   source.push_str("\n\n");
   write_module_constants(&mut source, literals);
-  write_render_handler(&mut source, wrapper);
+  if literals.layout_template.is_some() {
+    write_render_handler_with_layout(&mut source, wrapper);
+  } else {
+    write_render_handler(&mut source, wrapper);
+  }
   write_router_fn(&mut source, handler, route_path);
   source
 }
@@ -191,12 +231,16 @@ fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
   )
   .expect("infallible");
   writeln!(source, "const __STYLE: &str = {};", literals.style).expect("infallible");
-  write!(
+  writeln!(
     source,
-    "const __CLIENT_SCRIPT: &str = {};\n\n",
+    "const __CLIENT_SCRIPT: &str = {};",
     literals.client_script
   )
   .expect("infallible");
+  if let Some(layout_tmpl) = literals.layout_template {
+    writeln!(source, "const __LAYOUT_TEMPLATE: &str = {layout_tmpl};").expect("infallible");
+  }
+  source.push('\n');
 }
 
 fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
@@ -231,6 +275,17 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
          .expect(\"template render error\")\n",
   );
   source.push_str("    };\n");
+  write_html_assembly(source);
+  source.push_str("}\n\n");
+}
+
+/// Emit the `let __props_json`, `let __html = format!(…)`, and `Html(__html)`
+/// tail that is identical in both the plain and layout render handlers.
+///
+/// Preconditions (variables that must already be in scope in the generated code):
+/// - `__ctx: serde_json::Value`
+/// - `__body: String`
+fn write_html_assembly(source: &mut String) {
   source.push_str("    let __props_json = __ctx.to_string();\n");
   source.push_str("    let __html = format!(\n");
   source.push_str(
@@ -252,6 +307,64 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
   source.push_str("        user_script = __CLIENT_SCRIPT,\n");
   source.push_str("    );\n");
   source.push_str("    axum::response::Html(__html)\n");
+}
+
+/// Like [`write_render_handler`] but renders the route body first, then wraps
+/// it inside the layout template before assembling the HTML shell.
+fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<'_>) {
+  if wrapper.params.is_empty() {
+    source.push_str("async fn __thebe_render_handler() -> axum::response::Html<String> {\n");
+  } else {
+    writeln!(
+      source,
+      "async fn __thebe_render_handler({}) -> axum::response::Html<String> {{",
+      wrapper.params
+    )
+    .expect("infallible");
+  }
+  source.push_str(wrapper.call);
+  source.push_str(
+    "    let __ctx = serde_json::to_value(&__props)\
+         .expect(\"Props serialisation error\");\n",
+  );
+  // Render the route template into a string first.
+  source.push_str("    let __route_body = {\n");
+  source.push_str("        use minijinja::Environment;\n");
+  source.push_str("        let mut env = Environment::new();\n");
+  source.push_str(
+    "        env.add_template(\"__page\", __TEMPLATE)\
+         .expect(\"template compile error\");\n",
+  );
+  source.push_str(
+    "        env.get_template(\"__page\")\
+         .expect(\"template not found\")\n",
+  );
+  source.push_str(
+    "            .render(&__ctx)\
+         .expect(\"template render error\")\n",
+  );
+  source.push_str("    };\n");
+  // Wrap the route body inside the layout template.
+  source.push_str("    let __body = {\n");
+  source.push_str("        use minijinja::Environment;\n");
+  source.push_str("        let mut env = Environment::new();\n");
+  source.push_str(
+    "        env.add_template(\"__layout\", __LAYOUT_TEMPLATE)\
+         .expect(\"layout template compile error\");\n",
+  );
+  source.push_str(
+    "        let __layout_ctx = serde_json::json!({ \"__slot\": __route_body });\n",
+  );
+  source.push_str(
+    "        env.get_template(\"__layout\")\
+         .expect(\"layout template not found\")\n",
+  );
+  source.push_str(
+    "            .render(&__layout_ctx)\
+         .expect(\"layout render error\")\n",
+  );
+  source.push_str("    };\n");
+  write_html_assembly(source);
   source.push_str("}\n\n");
 }
 
@@ -293,6 +406,49 @@ pub fn generate_routes_file(routes: &[RouteEntry]) -> String {
   source.push_str("}\n");
 
   source
+}
+
+/// Replace all `<slot />`, `<slot/>`, and `<slot></slot>` occurrences in a
+/// layout template with the minijinja binding `{{ __slot }}`.
+fn replace_slot(template: &str) -> String {
+  template
+    .replace("<slot></slot>", "{{ __slot }}")
+    .replace("<slot />", "{{ __slot }}")
+    .replace("<slot/>", "{{ __slot }}")
+}
+
+/// Process a `_layout.trs` SFC into a (scoped_template, style_string) pair
+/// ready for embedding in a generated route module.
+///
+/// The layout template has `<slot />` replaced with `{{ __slot }}` and CSS
+/// scoping applied.  Hydration markers are intentionally **not** injected
+/// since layout templates are rendered server-side only.
+///
+/// Returns `(scoped_template_text, processed_style_css)` — **not** escaped
+/// as Rust raw-string literals; the caller applies [`escape_rust_raw_str`].
+fn process_layout(
+  layout_blocks: &SfcBlocks,
+  layout_scope_path: &str,
+) -> Result<(String, String), CodegenError> {
+  // Validate the layout template (slot placeholder is a valid identifier).
+  let with_slot = replace_slot(&layout_blocks.template);
+  template::parse_template(&with_slot)?;
+
+  // Apply CSS scoping to the layout template elements.
+  let layout_scope = thebe_css::scope_id(layout_scope_path);
+  let scoped_template = thebe_css::add_scope_attrs(&with_slot, &layout_scope);
+
+  // Process the layout's optional `<style>` block.
+  let layout_style = layout_blocks
+    .style
+    .as_deref()
+    .filter(|s| !s.trim().is_empty())
+    .map(|s| thebe_css::process_style(s, &layout_scope))
+    .transpose()
+    .map_err(|e| CodegenError::CssError(e.to_string()))?
+    .unwrap_or_default();
+
+  Ok((scoped_template, layout_style))
 }
 
 /// Inject `#[derive(serde::Serialize)]` immediately before every `struct Props`
