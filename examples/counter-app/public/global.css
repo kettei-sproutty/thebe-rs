@@ -1,0 +1,14 @@
+/* global.css — loaded by <link rel="stylesheet" href="/public/global.css"> */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 16px;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+}

@@ -46,6 +46,7 @@ function reset() {
 }
 </script>
 
+<link rel="stylesheet" href="/global.css">
 <main>
     <h1>{{ title }}, World!</h1>
     <nav>

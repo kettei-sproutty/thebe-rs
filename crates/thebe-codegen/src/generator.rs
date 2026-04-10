@@ -287,6 +287,9 @@ pub fn generate_routes_file(routes: &[RouteEntry]) -> String {
   for route in routes {
     writeln!(source, "        .merge({}::router())", route.mod_name).expect("infallible");
   }
+  source.push_str(
+    "        .fallback_service(tower_http::services::ServeDir::new(\"public\"))\n",
+  );
   source.push_str("}\n");
 
   source
