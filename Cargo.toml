@@ -1,7 +1,15 @@
 [workspace]
 resolver = "3"
-members = []
-default-members = []
+members = [
+  "crates/thebe-parser",
+  "crates/thebe-codegen",
+  "crates/thebe-cli",
+]
+default-members = ["crates/thebe-cli"]
+
+[workspace.dependencies]
+thiserror = "2"
+anyhow = "1"
 
 [workspace.lints]
 clippy = { pedantic = "warn" }

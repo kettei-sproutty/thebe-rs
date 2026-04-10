@@ -1,12 +1,26 @@
 # Thebe
 
-A full-stack web framework for Rust, built on [Axum](https://github.com/tokio-rs/axum), using Single File Components (`.trs`).
+A compiler-driven, server-first web framework for Rust, built on [Axum](https://github.com/tokio-rs/axum) and centered on Single File Components (`.trs`).
 
-Write your server logic in Rust, your reactive client code in TypeScript, your styles in CSS — all in one file.
+Thebe compiles `.trs` files into standard Axum routes with server-side rendering, scoped CSS, and narrowly scoped client hydration.
+
+The goal is not to replace Axum with a separate platform. The goal is to keep Rust in charge of the server while giving the UI a single file format with explicit boundaries between server logic, client interactivity, templates, and styles.
 
 ---
 
-## Overview
+## Status
+
+The project is in early design phase. The current target is Milestone 1: server-only SSR. The first proof point is intentionally small: compile a `.trs` route, run `thebe dev`, and serve static HTML from Rust.
+
+## Design Priorities
+
+- **Axum-native output:** Thebe compiles to plain `axum::Router` handlers and should always preserve an escape hatch to raw Axum.
+- **Context-aware parsing:** `.trs` files must be parsed with HTML-aware tooling, not regex splitting.
+- **Explicit boundaries:** Rust handles server work, TypeScript handles local client reactivity, and standard HTTP flows handle server mutation.
+- **Minimal hydration:** The runtime should attach to precise DOM nodes instead of diffing full subtrees.
+- **Tight v0 scope:** Template syntax and client behavior stay intentionally limited until the server-only slice is stable.
+
+## File Format
 
 A `.trs` file has four sections:
 
@@ -26,7 +40,7 @@ A `.trs` file has four sections:
 </style>
 ```
 
-The Thebe compiler transforms each section independently and wires them together at build time. The result is an Axum router with SSR, fine-grained client hydration, and scoped CSS — with zero boilerplate.
+The Thebe compiler transforms each section independently and wires them together at build time. In the main path, a route handler returns `Props`, the server renders the template, and the client hydrates only the bindings that actually need client-side updates.
 
 ---
 
@@ -166,6 +180,7 @@ pub async fn remove(Path(id): Path<u32>) -> Props { /* ... */ }
 ```
 
 Multiple handlers in one file map to multiple HTTP methods on the same route.
+The default model is handlers returning `Props` and letting the template own rendering. Redirects and other Axum responses are useful escape hatches, but they should stay explicit.
 
 ### Axum Extractors
 
@@ -216,7 +231,7 @@ function addUser() {
 }
 ```
 
-*Future Path (v1 "Smart Compiler"):* In later versions, the compiler will evolve to use static usage analysis. Instead of shipping a runtime Proxy, the SWC pass will determine exactly which fields are mutated or read reactively, and automatically upgrade only those specific fields to signals at compile time, reverting to "zero JS cost" for static variables.
+*Possible later direction, not v0:* If the proxy-based model proves itself, a future compiler pass could narrow runtime reactivity through static analysis. That is intentionally deferred until the basic end-to-end model works.
 
 ### `derived()`
 
@@ -431,29 +446,37 @@ thebe/
   └── thebe-css               →  scoped CSS output
 ```
 
----Context-Aware Parsing
-A `.trs` file cannot be parsed safely with a basic regex. Thebe relies on an HTML-aware tokenizer (compatible with HTML5 parsing rules) to safely map the outer document structure, while deferring TypeScript parsing strictly to `swc`. This guarantees that nested tags, strings containing HTML characters, and strange namespace boundaries are resolved truthfully.
-- `<script setup>` / `<script>`: Compiled into standard server-side Rust modules.
-- `<script lang="ts">`: Passed to `swc`.
-- `<style>`: Extracted for LightningCSS.
-- **Template**: The remaining HTML. Parsed into an AST that maps static DOM vs `{{ expr }}` bindings based on their DOM contextgs, escaped tags, or nested HTML in TS). Thebe relies on a more robust block extraction strategy (e.g. leveraging an HTML-compliant tokenizer or Tree-sitter) to safely split the file into:
-- `<script setup>`: Extracted as raw Rust code.
-- `<script lang="ts">`: Extracted as TypeScript code, parsed via `swc`.
-- `<style>`: Extracted as CSS.
-- **Template**: The remaining HTML. Parsed into an AST that classifies static DOM vs `{{ expr }}` bindings.
+  Not every stage is needed for Milestone 1. The first milestone only requires block extraction and server code generation.
 
-### 2. Rust ↔ TypeScript Type Generation
-To eliminate double-typing, Thebe uses the [`ts-rs`](https://crates.io/crates/ts-rs) crate.
-The transpiler automatically injects `#[derive(serde::Serialize, ts_rs::TS)]` onto the `Props` struct. During `thebe build`, it emits TypeScript `.d.ts` interfaces directly into the project's hidden cache. Your `<script lang="ts">` gets 100% accurate autocomplete for `getProps<Props>()` directly from the Rust struct definitions.
+  ## Key Compiler Constraints
 
-### 3. Template AST & Hydration Protocol
-The template compiler converts `{{ expr }}` into two paired artifacts:
-1. **SSR Output**: Reactive bindings are enclosed in special, invisible DOM comment markers.
-   *Source:* `<span>{{ counter }}</span>`
-   *SSR HTML:* `<span><!--thebe:counter-->0<!--/thebe:counter--></span>`
-2. **Client Hydration**: Fast marker traversal.
-   On load, the slim `thebe-client` runtime uses a `TreeWalker` to find all `<!--thebe:*-->` comments. It captures a reference to the `TextNode` between the comments and bounds it exclusively to that signal's `effect()`. Virtual DOM diffs are bypassed completely.
-   *(Note: For elements with strict parsing rules like `<table>` or `<select>`, comment markers risk being hoisted out of the nested structures by the browser. Thebe's template compiler detects these domains and strategically targets the nearest safe node or injects data attributes instead of loose comment nodes).*
+  ### Context-Aware Parsing
+
+  A `.trs` file cannot be split safely with regex. The outer document must be parsed with HTML-aware tooling so embedded closing tags, quoted HTML-like strings, and malformed-but-browser-valid markup are handled the way a browser would handle them.
+
+  - `<script setup>` and `<script>` are extracted as Rust source for server-side modules.
+  - `<script lang="ts">` is extracted and parsed with `swc`.
+  - `<style>` is extracted for LightningCSS.
+  - The remaining template is parsed into an HTML AST that classifies static DOM and reactive bindings.
+
+  ### Rust to TypeScript Type Bridge
+
+  To avoid double-typing, Thebe uses [`ts-rs`](https://crates.io/crates/ts-rs) to generate TypeScript definitions from Rust `Props` structs. `getProps<Props>()` should reflect the server type, not a second hand-maintained declaration.
+
+  ### Hydration Protocol
+
+  The template compiler emits two artifacts for reactive bindings:
+
+  1. **SSR HTML:** Stable hydration anchors in the rendered document.
+  2. **Client metadata:** Enough information for the runtime to reconnect those anchors to local reactive state.
+
+  In safe DOM contexts, Thebe can use paired comment markers around a text node:
+
+  ```html
+  <span><!--thebe:counter-->0<!--/thebe:counter--></span>
+  ```
+
+  In unsafe contexts such as tables or selects, the compiler must fall back to element-bound anchors instead of loose comments, because the browser may hoist or reorder comment nodes before hydration runs.
 
 ---
 
@@ -488,12 +511,6 @@ To keep the initial release laser-focused and the compiler architecture simple, 
 - **Complex Event Modifiers:** No `.prevent`, `.stop`, or inline arrow functions for `onclick`.
 - **Server-Side Suspense / Streaming:** Full document generation happens in one block.
 - **Custom Hydration Markers:** We will use static comments or ID-based markers. The protocol will be rigid and documented.
-
----
-
-## Status
-
-Early design phase. Moving towards Milestone 1.
 
 ---
 

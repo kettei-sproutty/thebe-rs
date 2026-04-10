@@ -1,0 +1,18 @@
+[package]
+name = "thebe-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "thebe"
+path = "src/main.rs"
+
+[dependencies]
+thebe-parser = { path = "../thebe-parser" }
+thebe-codegen = { path = "../thebe-codegen" }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+
+[lints]
+workspace = true
