@@ -3,4 +3,4 @@ mod generator;
 mod template;
 
 pub use error::CodegenError;
-pub use generator::{generate_main, generate_route, RouteEntry};
+pub use generator::{RouteEntry, generate_main, generate_route};

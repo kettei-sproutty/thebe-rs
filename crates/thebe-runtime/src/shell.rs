@@ -6,26 +6,26 @@
 ///   runtime to consume during hydration.
 #[must_use]
 pub fn html_shell(body: &str, props_json: &str) -> String {
-    format!(
-        "<!DOCTYPE html>\n\
+  format!(
+    "<!DOCTYPE html>\n\
          <html>\n\
          <body>\n\
          {body}\n\
          <script id=\"__thebe_props\" type=\"application/json\">{props_json}</script>\n\
          </body>\n\
          </html>"
-    )
+  )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+  use super::*;
 
-    #[test]
-    fn html_shell_embeds_props_json() {
-        let out = html_shell("<h1>Hi</h1>", r#"{"title":"Hi"}"#);
-        assert!(out.contains(r#"id="__thebe_props""#));
-        assert!(out.contains(r#"{"title":"Hi"}"#));
-        assert!(out.contains("<!DOCTYPE html>"));
-    }
+  #[test]
+  fn html_shell_embeds_props_json() {
+    let out = html_shell("<h1>Hi</h1>", r#"{"title":"Hi"}"#);
+    assert!(out.contains(r#"id="__thebe_props""#));
+    assert!(out.contains(r#"{"title":"Hi"}"#));
+    assert!(out.contains("<!DOCTYPE html>"));
+  }
 }

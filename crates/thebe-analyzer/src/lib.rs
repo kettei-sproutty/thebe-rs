@@ -7,14 +7,14 @@ use std::fmt::Write as _;
 /// The result of analysing a `<script lang="ts">` block.
 #[derive(Debug)]
 pub struct ClientModule {
-    /// Browser-runnable JavaScript with TypeScript types stripped.
-    ///
-    /// Includes synthesised `__thebe_register("name", name)` calls for every
-    /// top-level function so the runtime onclick wiring can look them up.
-    pub js: String,
+  /// Browser-runnable JavaScript with TypeScript types stripped.
+  ///
+  /// Includes synthesised `__thebe_register("name", name)` calls for every
+  /// top-level function so the runtime onclick wiring can look them up.
+  pub js: String,
 
-    /// Names of the top-level functions found (i.e. potential onclick targets).
-    pub event_fns: Vec<String>,
+  /// Names of the top-level functions found (i.e. potential onclick targets).
+  pub event_fns: Vec<String>,
 }
 
 /// Analyse a `<script lang="ts">` block and produce a [`ClientModule`].
@@ -28,36 +28,44 @@ pub struct ClientModule {
 ///
 /// Returns [`AnalyzerError`] if the TypeScript block cannot be processed.
 pub fn analyze(script_ts: &str) -> Result<ClientModule, AnalyzerError> {
-    let js_raw = strip::strip_ts_types(script_ts);
-    let event_fns = extract::extract_function_names(&js_raw);
+  let js_raw = strip::strip_ts_types(script_ts);
+  let event_fns = extract::extract_function_names(&js_raw);
 
-    let mut js = js_raw;
-    if !event_fns.is_empty() {
-        js.push_str("\n// thebe: register event handlers\n");
-        for name in &event_fns {
-            writeln!(js, r#"__thebe_register("{name}", {name});"#)
-                .expect("writing to String is infallible");
-        }
+  let mut js = js_raw;
+  if !event_fns.is_empty() {
+    js.push_str("\n// thebe: register event handlers\n");
+    for name in &event_fns {
+      writeln!(js, r#"__thebe_register("{name}", {name});"#)
+        .expect("writing to String is infallible");
     }
+  }
 
-    Ok(ClientModule { js, event_fns })
+  Ok(ClientModule { js, event_fns })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+  use super::*;
 
-    #[test]
-    fn analyze_produces_registration_calls() {
-        let ts = "let props = getProps<Props>();\n\
+  #[test]
+  fn analyze_produces_registration_calls() {
+    let ts = "let props = getProps<Props>();\n\
                   function increment() { props.counter += 1; }\n\
                   function decrement() { props.counter -= 1; }";
-        let module = analyze(ts).unwrap();
-        assert_eq!(module.event_fns, &["increment", "decrement"]);
-        assert!(module.js.contains("__thebe_register(\"increment\", increment)"));
-        assert!(module.js.contains("__thebe_register(\"decrement\", decrement)"));
-        // Type-stripped call
-        assert!(module.js.contains("getProps()"));
-        assert!(!module.js.contains("getProps<Props>()"));
-    }
+    let module = analyze(ts).unwrap();
+    assert_eq!(module.event_fns, &["increment", "decrement"]);
+    assert!(
+      module
+        .js
+        .contains("__thebe_register(\"increment\", increment)")
+    );
+    assert!(
+      module
+        .js
+        .contains("__thebe_register(\"decrement\", decrement)")
+    );
+    // Type-stripped call
+    assert!(module.js.contains("getProps()"));
+    assert!(!module.js.contains("getProps<Props>()"));
+  }
 }

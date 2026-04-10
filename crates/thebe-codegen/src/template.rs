@@ -7,10 +7,10 @@ use std::fmt::Write as _;
 /// the codegen (which passes the raw template string to minijinja at runtime).
 #[derive(Debug)]
 pub enum TemplatePart {
-    /// A run of static HTML text.
-    Literal(#[allow(dead_code)] String),
-    /// A `{{ ident }}` or `{{ ident.field }}` binding.
-    Binding(#[allow(dead_code)] String),
+  /// A run of static HTML text.
+  Literal(#[allow(dead_code)] String),
+  /// A `{{ ident }}` or `{{ ident.field }}` binding.
+  Binding(#[allow(dead_code)] String),
 }
 
 /// Parse a Thebe template string into a flat list of [`TemplatePart`]s.
@@ -18,44 +18,44 @@ pub enum TemplatePart {
 /// Only simple identifier and dotted-field bindings are supported (v0 grammar).
 /// Anything else (arithmetic, function calls, ternaries) is rejected.
 pub fn parse_template(template: &str) -> Result<Vec<TemplatePart>, CodegenError> {
-    let mut parts: Vec<TemplatePart> = Vec::new();
-    let mut literal = String::new();
-    let mut chars = template.chars().peekable();
+  let mut parts: Vec<TemplatePart> = Vec::new();
+  let mut literal = String::new();
+  let mut chars = template.chars().peekable();
 
-    while let Some(ch) = chars.next() {
-        if ch == '{' && chars.peek().copied() == Some('{') {
-            chars.next(); // consume second '{'
+  while let Some(ch) = chars.next() {
+    if ch == '{' && chars.peek().copied() == Some('{') {
+      chars.next(); // consume second '{'
 
-            // Collect the binding content until `}}`.
-            let mut binding = String::new();
-            loop {
-                match chars.next() {
-                    None => return Err(CodegenError::UnclosedBinding),
-                    Some('}') if chars.peek().copied() == Some('}') => {
-                        chars.next(); // consume second '}'
-                        break;
-                    }
-                    Some(c) => binding.push(c),
-                }
-            }
-
-            let ident = binding.trim().to_owned();
-            validate_binding(&ident)?;
-
-            if !literal.is_empty() {
-                parts.push(TemplatePart::Literal(std::mem::take(&mut literal)));
-            }
-            parts.push(TemplatePart::Binding(ident));
-        } else {
-            literal.push(ch);
+      // Collect the binding content until `}}`.
+      let mut binding = String::new();
+      loop {
+        match chars.next() {
+          None => return Err(CodegenError::UnclosedBinding),
+          Some('}') if chars.peek().copied() == Some('}') => {
+            chars.next(); // consume second '}'
+            break;
+          }
+          Some(c) => binding.push(c),
         }
-    }
+      }
 
-    if !literal.is_empty() {
-        parts.push(TemplatePart::Literal(literal));
-    }
+      let ident = binding.trim().to_owned();
+      validate_binding(&ident)?;
 
-    Ok(parts)
+      if !literal.is_empty() {
+        parts.push(TemplatePart::Literal(std::mem::take(&mut literal)));
+      }
+      parts.push(TemplatePart::Binding(ident));
+    } else {
+      literal.push(ch);
+    }
+  }
+
+  if !literal.is_empty() {
+    parts.push(TemplatePart::Literal(literal));
+  }
+
+  Ok(parts)
 }
 
 /// Validate that a binding is a simple identifier or dotted field path.
@@ -63,43 +63,55 @@ pub fn parse_template(template: &str) -> Result<Vec<TemplatePart>, CodegenError>
 /// Valid: `title`, `post`, `post.author`, `post.author.name`
 /// Invalid: `a + b`, `fn()`, `0bad`, `.leading_dot`
 fn validate_binding(ident: &str) -> Result<(), CodegenError> {
-    if ident.is_empty() {
+  if ident.is_empty() {
+    return Err(CodegenError::InvalidBinding(ident.to_owned()));
+  }
+  for part in ident.split('.') {
+    if part.is_empty() {
+      return Err(CodegenError::InvalidBinding(ident.to_owned()));
+    }
+    let mut chars = part.chars();
+    let first = chars.next().expect("part is non-empty");
+    if !first.is_alphabetic() && first != '_' {
+      return Err(CodegenError::InvalidBinding(ident.to_owned()));
+    }
+    for c in chars {
+      if !c.is_alphanumeric() && c != '_' {
         return Err(CodegenError::InvalidBinding(ident.to_owned()));
+      }
     }
-    for part in ident.split('.') {
-        if part.is_empty() {
-            return Err(CodegenError::InvalidBinding(ident.to_owned()));
-        }
-        let mut chars = part.chars();
-        let first = chars.next().expect("part is non-empty");
-        if !first.is_alphabetic() && first != '_' {
-            return Err(CodegenError::InvalidBinding(ident.to_owned()));
-        }
-        for c in chars {
-            if !c.is_alphanumeric() && c != '_' {
-                return Err(CodegenError::InvalidBinding(ident.to_owned()));
-            }
-        }
-    }
-    Ok(())
+  }
+  Ok(())
 }
 
 /// HTML tags that cause the browser parser to hoist or reject loose comment
 /// nodes placed inside them. Reactive bindings in these contexts fall back to
 /// `<span data-thebe-bind="…">` anchors instead of comment markers.
 const UNSAFE_CTX_TAGS: &[&str] = &[
-    "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "col",
-    "colgroup", "select", "option", "optgroup",
+  "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "col", "colgroup", "select",
+  "option", "optgroup",
 ];
 
 /// HTML void elements — never have children, so never pushed onto the tag
 /// context stack.
 fn is_void_element(name: &str) -> bool {
-    matches!(
-        name,
-        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input"
-            | "link" | "meta" | "param" | "source" | "track" | "wbr"
-    )
+  matches!(
+    name,
+    "area"
+      | "base"
+      | "br"
+      | "col"
+      | "embed"
+      | "hr"
+      | "img"
+      | "input"
+      | "link"
+      | "meta"
+      | "param"
+      | "source"
+      | "track"
+      | "wbr"
+  )
 }
 
 /// Transform a Thebe template so that each `{{ ident }}` binding is wrapped in
@@ -121,192 +133,190 @@ fn is_void_element(name: &str) -> bool {
 /// Call [`parse_template`] first to validate the template; this function does
 /// not re-validate.
 pub fn inject_hydration_markers(template: &str) -> String {
-    let mut out = String::with_capacity(template.len() + 128);
-    let mut tag_stack: Vec<String> = Vec::new();
-    let mut chars = template.chars().peekable();
+  let mut out = String::with_capacity(template.len() + 128);
+  let mut tag_stack: Vec<String> = Vec::new();
+  let mut chars = template.chars().peekable();
 
-    while let Some(ch) = chars.next() {
-        if ch == '<' {
-            // Accumulate the full tag token up to and including `>`.
-            let mut tag_buf = String::from('<');
-            for c in chars.by_ref() {
-                tag_buf.push(c);
-                if c == '>' {
-                    break;
-                }
-            }
-
-            // Extract tag name and decide whether to push / pop the stack.
-            let inner = tag_buf.trim_start_matches('<').trim_end_matches('>').trim();
-            let is_closing = inner.starts_with('/');
-            let name_part = if is_closing { &inner[1..] } else { inner };
-            let name: String = name_part
-                .split(|c: char| c.is_whitespace() || c == '/')
-                .next()
-                .unwrap_or("")
-                .to_lowercase();
-
-            if !name.is_empty() {
-                if is_closing {
-                    if let Some(pos) = tag_stack.iter().rposition(|t| t == &name) {
-                        tag_stack.truncate(pos);
-                    }
-                } else if !is_void_element(&name) && !inner.ends_with('/') {
-                    tag_stack.push(name);
-                }
-            }
-
-            out.push_str(&tag_buf);
-        } else if ch == '{' && chars.peek().copied() == Some('{') {
-            chars.next(); // consume second `{`
-
-            let mut binding = String::new();
-            let mut closed = false;
-            loop {
-                match chars.next() {
-                    None => break,
-                    Some('}') if chars.peek().copied() == Some('}') => {
-                        chars.next(); // consume second `}`
-                        closed = true;
-                        break;
-                    }
-                    Some(c) => binding.push(c),
-                }
-            }
-
-            if !closed {
-                // Malformed — pass through; validation already caught this.
-                out.push_str("{{");
-                out.push_str(&binding);
-                continue;
-            }
-
-            let ident = binding.trim();
-            let in_unsafe_ctx = tag_stack
-                .iter()
-                .any(|t| UNSAFE_CTX_TAGS.contains(&t.as_str()));
-
-            if in_unsafe_ctx {
-                write!(out, r#"<span data-thebe-bind="{ident}">{{{{ {ident} }}}}</span>"#)
-                    .expect("infallible");
-            } else {
-                write!(out, "<!--thebe:{ident}-->{{{{ {ident} }}}}<!--/thebe:{ident}-->")
-                    .expect("infallible");
-            }
-        } else {
-            out.push(ch);
+  while let Some(ch) = chars.next() {
+    if ch == '<' {
+      // Accumulate the full tag token up to and including `>`.
+      let mut tag_buf = String::from('<');
+      for c in chars.by_ref() {
+        tag_buf.push(c);
+        if c == '>' {
+          break;
         }
-    }
+      }
 
-    out
+      // Extract tag name and decide whether to push / pop the stack.
+      let inner = tag_buf.trim_start_matches('<').trim_end_matches('>').trim();
+      let is_closing = inner.starts_with('/');
+      let name_part = if is_closing { &inner[1..] } else { inner };
+      let name: String = name_part
+        .split(|c: char| c.is_whitespace() || c == '/')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+
+      if !name.is_empty() {
+        if is_closing {
+          if let Some(pos) = tag_stack.iter().rposition(|t| t == &name) {
+            tag_stack.truncate(pos);
+          }
+        } else if !is_void_element(&name) && !inner.ends_with('/') {
+          tag_stack.push(name);
+        }
+      }
+
+      out.push_str(&tag_buf);
+    } else if ch == '{' && chars.peek().copied() == Some('{') {
+      chars.next(); // consume second `{`
+
+      let mut binding = String::new();
+      let mut closed = false;
+      loop {
+        match chars.next() {
+          None => break,
+          Some('}') if chars.peek().copied() == Some('}') => {
+            chars.next(); // consume second `}`
+            closed = true;
+            break;
+          }
+          Some(c) => binding.push(c),
+        }
+      }
+
+      if !closed {
+        // Malformed — pass through; validation already caught this.
+        out.push_str("{{");
+        out.push_str(&binding);
+        continue;
+      }
+
+      let ident = binding.trim();
+      let in_unsafe_ctx = tag_stack
+        .iter()
+        .any(|t| UNSAFE_CTX_TAGS.contains(&t.as_str()));
+
+      if in_unsafe_ctx {
+        write!(
+          out,
+          r#"<span data-thebe-bind="{ident}">{{{{ {ident} }}}}</span>"#
+        )
+        .expect("infallible");
+      } else {
+        write!(
+          out,
+          "<!--thebe:{ident}-->{{{{ {ident} }}}}<!--/thebe:{ident}-->"
+        )
+        .expect("infallible");
+      }
+    } else {
+      out.push(ch);
+    }
+  }
+
+  out
 }
 
 /// Escape a string for use inside a Rust double-quoted string literal.
 #[allow(dead_code)] // retained for potential future use
 pub fn escape_rust_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
+  let mut out = String::with_capacity(s.len());
+  for c in s.chars() {
+    match c {
+      '\\' => out.push_str("\\\\"),
+      '"' => out.push_str("\\\""),
+      '\n' => out.push_str("\\n"),
+      '\r' => out.push_str("\\r"),
+      '\t' => out.push_str("\\t"),
+      c => out.push(c),
     }
-    out
+  }
+  out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+  use super::*;
 
-    #[test]
-    fn parse_single_binding() {
-        let parts = parse_template("Hello {{ name }}!").unwrap();
-        assert!(matches!(parts[0], TemplatePart::Literal(ref s) if s == "Hello "));
-        assert!(matches!(parts[1], TemplatePart::Binding(ref s) if s == "name"));
-        assert!(matches!(parts[2], TemplatePart::Literal(ref s) if s == "!"));
-    }
+  #[test]
+  fn parse_single_binding() {
+    let parts = parse_template("Hello {{ name }}!").unwrap();
+    assert!(matches!(parts[0], TemplatePart::Literal(ref s) if s == "Hello "));
+    assert!(matches!(parts[1], TemplatePart::Binding(ref s) if s == "name"));
+    assert!(matches!(parts[2], TemplatePart::Literal(ref s) if s == "!"));
+  }
 
-    #[test]
-    fn parse_dotted_binding() {
-        let parts = parse_template("{{ post.author.name }}").unwrap();
-        assert!(
-            matches!(parts[0], TemplatePart::Binding(ref s) if s == "post.author.name")
-        );
-    }
+  #[test]
+  fn parse_dotted_binding() {
+    let parts = parse_template("{{ post.author.name }}").unwrap();
+    assert!(matches!(parts[0], TemplatePart::Binding(ref s) if s == "post.author.name"));
+  }
 
-    #[test]
-    fn parse_unclosed_binding_returns_error() {
-        assert!(parse_template("{{ oops").is_err());
-    }
+  #[test]
+  fn parse_unclosed_binding_returns_error() {
+    assert!(parse_template("{{ oops").is_err());
+  }
 
-    #[test]
-    fn validate_rejects_expressions() {
-        assert!(parse_template("{{ a + b }}").is_err());
-        assert!(parse_template("{{ fn() }}").is_err());
-        assert!(parse_template("{{ }}").is_err());
-    }
+  #[test]
+  fn validate_rejects_expressions() {
+    assert!(parse_template("{{ a + b }}").is_err());
+    assert!(parse_template("{{ fn() }}").is_err());
+    assert!(parse_template("{{ }}").is_err());
+  }
 
-    // ── inject_hydration_markers ────────────────────────────────────────────
+  // ── inject_hydration_markers ────────────────────────────────────────────
 
-    #[test]
-    fn hydration_safe_context_emits_comment_markers() {
-        let out = inject_hydration_markers("<span>{{ counter }}</span>");
-        assert_eq!(
-            out,
-            "<span><!--thebe:counter-->{{ counter }}<!--/thebe:counter--></span>"
-        );
-    }
+  #[test]
+  fn hydration_safe_context_emits_comment_markers() {
+    let out = inject_hydration_markers("<span>{{ counter }}</span>");
+    assert_eq!(
+      out,
+      "<span><!--thebe:counter-->{{ counter }}<!--/thebe:counter--></span>"
+    );
+  }
 
-    #[test]
-    fn hydration_dotted_path_uses_full_key() {
-        let out = inject_hydration_markers("<p>{{ user.name }}</p>");
-        assert_eq!(
-            out,
-            "<p><!--thebe:user.name-->{{ user.name }}<!--/thebe:user.name--></p>"
-        );
-    }
+  #[test]
+  fn hydration_dotted_path_uses_full_key() {
+    let out = inject_hydration_markers("<p>{{ user.name }}</p>");
+    assert_eq!(
+      out,
+      "<p><!--thebe:user.name-->{{ user.name }}<!--/thebe:user.name--></p>"
+    );
+  }
 
-    #[test]
-    fn hydration_inside_table_cell_emits_span() {
-        let out = inject_hydration_markers(
-            "<table><tr><td>{{ count }}</td></tr></table>",
-        );
-        assert!(
-            out.contains(r#"<span data-thebe-bind="count">{{ count }}</span>"#),
-            "expected data-thebe-bind span, got: {out}"
-        );
-    }
+  #[test]
+  fn hydration_inside_table_cell_emits_span() {
+    let out = inject_hydration_markers("<table><tr><td>{{ count }}</td></tr></table>");
+    assert!(
+      out.contains(r#"<span data-thebe-bind="count">{{ count }}</span>"#),
+      "expected data-thebe-bind span, got: {out}"
+    );
+  }
 
-    #[test]
-    fn hydration_after_table_reverts_to_comment_markers() {
-        let out = inject_hydration_markers(
-            "<table><tr><td>{{ a }}</td></tr></table><p>{{ b }}</p>",
-        );
-        assert!(out.contains(r#"data-thebe-bind="a""#), "a should use span");
-        assert!(
-            out.contains("<!--thebe:b-->{{ b }}<!--/thebe:b-->"),
-            "b should use comment markers"
-        );
-    }
+  #[test]
+  fn hydration_after_table_reverts_to_comment_markers() {
+    let out = inject_hydration_markers("<table><tr><td>{{ a }}</td></tr></table><p>{{ b }}</p>");
+    assert!(out.contains(r#"data-thebe-bind="a""#), "a should use span");
+    assert!(
+      out.contains("<!--thebe:b-->{{ b }}<!--/thebe:b-->"),
+      "b should use comment markers"
+    );
+  }
 
-    #[test]
-    fn hydration_inside_select_emits_span() {
-        let out = inject_hydration_markers(
-            "<select><option>{{ label }}</option></select>",
-        );
-        assert!(
-            out.contains(r#"data-thebe-bind="label""#),
-            "expected data-thebe-bind inside select"
-        );
-    }
+  #[test]
+  fn hydration_inside_select_emits_span() {
+    let out = inject_hydration_markers("<select><option>{{ label }}</option></select>");
+    assert!(
+      out.contains(r#"data-thebe-bind="label""#),
+      "expected data-thebe-bind inside select"
+    );
+  }
 
-    #[test]
-    fn hydration_no_bindings_is_passthrough() {
-        let tmpl = "<h1>Hello world</h1>";
-        assert_eq!(inject_hydration_markers(tmpl), tmpl);
-    }
+  #[test]
+  fn hydration_no_bindings_is_passthrough() {
+    let tmpl = "<h1>Hello world</h1>";
+    assert_eq!(inject_hydration_markers(tmpl), tmpl);
+  }
 }
