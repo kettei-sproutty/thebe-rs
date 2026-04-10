@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 thebe-parser = { path = "../thebe-parser" }
 thebe-analyzer = { path = "../thebe-analyzer" }
+thebe-css = { path = "../thebe-css" }
 thiserror = { workspace = true }
 
 [lints]

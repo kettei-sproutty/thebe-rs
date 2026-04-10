@@ -25,4 +25,7 @@ pub enum CodegenError {
 
   #[error("`<script setup>` block is missing")]
   MissingScriptSetup,
+
+  #[error("CSS error: {0}")]
+  CssError(String),
 }

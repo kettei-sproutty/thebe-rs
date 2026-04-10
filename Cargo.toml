@@ -4,6 +4,7 @@ members = [
   "crates/thebe-parser",
   "crates/thebe-analyzer",
   "crates/thebe-codegen",
+  "crates/thebe-css",
   "crates/thebe-runtime",
   "crates/thebe-cli",
 ]

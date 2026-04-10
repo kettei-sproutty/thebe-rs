@@ -10,6 +10,7 @@
  *  4. `_updateDOM(key, value)` — finds all anchors for `key` and patches
  *     the bound text nodes or data-attribute elements.
  */
+/* __thebe_runtime */
 (function (win) {
   "use strict";
 
@@ -133,11 +134,120 @@
     }
   }
 
+  /**
+   * Re-evaluate all inline `<script>` elements found in a parsed document
+   * body.  Scripts injected via `innerHTML` are inert; this clones them into
+   * live `<script>` nodes so the browser evaluates them.
+   *
+   * The thebe runtime script itself is identified by the sentinel comment
+   * `/* __thebe_runtime *\/` at the top of its content and is skipped — it is
+   * already running and must not be re-initialised.
+   */
+  function _evalScripts(parsedBody) {
+    var scripts = parsedBody.querySelectorAll("script");
+    for (var i = 0; i < scripts.length; i++) {
+      var src = scripts[i];
+      // Skip the runtime bootstrap — already in scope.
+      if (src.textContent.indexOf("__thebe_runtime") !== -1) {
+        continue;
+      }
+      var live = win.document.createElement("script");
+      if (src.type) {
+        live.type = src.type;
+      }
+      live.textContent = src.textContent;
+      win.document.body.appendChild(live);
+    }
+  }
+
+  /**
+   * Perform a client-side navigation to `href`.
+   *
+   * Fetches the full server-rendered HTML, swaps the document body, pushes a
+   * history entry (unless `push` is false, e.g. on popstate), scrolls to the
+   * top, and re-runs the new page's inline scripts + event wiring.
+   */
+  function _navigate(href, push) {
+    win
+      .fetch(href, { headers: { Accept: "text/html" } })
+      .then(function (r) {
+        return r.text();
+      })
+      .then(function (html) {
+        var parser = new win.DOMParser();
+        var doc = parser.parseFromString(html, "text/html");
+
+        // Swap body content.
+        win.document.body.innerHTML = doc.body.innerHTML;
+
+        // Update history and title.
+        if (push !== false) {
+          win.history.pushState({}, doc.title || "", href);
+        }
+        if (doc.title) {
+          win.document.title = doc.title;
+        }
+
+        win.scrollTo(0, 0);
+
+        // Reset handler registry for the new page.
+        _handlers = {};
+
+        // Re-evaluate the new page's inline scripts (user script + props).
+        _evalScripts(doc.body);
+
+        // Re-wire onclick attributes emitted by codegen.
+        _wireEvents();
+      })
+      .catch(function () {
+        // On network error fall back to a full navigation.
+        win.location.href = href;
+      });
+  }
+
+  /**
+   * Attach the client-side router.
+   *
+   * Uses event delegation on `document` — a single listener handles all
+   * current and future anchor elements.  Links can opt out of client routing
+   * with `data-thebe-reload`.
+   */
+  function _initRouter() {
+    win.document.addEventListener("click", function (e) {
+      var a = e.target.closest("a[href]");
+      if (!a) {
+        return;
+      }
+      var href = a.getAttribute("href");
+      // Skip: empty, external, protocol-relative, hash-only, or opted-out.
+      if (
+        !href ||
+        href.indexOf("://") !== -1 ||
+        href.startsWith("//") ||
+        href.startsWith("#") ||
+        a.hasAttribute("data-thebe-reload")
+      ) {
+        return;
+      }
+      e.preventDefault();
+      _navigate(href, true);
+    });
+
+    // Handle back/forward buttons.
+    win.addEventListener("popstate", function () {
+      _navigate(win.location.pathname + win.location.search, false);
+    });
+  }
+
   // Attach event wirer after DOM is ready (safe even if already parsed).
   if (win.document.readyState === "loading") {
-    win.document.addEventListener("DOMContentLoaded", _wireEvents);
+    win.document.addEventListener("DOMContentLoaded", function () {
+      _wireEvents();
+      _initRouter();
+    });
   } else {
     _wireEvents();
+    _initRouter();
   }
 
   // Expose public API on `window`.

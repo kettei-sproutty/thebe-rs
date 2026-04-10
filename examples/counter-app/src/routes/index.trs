@@ -62,17 +62,16 @@ function reset() {
 </main>
 
 <style>
-body {
-    font-family: system-ui, sans-serif;
-    display: flex;
-    justify-content: center;
-    padding: 4rem 1rem;
-    background: #f8f8f8;
-    color: #1a1a1a;
-}
 
 main {
-    text-align: center;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-family: system-ui, sans-serif;
+  color: white;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
 }
 
 h1 {
@@ -94,7 +93,6 @@ h1 {
 }
 
 button {
-    width: 3rem;
     height: 3rem;
     font-size: 1.5rem;
     border: 2px solid #1a1a1a;

@@ -50,6 +50,7 @@ struct ModuleLiterals<'a> {
   template: &'a str,
   runtime: &'a str,
   client_script: &'a str,
+  style: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -114,8 +115,21 @@ pub fn generate_route(blocks: &SfcBlocks, route_path: &str) -> Result<String, Co
     format!("    let __props = {}({call_args});\n", handler.name)
   };
 
-  let template_with_markers = template::inject_hydration_markers(&blocks.template);
-  let template_literal = escape_rust_raw_str(&template_with_markers);
+  // Compute a deterministic scope ID and apply CSS scoping.
+  let scope = thebe_css::scope_id(route_path);
+  let template_scoped =
+    thebe_css::add_scope_attrs(&template::inject_hydration_markers(&blocks.template), &scope);
+  let style = blocks
+    .style
+    .as_deref()
+    .filter(|s| !s.trim().is_empty())
+    .map(|s| thebe_css::process_style(s, &scope))
+    .transpose()
+    .map_err(|e| CodegenError::CssError(e.to_string()))?
+    .unwrap_or_default();
+
+  let template_literal = escape_rust_raw_str(&template_scoped);
+  let style_literal = escape_rust_raw_str(&style);
 
   // Process the optional `<script lang="ts">` block.
   let client_js = blocks
@@ -134,6 +148,7 @@ pub fn generate_route(blocks: &SfcBlocks, route_path: &str) -> Result<String, Co
     template: &template_literal,
     runtime: &runtime_literal,
     client_script: &client_script_literal,
+    style: &style_literal,
   };
   let wrapper = WrapperSource {
     params: &wrapper_params,
@@ -175,6 +190,7 @@ fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
     literals.runtime
   )
   .expect("infallible");
+  writeln!(source, "const __STYLE: &str = {};", literals.style).expect("infallible");
   write!(
     source,
     "const __CLIENT_SCRIPT: &str = {};\n\n",
@@ -220,6 +236,7 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
   source.push_str(
     "        \"<!DOCTYPE html>\\n\\
          <html>\\n\\
+         <head><style>{style}</style></head>\\n\\
          <body>\\n\\
          {body}\\n\\
          <script id=\\\"__thebe_props\\\" type=\\\"application/json\\\">{props_json}</script>\\n\\
@@ -228,6 +245,7 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
          </body>\\n\\
          </html>\",\n",
   );
+  source.push_str("        style = __STYLE,\n");
   source.push_str("        body = __body,\n");
   source.push_str("        props_json = __props_json,\n");
   source.push_str("        runtime = __CLIENT_RUNTIME,\n");
