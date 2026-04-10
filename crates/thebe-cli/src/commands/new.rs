@@ -27,6 +27,9 @@ pub fn run(name: &str) -> anyhow::Result<()> {
   )
   .context("failed to write src/routes/index.trs")?;
 
+  std::fs::write(project_dir.join("app.html"), thebe_codegen::default_app_html())
+    .context("failed to write app.html")?;
+
   println!("created `{name}`");
   println!("  run:  cd {name} && thebe dev");
   Ok(())

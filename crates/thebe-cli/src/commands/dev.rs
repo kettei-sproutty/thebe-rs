@@ -37,6 +37,7 @@ pub fn run(watch: bool) -> anyhow::Result<()> {
 fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow::Result<()> {
   // Parse all `_layout.trs` files first so each route can find its wrapper.
   let layouts = collect_layouts(routes_dir)?;
+  let app_html = load_app_html(project_root)?;
 
   let trs_files = collect_trs_files(routes_dir)?;
   anyhow::ensure!(
@@ -60,7 +61,7 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
     let layout_arg = find_layout(&layouts, trs_path, routes_dir)
       .map(|(blocks, scope_path)| (blocks, scope_path.as_str()));
 
-    let generated = thebe_codegen::generate_route(&blocks, &route_path, layout_arg)
+    let generated = thebe_codegen::generate_route(&blocks, &route_path, layout_arg, &app_html)
       .with_context(|| format!("codegen error for {}", trs_path.display()))?;
 
     let rs_path = trs_path.with_extension("rs");
@@ -91,6 +92,22 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
   println!("thebe: generated src/__thebe_routes.rs");
 
   Ok(())
+}
+
+fn load_app_html(project_root: &Path) -> anyhow::Result<String> {
+  let app_html_path = project_root.join("app.html");
+
+  if app_html_path.exists() {
+    let app_html = std::fs::read_to_string(&app_html_path)
+      .with_context(|| format!("failed to read {}", app_html_path.display()))?;
+    thebe_codegen::validate_app_html(&app_html)
+      .with_context(|| format!("invalid {}", app_html_path.display()))?;
+    return Ok(app_html);
+  }
+
+  let app_html = thebe_codegen::default_app_html().to_owned();
+  thebe_codegen::validate_app_html(&app_html).context("internal default app.html is invalid")?;
+  Ok(app_html)
 }
 
 /// Spawn `cargo run` in `project_root` as a background child process.
@@ -141,18 +158,21 @@ fn run_watch(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow::
   watcher
     .watch(routes_dir, RecursiveMode::Recursive)
     .context("failed to watch routes directory")?;
+  watcher
+    .watch(project_root, RecursiveMode::NonRecursive)
+    .context("failed to watch project root")?;
 
   while let Ok(first) = rx.recv() {
-    // Only act on events that touch `.trs` files.
-    let trs_changed = is_trs_event(&first);
+    // Only act on events that touch route `.trs` files or `app.html`.
+    let codegen_changed = is_codegen_event(&first, project_root);
 
     // Drain any rapid follow-up events (debounce over 150 ms).
-    let mut any_trs = trs_changed;
+    let mut any_codegen_change = codegen_changed;
     loop {
       match rx.recv_timeout(Duration::from_millis(150)) {
         Ok(res) => {
-          if is_trs_event(&res) {
-            any_trs = true;
+          if is_codegen_event(&res, project_root) {
+            any_codegen_change = true;
           }
         }
         Err(mpsc::RecvTimeoutError::Timeout) => break,
@@ -160,7 +180,7 @@ fn run_watch(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow::
       }
     }
 
-    if !any_trs {
+    if !any_codegen_change {
       continue;
     }
 
@@ -180,21 +200,27 @@ fn run_watch(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow::
   Ok(())
 }
 
-/// Return `true` if a notify result represents a create/modify/remove on a `.trs` file.
-fn is_trs_event(res: &notify::Result<notify::Event>) -> bool {
+/// Return `true` if a notify result should trigger route code generation.
+fn is_codegen_event(res: &notify::Result<notify::Event>, project_root: &Path) -> bool {
   use notify::event::EventKind;
   match res {
     Ok(event) => {
       matches!(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-      ) && event
-        .paths
-        .iter()
-        .any(|p| p.extension().is_some_and(|e| e == "trs"))
+      ) && event.paths.iter().any(|path| {
+        path.extension().is_some_and(|ext| ext == "trs") || is_app_html_path(path, project_root)
+      })
     }
     Err(_) => false,
   }
+}
+
+fn is_app_html_path(path: &Path, project_root: &Path) -> bool {
+  path
+    .file_name()
+    .is_some_and(|file_name| file_name == "app.html")
+    && path.parent().is_some_and(|parent| parent == project_root)
 }
 
 /// Walk up from the current directory to find the nearest `Cargo.toml`.

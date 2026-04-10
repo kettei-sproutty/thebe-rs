@@ -8,6 +8,20 @@ use thebe_parser::SfcBlocks;
 /// external CDN or npm install is required during `thebe dev`.
 const THEBE_CLIENT_RUNTIME: &str = include_str!("../../../packages/thebe-client/runtime.js");
 
+const APP_HTML_HEAD_PLACEHOLDER: &str = "%thebe.head%";
+const APP_HTML_BODY_PLACEHOLDER: &str = "%thebe.body%";
+const DEFAULT_APP_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  %thebe.head%
+</head>
+<body>
+  %thebe.body%
+</body>
+</html>"#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HttpMethod {
   Delete,
@@ -47,10 +61,12 @@ struct RouteHandler {
 
 #[derive(Clone, Copy)]
 struct ModuleLiterals<'a> {
+  app_html: &'a str,
   template: &'a str,
   runtime: &'a str,
   client_script: &'a str,
   style: &'a str,
+  route_path: &'a str,
   /// Pre-processed layout template, or `None` when no layout wraps this route.
   layout_template: Option<&'a str>,
 }
@@ -67,6 +83,39 @@ pub struct RouteEntry {
   pub mod_name: String,
   /// Path to the generated route module relative to `src/main.rs`.
   pub source_path: String,
+}
+
+/// Return the built-in app shell used when a project does not provide `app.html`.
+#[must_use]
+pub fn default_app_html() -> &'static str {
+  DEFAULT_APP_HTML
+}
+
+/// Validate that `app.html` contains the required Thebe placeholders.
+///
+/// A valid shell must contain exactly one `%thebe.head%` placeholder and
+/// exactly one `%thebe.body%` placeholder.
+///
+/// # Errors
+///
+/// Returns [`CodegenError::InvalidAppHtml`] when a placeholder is missing or
+/// duplicated.
+pub fn validate_app_html(app_html: &str) -> Result<(), CodegenError> {
+  validate_app_html_placeholder(app_html, APP_HTML_HEAD_PLACEHOLDER)?;
+  validate_app_html_placeholder(app_html, APP_HTML_BODY_PLACEHOLDER)
+}
+
+fn validate_app_html_placeholder(app_html: &str, placeholder: &str) -> Result<(), CodegenError> {
+  let count = app_html.match_indices(placeholder).count();
+  match count {
+    1 => Ok(()),
+    0 => Err(CodegenError::InvalidAppHtml(format!(
+      "missing `{placeholder}` placeholder"
+    ))),
+    _ => Err(CodegenError::InvalidAppHtml(format!(
+      "`{placeholder}` must appear exactly once"
+    ))),
+  }
 }
 
 /// Generate the Rust source code for a single route module.
@@ -93,11 +142,14 @@ pub fn generate_route(
   blocks: &SfcBlocks,
   route_path: &str,
   layout: Option<(&SfcBlocks, &str)>,
+  app_html: &str,
 ) -> Result<String, CodegenError> {
   let setup = blocks
     .script_setup
     .as_deref()
     .ok_or(CodegenError::MissingScriptSetup)?;
+
+  validate_app_html(app_html)?;
 
   // Validate the template before committing to codegen.
   template::parse_template(&blocks.template)?;
@@ -137,8 +189,10 @@ pub fn generate_route(
     .map_err(|e| CodegenError::CssError(e.to_string()))?
     .unwrap_or_default();
 
+  let app_html_literal = escape_rust_raw_str(app_html);
   let template_literal = escape_rust_raw_str(&template_scoped);
   let style_literal = escape_rust_raw_str(&style);
+  let route_path_literal = escape_rust_raw_str(route_path);
 
   // Process the optional `<script lang="ts">` block.
   let client_js = blocks
@@ -180,10 +234,12 @@ pub fn generate_route(
   };
 
   let literals = ModuleLiterals {
+    app_html: &app_html_literal,
     template: &template_literal,
     runtime: &runtime_literal,
     client_script: &client_script_literal,
     style: &final_style_literal,
+    route_path: &route_path_literal,
     layout_template: layout_template_opt.as_deref(),
   };
   let wrapper = WrapperSource {
@@ -213,6 +269,7 @@ fn build_route_module(
   source.push_str(setup_with_serde);
   source.push_str("\n\n");
   write_module_constants(&mut source, literals);
+  write_support_fns(&mut source);
   if literals.layout_template.is_some() {
     write_render_handler_with_layout(&mut source, wrapper);
   } else {
@@ -223,6 +280,7 @@ fn build_route_module(
 }
 
 fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
+  writeln!(source, "const __APP_HTML: &str = {};", literals.app_html).expect("infallible");
   writeln!(source, "const __TEMPLATE: &str = {};", literals.template).expect("infallible");
   writeln!(
     source,
@@ -231,6 +289,7 @@ fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
   )
   .expect("infallible");
   writeln!(source, "const __STYLE: &str = {};", literals.style).expect("infallible");
+  writeln!(source, "const __ROUTE_PATH: &str = {};", literals.route_path).expect("infallible");
   writeln!(
     source,
     "const __CLIENT_SCRIPT: &str = {};",
@@ -243,13 +302,54 @@ fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
   source.push('\n');
 }
 
+fn write_support_fns(source: &mut String) {
+  source.push_str(
+    "type __ThebeResponse = Result<axum::response::Html<String>, axum::response::Response>;\n\n",
+  );
+  source.push_str("fn __thebe_render_app_html(head: &str, body: &str) -> String {\n");
+  source.push_str("    __APP_HTML\n");
+  source.push_str("        .replace(\"%thebe.head%\", head)\n");
+  source.push_str("        .replace(\"%thebe.body%\", body)\n");
+  source.push_str("}\n\n");
+  source.push_str("fn __thebe_escape_html(input: &str) -> String {\n");
+  source.push_str("    let mut escaped = String::with_capacity(input.len());\n");
+  source.push_str("    for ch in input.chars() {\n");
+  source.push_str("        match ch {\n");
+  source.push_str("            '&' => escaped.push_str(\"&amp;\"),\n");
+  source.push_str("            '<' => escaped.push_str(\"&lt;\"),\n");
+  source.push_str("            '>' => escaped.push_str(\"&gt;\"),\n");
+  source.push_str("            _ => escaped.push(ch),\n");
+  source.push_str("        }\n");
+  source.push_str("    }\n");
+  source.push_str("    escaped\n");
+  source.push_str("}\n\n");
+  source.push_str("fn __thebe_internal_error(stage: &str, err: impl std::fmt::Display) -> axum::response::Response {\n");
+  source.push_str("    use axum::response::IntoResponse;\n\n");
+  source.push_str("    let route = __thebe_escape_html(__ROUTE_PATH);\n");
+  source.push_str("    let stage = __thebe_escape_html(stage);\n");
+  source.push_str("    let message = __thebe_escape_html(&err.to_string());\n\n");
+  source.push_str("    (\n");
+  source.push_str("        axum::http::StatusCode::INTERNAL_SERVER_ERROR,\n");
+  source.push_str("        axum::response::Html(format!(\n");
+  source.push_str(
+    "            \"<!DOCTYPE html>\\n\\\n             <html>\\n\\\n             <head><title>Thebe Error</title></head>\\n\\\n             <body>\\n\\\n             <h1>500 - Thebe render error</h1>\\n\\\n             <p><strong>Route:</strong> {route}</p>\\n\\\n             <p><strong>Stage:</strong> {stage}</p>\\n\\\n             <pre>{message}</pre>\\n\\\n             </body>\\n\\\n             </html>\",\n",
+  );
+  source.push_str("            route = route,\n");
+  source.push_str("            stage = stage,\n");
+  source.push_str("            message = message,\n");
+  source.push_str("        )),\n");
+  source.push_str("    )\n");
+  source.push_str("        .into_response()\n");
+  source.push_str("}\n\n");
+}
+
 fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
   if wrapper.params.is_empty() {
-    source.push_str("async fn __thebe_render_handler() -> axum::response::Html<String> {\n");
+    source.push_str("async fn __thebe_render_handler() -> __ThebeResponse {\n");
   } else {
     writeln!(
       source,
-      "async fn __thebe_render_handler({}) -> axum::response::Html<String> {{",
+      "async fn __thebe_render_handler({}) -> __ThebeResponse {{",
       wrapper.params
     )
     .expect("infallible");
@@ -257,22 +357,22 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
   source.push_str(wrapper.call);
   source.push_str(
     "    let __ctx = serde_json::to_value(&__props)\
-         .expect(\"Props serialisation error\");\n",
+         .map_err(|err| __thebe_internal_error(\"serialize props\", err))?;\n",
   );
   source.push_str("    let __body = {\n");
   source.push_str("        use minijinja::Environment;\n");
   source.push_str("        let mut env = Environment::new();\n");
   source.push_str(
     "        env.add_template(\"__page\", __TEMPLATE)\
-         .expect(\"template compile error\");\n",
+         .map_err(|err| __thebe_internal_error(\"compile template\", err))?;\n",
   );
   source.push_str(
     "        env.get_template(\"__page\")\
-         .expect(\"template not found\")\n",
+         .map_err(|err| __thebe_internal_error(\"load template\", err))?\n",
   );
   source.push_str(
     "            .render(&__ctx)\
-         .expect(\"template render error\")\n",
+         .map_err(|err| __thebe_internal_error(\"render template\", err))?\n",
   );
   source.push_str("    };\n");
   write_html_assembly(source);
@@ -287,37 +387,36 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
 /// - `__body: String`
 fn write_html_assembly(source: &mut String) {
   source.push_str("    let __props_json = __ctx.to_string();\n");
-  source.push_str("    let __html = format!(\n");
   source.push_str(
-    "        \"<!DOCTYPE html>\\n\\
-         <html>\\n\\
-         <head><style>{style}</style></head>\\n\\
-         <body>\\n\\
-         {body}\\n\\
-         <script id=\\\"__thebe_props\\\" type=\\\"application/json\\\">{props_json}</script>\\n\\
-         <script>{runtime}</script>\\n\\
-         <script>{user_script}</script>\\n\\
-         </body>\\n\\
-         </html>\",\n",
+    r##"    let __head = if __STYLE.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<style data-thebe-head="style">{style}</style>"#, style = __STYLE)
+    };
+    let __body_with_scripts = format!(r#"{body}
+<script id="__thebe_props" type="application/json">{props_json}</script>
+<script>{runtime}</script>
+<script>{user_script}</script>"#,
+"##,
   );
-  source.push_str("        style = __STYLE,\n");
   source.push_str("        body = __body,\n");
   source.push_str("        props_json = __props_json,\n");
   source.push_str("        runtime = __CLIENT_RUNTIME,\n");
   source.push_str("        user_script = __CLIENT_SCRIPT,\n");
   source.push_str("    );\n");
-  source.push_str("    axum::response::Html(__html)\n");
+  source.push_str("    let __html = __thebe_render_app_html(&__head, &__body_with_scripts);\n");
+  source.push_str("    Ok(axum::response::Html(__html))\n");
 }
 
 /// Like [`write_render_handler`] but renders the route body first, then wraps
 /// it inside the layout template before assembling the HTML shell.
 fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<'_>) {
   if wrapper.params.is_empty() {
-    source.push_str("async fn __thebe_render_handler() -> axum::response::Html<String> {\n");
+    source.push_str("async fn __thebe_render_handler() -> __ThebeResponse {\n");
   } else {
     writeln!(
       source,
-      "async fn __thebe_render_handler({}) -> axum::response::Html<String> {{",
+      "async fn __thebe_render_handler({}) -> __ThebeResponse {{",
       wrapper.params
     )
     .expect("infallible");
@@ -325,7 +424,7 @@ fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<
   source.push_str(wrapper.call);
   source.push_str(
     "    let __ctx = serde_json::to_value(&__props)\
-         .expect(\"Props serialisation error\");\n",
+         .map_err(|err| __thebe_internal_error(\"serialize props\", err))?;\n",
   );
   // Render the route template into a string first.
   source.push_str("    let __route_body = {\n");
@@ -333,15 +432,15 @@ fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<
   source.push_str("        let mut env = Environment::new();\n");
   source.push_str(
     "        env.add_template(\"__page\", __TEMPLATE)\
-         .expect(\"template compile error\");\n",
+         .map_err(|err| __thebe_internal_error(\"compile template\", err))?;\n",
   );
   source.push_str(
     "        env.get_template(\"__page\")\
-         .expect(\"template not found\")\n",
+         .map_err(|err| __thebe_internal_error(\"load template\", err))?\n",
   );
   source.push_str(
     "            .render(&__ctx)\
-         .expect(\"template render error\")\n",
+         .map_err(|err| __thebe_internal_error(\"render template\", err))?\n",
   );
   source.push_str("    };\n");
   // Wrap the route body inside the layout template.
@@ -350,18 +449,18 @@ fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<
   source.push_str("        let mut env = Environment::new();\n");
   source.push_str(
     "        env.add_template(\"__layout\", __LAYOUT_TEMPLATE)\
-         .expect(\"layout template compile error\");\n",
+         .map_err(|err| __thebe_internal_error(\"compile layout template\", err))?;\n",
   );
   source.push_str(
     "        let __layout_ctx = serde_json::json!({ \"__slot\": __route_body });\n",
   );
   source.push_str(
     "        env.get_template(\"__layout\")\
-         .expect(\"layout template not found\")\n",
+         .map_err(|err| __thebe_internal_error(\"load layout template\", err))?\n",
   );
   source.push_str(
     "            .render(&__layout_ctx)\
-         .expect(\"layout render error\")\n",
+         .map_err(|err| __thebe_internal_error(\"render layout template\", err))?\n",
   );
   source.push_str("    };\n");
   write_html_assembly(source);
@@ -895,11 +994,16 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let src = generate_route(&blocks, "/").unwrap();
+    let src = generate_route(&blocks, "/", None, default_app_html()).unwrap();
 
+    assert!(src.contains("const __APP_HTML"), "app shell const missing");
     // The generated source must contain both client consts.
     assert!(src.contains("__CLIENT_RUNTIME"), "runtime const missing");
     assert!(src.contains("__CLIENT_SCRIPT"), "user script const missing");
+    assert!(src.contains("data-thebe-head=\"style\""));
+    assert!(src.contains("fn __thebe_internal_error"));
+    assert!(src.contains("fn __thebe_render_app_html"));
+    assert!(src.contains("-> __ThebeResponse"));
 
     // The format! call must reference both as named args.
     assert!(src.contains("runtime = __CLIENT_RUNTIME"));
@@ -929,7 +1033,7 @@ mod tests {
             ..SfcBlocks::default()
         };
 
-    let src = generate_route(&blocks, "/blog/:slug").unwrap();
+    let src = generate_route(&blocks, "/blog/:slug", None, default_app_html()).unwrap();
 
     assert!(src.contains(
       "async fn __thebe_render_handler(__thebe_arg0: Path<String>, __thebe_arg1: State<AppState>)"
@@ -958,5 +1062,29 @@ mod tests {
     assert!(source.contains(".merge(route__blog__dyn_slug::router())"));
     assert!(source.contains("fn __thebe_router()"));
     assert!(!source.contains("async fn main()"));
+  }
+
+  #[test]
+  fn default_app_html_contains_required_placeholders() {
+    let app_html = default_app_html();
+
+    assert!(app_html.contains(APP_HTML_HEAD_PLACEHOLDER));
+    assert!(app_html.contains(APP_HTML_BODY_PLACEHOLDER));
+    assert!(validate_app_html(app_html).is_ok());
+  }
+
+  #[test]
+  fn generate_route_rejects_invalid_app_html() {
+    let blocks = SfcBlocks {
+      script_setup: Some(
+        "#[thebe::get]\npub fn handler() -> Props { Props { counter: 0 } }".to_owned(),
+      ),
+      template: "<span>{{ counter }}</span>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let err = generate_route(&blocks, "/", None, "<html>%thebe.head%</html>").unwrap_err();
+
+    assert!(matches!(err, CodegenError::InvalidAppHtml(_)));
   }
 }

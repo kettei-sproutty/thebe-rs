@@ -134,6 +134,56 @@
     }
   }
 
+  function _isExecutableScript(script) {
+    var type = (script.getAttribute("type") || "").trim().toLowerCase();
+    return (
+      !type ||
+      type === "text/javascript" ||
+      type === "application/javascript" ||
+      type === "module"
+    );
+  }
+
+  function _syncManagedHead(parsedDoc) {
+    var selector = "[data-thebe-head]";
+    var current = win.document.head.querySelectorAll(selector);
+    var incoming = parsedDoc.head.querySelectorAll(selector);
+    var i;
+
+    for (i = 0; i < current.length; i++) {
+      current[i].remove();
+    }
+
+    for (i = 0; i < incoming.length; i++) {
+      win.document.head.appendChild(incoming[i].cloneNode(true));
+    }
+  }
+
+  function _scrollToNavigationTarget(url) {
+    if (!url.hash) {
+      win.scrollTo(0, 0);
+      return;
+    }
+
+    var target = win.document.getElementById(
+      decodeURIComponent(url.hash.slice(1))
+    );
+    if (target) {
+      target.scrollIntoView();
+      return;
+    }
+
+    win.scrollTo(0, 0);
+  }
+
+  function _resolveUrl(href) {
+    try {
+      return new win.URL(href, win.location.href);
+    } catch (_) {
+      return null;
+    }
+  }
+
   /**
    * Re-evaluate all inline `<script>` elements found in a parsed document
    * body.  Scripts injected via `innerHTML` are inert; this clones them into
@@ -147,17 +197,31 @@
     var scripts = parsedBody.querySelectorAll("script");
     for (var i = 0; i < scripts.length; i++) {
       var src = scripts[i];
+      var type;
       // Skip the runtime bootstrap — already in scope.
-      if (src.textContent.indexOf("__thebe_runtime") !== -1) {
+      if (
+        src.id === "__thebe_props" ||
+        !_isExecutableScript(src) ||
+        src.textContent.indexOf("__thebe_runtime") !== -1
+      ) {
         continue;
       }
       var live = win.document.createElement("script");
-      if (src.type) {
-        live.type = src.type;
+      for (var j = 0; j < src.attributes.length; j++) {
+        live.setAttribute(src.attributes[j].name, src.attributes[j].value);
       }
+      if (src.src) {
+        live.src = src.src;
+        win.document.body.appendChild(live);
+        continue;
+      }
+      type = (live.type || "").trim().toLowerCase();
       // Wrap in an IIFE so each navigation gets a fresh scope and `let`/`const`
       // declarations from the previous page cannot conflict with the new page.
-      live.textContent = "(function(){\n" + src.textContent + "\n})();";
+      live.textContent =
+        type === "module"
+          ? src.textContent
+          : "(function(){\n" + src.textContent + "\n})();";
       win.document.body.appendChild(live);
     }
   }
@@ -169,9 +233,12 @@
    * history entry (unless `push` is false, e.g. on popstate), scrolls to the
    * top, and re-runs the new page's inline scripts + event wiring.
    */
-  function _navigate(href, push) {
+  function _navigate(url, push) {
+    var requestPath = url.pathname + url.search;
+    var historyPath = requestPath + url.hash;
+
     win
-      .fetch(href, { headers: { Accept: "text/html" } })
+      .fetch(requestPath, { headers: { Accept: "text/html" } })
       .then(function (r) {
         return r.text();
       })
@@ -179,18 +246,18 @@
         var parser = new win.DOMParser();
         var doc = parser.parseFromString(html, "text/html");
 
+        _syncManagedHead(doc);
+
         // Swap body content.
         win.document.body.innerHTML = doc.body.innerHTML;
 
         // Update history and title.
         if (push !== false) {
-          win.history.pushState({}, doc.title || "", href);
+          win.history.pushState({}, doc.title || "", historyPath);
         }
-        if (doc.title) {
-          win.document.title = doc.title;
-        }
+        win.document.title = doc.title;
 
-        win.scrollTo(0, 0);
+        _scrollToNavigationTarget(url);
 
         // Reset handler registry for the new page.
         _handlers = {};
@@ -216,28 +283,52 @@
    */
   function _initRouter() {
     win.document.addEventListener("click", function (e) {
+      var href;
+      var url;
+
+      if (
+        e.defaultPrevented ||
+        e.button !== 0 ||
+        e.metaKey ||
+        e.ctrlKey ||
+        e.shiftKey ||
+        e.altKey ||
+        !e.target ||
+        typeof e.target.closest !== "function"
+      ) {
+        return;
+      }
+
       var a = e.target.closest("a[href]");
       if (!a) {
         return;
       }
-      var href = a.getAttribute("href");
-      // Skip: empty, external, protocol-relative, hash-only, or opted-out.
+
+      href = a.getAttribute("href");
+      url = _resolveUrl(href);
+
+      // Skip: invalid, cross-origin, non-http(s), same-document hash, or opted-out.
       if (
-        !href ||
-        href.indexOf("://") !== -1 ||
-        href.startsWith("//") ||
-        href.startsWith("#") ||
-        a.hasAttribute("data-thebe-reload")
+        !url ||
+        url.origin !== win.location.origin ||
+        (url.protocol !== "http:" && url.protocol !== "https:") ||
+        a.hasAttribute("data-thebe-reload") ||
+        a.hasAttribute("download") ||
+        (a.target && a.target.toLowerCase() !== "_self") ||
+        (url.pathname === win.location.pathname &&
+          url.search === win.location.search &&
+          url.hash)
       ) {
         return;
       }
+
       e.preventDefault();
-      _navigate(href, true);
+      _navigate(url, true);
     });
 
     // Handle back/forward buttons.
     win.addEventListener("popstate", function () {
-      _navigate(win.location.pathname + win.location.search, false);
+      _navigate(new win.URL(win.location.href), false);
     });
   }
 

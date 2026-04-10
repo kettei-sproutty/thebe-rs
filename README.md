@@ -128,6 +128,7 @@ Thebe's design strictly bounds complexity by keeping server code, client updates
 ```
 my-app/
 ├── Cargo.toml
+├── app.html            # outer document shell (`%thebe.head%`, `%thebe.body%`)
 ├── src/
 │   ├── main.rs
 │   ├── routes/          # file-system router
@@ -143,6 +144,10 @@ my-app/
 │           └── Header.trs
 └── public/              # static assets (served via tower-http)
 ```
+
+`app.html` defines the document shell for every route. Thebe injects route CSS
+into `%thebe.head%` and the rendered page body plus hydration scripts into
+`%thebe.body%`.
 
 ### FS Router Rules
 
