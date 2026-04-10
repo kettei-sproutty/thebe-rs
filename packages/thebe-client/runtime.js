@@ -155,7 +155,9 @@
       if (src.type) {
         live.type = src.type;
       }
-      live.textContent = src.textContent;
+      // Wrap in an IIFE so each navigation gets a fresh scope and `let`/`const`
+      // declarations from the previous page cannot conflict with the new page.
+      live.textContent = "(function(){\n" + src.textContent + "\n})();";
       win.document.body.appendChild(live);
     }
   }
