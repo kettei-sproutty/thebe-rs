@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/thebe-parser",
   "crates/thebe-codegen",
+  "crates/thebe-runtime",
   "crates/thebe-cli",
 ]
 default-members = ["crates/thebe-cli"]
@@ -10,6 +11,7 @@ default-members = ["crates/thebe-cli"]
 [workspace.dependencies]
 thiserror = "2"
 anyhow = "1"
+serde_json = "1"
 
 [workspace.lints]
 clippy = { pedantic = "warn" }

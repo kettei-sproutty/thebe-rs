@@ -1,12 +1,15 @@
 use crate::error::CodegenError;
 
 /// A segment of a parsed Thebe template.
+///
+/// Used during validation; the field contents are intentionally not read by
+/// the codegen (which passes the raw template string to minijinja at runtime).
 #[derive(Debug)]
 pub enum TemplatePart {
     /// A run of static HTML text.
-    Literal(String),
+    Literal(#[allow(dead_code)] String),
     /// A `{{ ident }}` or `{{ ident.field }}` binding.
-    Binding(String),
+    Binding(#[allow(dead_code)] String),
 }
 
 /// Parse a Thebe template string into a flat list of [`TemplatePart`]s.
@@ -81,6 +84,7 @@ fn validate_binding(ident: &str) -> Result<(), CodegenError> {
 }
 
 /// Escape a string for use inside a Rust double-quoted string literal.
+#[allow(dead_code)] // retained for potential future use
 pub fn escape_rust_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -94,33 +98,6 @@ pub fn escape_rust_str(s: &str) -> String {
         }
     }
     out
-}
-
-/// Emit a sequence of `__html.push_str(...)` calls that build the full HTML
-/// response, wrapped in a minimal HTML document shell.
-pub fn generate_html_builder(parts: &[TemplatePart]) -> String {
-    let mut code = String::new();
-    code.push_str("    let mut __html = String::new();\n");
-    code.push_str(
-        "    __html.push_str(\"<!DOCTYPE html>\\n<html>\\n<body>\\n\");\n",
-    );
-
-    for part in parts {
-        match part {
-            TemplatePart::Literal(s) => {
-                let escaped = escape_rust_str(s);
-                code.push_str(&format!("    __html.push_str(\"{escaped}\");\n"));
-            }
-            TemplatePart::Binding(ident) => {
-                code.push_str(&format!(
-                    "    __html.push_str(&__props.{ident}.to_string());\n"
-                ));
-            }
-        }
-    }
-
-    code.push_str("    __html.push_str(\"\\n</body>\\n</html>\");\n");
-    code
 }
 
 #[cfg(test)]
