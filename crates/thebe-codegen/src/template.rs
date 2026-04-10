@@ -83,6 +83,125 @@ fn validate_binding(ident: &str) -> Result<(), CodegenError> {
     Ok(())
 }
 
+/// HTML tags that cause the browser parser to hoist or reject loose comment
+/// nodes placed inside them. Reactive bindings in these contexts fall back to
+/// `<span data-thebe-bind="…">` anchors instead of comment markers.
+const UNSAFE_CTX_TAGS: &[&str] = &[
+    "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "col",
+    "colgroup", "select", "option", "optgroup",
+];
+
+/// HTML void elements — never have children, so never pushed onto the tag
+/// context stack.
+fn is_void_element(name: &str) -> bool {
+    matches!(
+        name,
+        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input"
+            | "link" | "meta" | "param" | "source" | "track" | "wbr"
+    )
+}
+
+/// Transform a Thebe template so that each `{{ ident }}` binding is wrapped in
+/// an SSR hydration anchor appropriate for its DOM context.
+///
+/// **Safe contexts** (phrasing content, divs, spans, …):
+/// ```text
+/// {{ counter }}  →  <!--thebe:counter-->{{ counter }}<!--/thebe:counter-->
+/// ```
+///
+/// **Unsafe contexts** (table cells, `<select>`, …) where browsers hoist
+/// comment nodes out of the structure:
+/// ```text
+/// {{ counter }}  →  <span data-thebe-bind="counter">{{ counter }}</span>
+/// ```
+///
+/// Dotted paths (`{{ user.name }}`) use the full path as the anchor key.
+///
+/// Call [`parse_template`] first to validate the template; this function does
+/// not re-validate.
+pub fn inject_hydration_markers(template: &str) -> String {
+    let mut out = String::with_capacity(template.len() + 128);
+    let mut tag_stack: Vec<String> = Vec::new();
+    let mut chars = template.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            // Accumulate the full tag token up to and including `>`.
+            let mut tag_buf = String::from('<');
+            for c in chars.by_ref() {
+                tag_buf.push(c);
+                if c == '>' {
+                    break;
+                }
+            }
+
+            // Extract tag name and decide whether to push / pop the stack.
+            let inner = tag_buf.trim_start_matches('<').trim_end_matches('>').trim();
+            let is_closing = inner.starts_with('/');
+            let name_part = if is_closing { &inner[1..] } else { inner };
+            let name: String = name_part
+                .split(|c: char| c.is_whitespace() || c == '/')
+                .next()
+                .unwrap_or("")
+                .to_lowercase();
+
+            if !name.is_empty() {
+                if is_closing {
+                    if let Some(pos) = tag_stack.iter().rposition(|t| t == &name) {
+                        tag_stack.truncate(pos);
+                    }
+                } else if !is_void_element(&name) && !inner.ends_with('/') {
+                    tag_stack.push(name);
+                }
+            }
+
+            out.push_str(&tag_buf);
+        } else if ch == '{' && chars.peek().copied() == Some('{') {
+            chars.next(); // consume second `{`
+
+            let mut binding = String::new();
+            let mut closed = false;
+            loop {
+                match chars.next() {
+                    None => break,
+                    Some('}') if chars.peek().copied() == Some('}') => {
+                        chars.next(); // consume second `}`
+                        closed = true;
+                        break;
+                    }
+                    Some(c) => binding.push(c),
+                }
+            }
+
+            if !closed {
+                // Malformed — pass through; validation already caught this.
+                out.push_str("{{");
+                out.push_str(&binding);
+                continue;
+            }
+
+            let ident = binding.trim();
+            let in_unsafe_ctx = tag_stack
+                .iter()
+                .any(|t| UNSAFE_CTX_TAGS.contains(&t.as_str()));
+
+            if in_unsafe_ctx {
+                out.push_str(&format!(
+                    r#"<span data-thebe-bind="{ident}">{{{{ {ident} }}}}</span>"#
+                ));
+            } else {
+                out.push_str(&format!(
+                    "<!--thebe:{ident}-->{{{{ {ident} }}}}<!--/thebe:{ident}-->"
+                ));
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+
+    out
+}
+
 /// Escape a string for use inside a Rust double-quoted string literal.
 #[allow(dead_code)] // retained for potential future use
 pub fn escape_rust_str(s: &str) -> String {
@@ -130,5 +249,65 @@ mod tests {
         assert!(parse_template("{{ a + b }}").is_err());
         assert!(parse_template("{{ fn() }}").is_err());
         assert!(parse_template("{{ }}").is_err());
+    }
+
+    // ── inject_hydration_markers ────────────────────────────────────────────
+
+    #[test]
+    fn hydration_safe_context_emits_comment_markers() {
+        let out = inject_hydration_markers("<span>{{ counter }}</span>");
+        assert_eq!(
+            out,
+            "<span><!--thebe:counter-->{{ counter }}<!--/thebe:counter--></span>"
+        );
+    }
+
+    #[test]
+    fn hydration_dotted_path_uses_full_key() {
+        let out = inject_hydration_markers("<p>{{ user.name }}</p>");
+        assert_eq!(
+            out,
+            "<p><!--thebe:user.name-->{{ user.name }}<!--/thebe:user.name--></p>"
+        );
+    }
+
+    #[test]
+    fn hydration_inside_table_cell_emits_span() {
+        let out = inject_hydration_markers(
+            "<table><tr><td>{{ count }}</td></tr></table>",
+        );
+        assert!(
+            out.contains(r#"<span data-thebe-bind="count">{{ count }}</span>"#),
+            "expected data-thebe-bind span, got: {out}"
+        );
+    }
+
+    #[test]
+    fn hydration_after_table_reverts_to_comment_markers() {
+        let out = inject_hydration_markers(
+            "<table><tr><td>{{ a }}</td></tr></table><p>{{ b }}</p>",
+        );
+        assert!(out.contains(r#"data-thebe-bind="a""#), "a should use span");
+        assert!(
+            out.contains("<!--thebe:b-->{{ b }}<!--/thebe:b-->"),
+            "b should use comment markers"
+        );
+    }
+
+    #[test]
+    fn hydration_inside_select_emits_span() {
+        let out = inject_hydration_markers(
+            "<select><option>{{ label }}</option></select>",
+        );
+        assert!(
+            out.contains(r#"data-thebe-bind="label""#),
+            "expected data-thebe-bind inside select"
+        );
+    }
+
+    #[test]
+    fn hydration_no_bindings_is_passthrough() {
+        let tmpl = "<h1>Hello world</h1>";
+        assert_eq!(inject_hydration_markers(tmpl), tmpl);
     }
 }

@@ -51,7 +51,8 @@ pub fn generate_route(
         format!("    let __props = {handler_name}();\n")
     };
 
-    let template_literal = escape_rust_raw_str(&blocks.template);
+    let template_with_markers = template::inject_hydration_markers(&blocks.template);
+    let template_literal = escape_rust_raw_str(&template_with_markers);
 
     // Process the optional `<script lang="ts">` block.
     let client_js = blocks
