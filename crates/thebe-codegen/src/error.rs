@@ -3,6 +3,14 @@ pub enum CodegenError {
     #[error("parse error: {0}")]
     Parse(#[from] thebe_parser::ParseError),
 
+    #[error(
+        "unsupported HTTP method attribute `#[thebe::{0}]` — supported: get, post, put, patch, delete, head, options"
+    )]
+    UnsupportedMethod(String),
+
+    #[error("could not parse the handler signature after `#[thebe::{0}]`")]
+    InvalidHandlerSignature(String),
+
     #[error("unclosed binding — every `{{{{` must be closed with `}}}}`")]
     UnclosedBinding,
 

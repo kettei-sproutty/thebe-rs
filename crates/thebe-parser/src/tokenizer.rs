@@ -37,6 +37,17 @@ impl BlockKind {
     }
 }
 
+struct OpeningTag<'a> {
+    name: &'a str,
+    attrs: Vec<Attribute<'a>>,
+    end: usize,
+}
+
+struct Attribute<'a> {
+    name: &'a str,
+    value: Option<&'a str>,
+}
+
 /// Parse a `.trs` file into its constituent blocks.
 ///
 /// Uses an HTML5-aware approach: `<script>` and `<style>` are treated as
@@ -104,38 +115,17 @@ pub fn parse_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
 fn try_extract_block(
     input: &str,
 ) -> Result<Option<(BlockKind, &str, &str)>, ParseError> {
-    // Identify the block kind by matching the opening tag prefix.
-    // All comparisons are on ASCII characters, so a byte-level lower-case
-    // check is sufficient and avoids allocating a lowercase copy of the full
-    // input.
-    let kind = if ascii_starts_with_ignore_case(input, "<script") {
-        // Need to inspect the attributes to distinguish the two script kinds.
-        classify_script_tag(input)
-    } else if ascii_starts_with_ignore_case(input, "<style") {
-        // Make sure the next char after "<style" is `>` or whitespace, not
-        // an unrelated tag name like `<stylesheet>`.
-        let after_keyword = &input["<style".len()..];
-        if after_keyword
-            .starts_with(|c: char| c == '>' || c.is_ascii_whitespace())
-        {
-            Some(BlockKind::Style)
-        } else {
-            None
-        }
-    } else {
-        None
+    let Some(tag) = parse_opening_tag(input) else {
+        return Ok(None);
     };
+
+    let kind = classify_opening_tag(&tag);
 
     let Some(kind) = kind else {
         return Ok(None);
     };
 
-    // Find the `>` that closes the opening tag.
-    let Some(open_end) = input.find('>') else {
-        return Err(ParseError::UnclosedBlock(kind.label().to_owned()));
-    };
-
-    let content_start = open_end + 1;
+    let content_start = tag.end + 1;
     let content_and_rest = &input[content_start..];
     let close_tag = kind.close_tag();
 
@@ -157,30 +147,137 @@ fn try_extract_block(
     Ok(Some((kind, content, after)))
 }
 
-/// Determine whether the `<script ...>` opening tag at `input` is a setup
-/// block, a TypeScript block, or something else (in which case `None` is
-/// returned so the tag passes through to the template).
-fn classify_script_tag(input: &str) -> Option<BlockKind> {
-    // Collect everything up to the first `>` as the attribute string.
-    let gt_pos = input.find('>')?;
-    let attrs_region = &input[..gt_pos];
+fn classify_opening_tag(tag: &OpeningTag<'_>) -> Option<BlockKind> {
+    if tag.name.eq_ignore_ascii_case("style") {
+        return Some(BlockKind::Style);
+    }
+    if !tag.name.eq_ignore_ascii_case("script") {
+        return None;
+    }
 
-    // Check for the `setup` attribute (bare or with value).
-    if attrs_region.contains("setup") {
-        return Some(BlockKind::ScriptSetup);
+    for attr in &tag.attrs {
+        if attr.name.eq_ignore_ascii_case("setup") {
+            return Some(BlockKind::ScriptSetup);
+        }
+        if attr.name.eq_ignore_ascii_case("lang")
+            && attr.value.is_some_and(|value| value.eq_ignore_ascii_case("ts"))
+        {
+            return Some(BlockKind::ScriptTs);
+        }
     }
-    // Check for `lang="ts"` or `lang='ts'`.
-    if attrs_region.contains(r#"lang="ts""#) || attrs_region.contains("lang='ts'") {
-        return Some(BlockKind::ScriptTs);
-    }
-    // Plain `<script>` — not a Thebe block we extract.
+
     None
 }
 
-/// Returns `true` if `haystack` starts with `needle`, ignoring ASCII case.
-fn ascii_starts_with_ignore_case(haystack: &str, needle: &str) -> bool {
-    haystack.len() >= needle.len()
-        && haystack[..needle.len()].eq_ignore_ascii_case(needle)
+fn parse_opening_tag(input: &str) -> Option<OpeningTag<'_>> {
+    let bytes = input.as_bytes();
+    if bytes.first().copied()? != b'<' {
+        return None;
+    }
+    if bytes.get(1).is_some_and(|byte| *byte == b'/') {
+        return None;
+    }
+
+    let mut idx = 1usize;
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+
+    let name_start = idx;
+    while idx < bytes.len() && is_tag_name_byte(bytes[idx]) {
+        idx += 1;
+    }
+    if idx == name_start {
+        return None;
+    }
+    let name_end = idx;
+
+    let mut attrs = Vec::new();
+    loop {
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        if idx >= bytes.len() {
+            return None;
+        }
+        match bytes[idx] {
+            b'>' => {
+                return Some(OpeningTag {
+                    name: &input[name_start..name_end],
+                    attrs,
+                    end: idx,
+                });
+            }
+            b'/' if bytes.get(idx + 1).is_some_and(|byte| *byte == b'>') => {
+                return Some(OpeningTag {
+                    name: &input[name_start..name_end],
+                    attrs,
+                    end: idx + 1,
+                });
+            }
+            _ => {}
+        }
+
+        let attr_start = idx;
+        while idx < bytes.len()
+            && !bytes[idx].is_ascii_whitespace()
+            && bytes[idx] != b'='
+            && bytes[idx] != b'>'
+            && bytes[idx] != b'/'
+        {
+            idx += 1;
+        }
+        if idx == attr_start {
+            return None;
+        }
+
+        let name = &input[attr_start..idx];
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+
+        let value = if bytes.get(idx).is_some_and(|byte| *byte == b'=') {
+            idx += 1;
+            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+            if idx >= bytes.len() {
+                return None;
+            }
+
+            if matches!(bytes[idx], b'"' | b'\'') {
+                let quote = bytes[idx];
+                idx += 1;
+                let value_start = idx;
+                while idx < bytes.len() && bytes[idx] != quote {
+                    idx += 1;
+                }
+                if idx >= bytes.len() {
+                    return None;
+                }
+                let value = &input[value_start..idx];
+                idx += 1;
+                Some(value)
+            } else {
+                let value_start = idx;
+                while idx < bytes.len()
+                    && !bytes[idx].is_ascii_whitespace()
+                    && bytes[idx] != b'>'
+                {
+                    idx += 1;
+                }
+                Some(&input[value_start..idx])
+            }
+        } else {
+            None
+        };
+
+        attrs.push(Attribute { name, value });
+    }
+}
+
+fn is_tag_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-')
 }
 
 fn trim_newlines(s: &str) -> String {
@@ -234,5 +331,26 @@ h1 { color: red; }
     fn parse_sfc_returns_error_on_duplicate_block() {
         let input = "<script setup>fn a() {}</script>\n<script setup>fn b() {}</script>";
         assert!(parse_sfc(input).is_err());
+    }
+
+    #[test]
+    fn parse_sfc_handles_gt_inside_attribute_values() {
+        let input = r#"<script setup data-note="> still inside attr">
+pub fn handler() {}
+</script>
+<h1>Hello</h1>"#;
+        let blocks = parse_sfc(input).unwrap();
+        assert!(blocks.script_setup.is_some());
+        assert_eq!(blocks.template, "<h1>Hello</h1>");
+    }
+
+    #[test]
+    fn parse_sfc_does_not_misclassify_script_from_attribute_values() {
+        let input = r#"<script data-kind="setup" data-lang="lang=ts">alert('hi');</script>
+<p>Hello</p>"#;
+        let blocks = parse_sfc(input).unwrap();
+        assert!(blocks.script_setup.is_none());
+        assert!(blocks.script_ts.is_none());
+        assert!(blocks.template.contains("<script data-kind=\"setup\" data-lang=\"lang=ts\">"));
     }
 }

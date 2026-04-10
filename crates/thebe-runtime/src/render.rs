@@ -6,6 +6,11 @@ use crate::error::RuntimeError;
 /// `ctx` is the serialised `Props` value.
 ///
 /// Returns the rendered HTML body fragment (without the outer shell).
+///
+/// # Errors
+///
+/// Returns [`RuntimeError`] when the template cannot be compiled or rendered
+/// by `MiniJinja`.
 pub fn render_template(
     template: &str,
     ctx: &serde_json::Value,

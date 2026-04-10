@@ -8,7 +8,8 @@ pub fn run() -> anyhow::Result<()> {
     let project_root = find_project_root()?;
     println!("thebe: project root at {}", project_root.display());
 
-    let routes_dir = project_root.join("src").join("routes");
+    let src_dir = project_root.join("src");
+    let routes_dir = src_dir.join("routes");
     anyhow::ensure!(
         routes_dir.exists(),
         "no `src/routes/` directory found — create your route `.trs` files there"
@@ -30,7 +31,7 @@ pub fn run() -> anyhow::Result<()> {
             .with_context(|| format!("parse error in {}", trs_path.display()))?;
 
         let route_path = file_to_route_path(trs_path, &routes_dir);
-        let mod_name = file_to_mod_name(trs_path);
+        let mod_name = file_to_mod_name(trs_path, &routes_dir);
 
         let generated = thebe_codegen::generate_route(&blocks, &route_path)
             .with_context(|| format!("codegen error for {}", trs_path.display()))?;
@@ -45,9 +46,15 @@ pub fn run() -> anyhow::Result<()> {
             rs_path.display()
         );
 
+        let source_path = rs_path
+            .strip_prefix(&src_dir)
+            .with_context(|| format!("generated route {} is outside src/", rs_path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+
         route_entries.push(thebe_codegen::RouteEntry {
             mod_name,
-            route_path,
+            source_path,
         });
     }
 
@@ -94,6 +101,7 @@ fn collect_trs_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
             files.push(entry.into_path());
         }
     }
+    files.sort();
     Ok(files)
 }
 
@@ -132,10 +140,91 @@ fn file_to_route_path(trs_path: &Path, routes_dir: &Path) -> String {
 }
 
 /// Derive the Rust module name from the `.trs` filename stem.
-fn file_to_mod_name(trs_path: &Path) -> String {
-    trs_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .replace('-', "_")
+fn file_to_mod_name(trs_path: &Path, routes_dir: &Path) -> String {
+    let rel = trs_path
+        .strip_prefix(routes_dir)
+        .unwrap_or(trs_path);
+
+    let mut parts: Vec<String> = rel
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(last) = parts.last_mut() {
+        let stem = Path::new(last)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        *last = stem;
+    }
+
+    let module = parts
+        .iter()
+        .map(|part| sanitize_module_segment(part))
+        .collect::<Vec<_>>()
+        .join("__");
+
+    format!("route__{module}")
+}
+
+fn sanitize_module_segment(segment: &str) -> String {
+    let raw = if let Some(dynamic) = segment
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        format!("dyn_{dynamic}")
+    } else {
+        segment.to_owned()
+    };
+
+    let mut out = String::new();
+    let mut prev_was_underscore = false;
+    for ch in raw.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            prev_was_underscore = false;
+            ch.to_ascii_lowercase()
+        } else {
+            if prev_was_underscore {
+                continue;
+            }
+            prev_was_underscore = true;
+            '_'
+        };
+        out.push(mapped);
+    }
+
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("route");
+    }
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_to_route_path_maps_nested_and_dynamic_routes() {
+        let routes_dir = Path::new("/tmp/app/src/routes");
+        let path = Path::new("/tmp/app/src/routes/blog/[slug].trs");
+        assert_eq!(file_to_route_path(path, routes_dir), "/blog/:slug");
+    }
+
+    #[test]
+    fn file_to_mod_name_uses_relative_path_segments() {
+        let routes_dir = Path::new("/tmp/app/src/routes");
+        let path = Path::new("/tmp/app/src/routes/blog/[slug].trs");
+        assert_eq!(file_to_mod_name(path, routes_dir), "route__blog__dyn_slug");
+    }
+
+    #[test]
+    fn sanitize_module_segment_normalizes_static_segments() {
+        assert_eq!(sanitize_module_segment("My-page"), "my_page");
+    }
 }

@@ -4,6 +4,7 @@
 /// `props_json` — the serialised `Props` JSON string injected as
 ///   `<script id="__thebe_props" type="application/json">` for the client
 ///   runtime to consume during hydration.
+#[must_use]
 pub fn html_shell(body: &str, props_json: &str) -> String {
     format!(
         "<!DOCTYPE html>\n\
