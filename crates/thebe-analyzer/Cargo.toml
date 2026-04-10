@@ -1,11 +1,9 @@
 [package]
-name = "thebe-codegen"
+name = "thebe-analyzer"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-thebe-parser = { path = "../thebe-parser" }
-thebe-analyzer = { path = "../thebe-analyzer" }
 thiserror = { workspace = true }
 
 [lints]

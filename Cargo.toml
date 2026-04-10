@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "crates/thebe-parser",
+  "crates/thebe-analyzer",
   "crates/thebe-codegen",
   "crates/thebe-runtime",
   "crates/thebe-cli",

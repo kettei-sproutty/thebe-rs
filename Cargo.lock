@@ -237,6 +237,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "thebe-analyzer"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "thebe-cli"
 version = "0.1.0"
 dependencies = [
@@ -251,6 +258,7 @@ dependencies = [
 name = "thebe-codegen"
 version = "0.1.0"
 dependencies = [
+ "thebe-analyzer",
  "thebe-parser",
  "thiserror",
 ]
