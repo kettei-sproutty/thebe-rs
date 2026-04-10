@@ -1,15 +1,20 @@
 <script setup>
+use rand::RngExt;
+
 struct Props {
     title: String,
-    count: i32,
+    count: u32,
 }
 
 #[thebe::get]
 pub fn handler() -> Props {
-    Props {
-        title: "Thebe Counter".to_string(),
-        count: 0,
-    }
+  let mut rng = rand::rng();
+  let random_number: u32 = rng.random();
+
+  Props {
+    title: "Thebe Counter".to_string(),
+    count: random_number
+  }
 }
 </script>
 
@@ -23,18 +28,26 @@ function increment() {
 function decrement() {
     props.count -= 1;
 }
+
+function reset() {
+    props.count = 0;
+}
 </script>
 
 <main>
-    <h1>{{ title }}</h1>
-    <p class="count">{{ count }}</p>
-    <div class="controls">
-        <button onclick="decrement">−</button>
-        <button onclick="increment">+</button>
-    </div>
+    <h1>{{ title }}, World!</h1>
     <nav>
         <a href="/about">About</a>
     </nav>
+     <div class="controls">
+      <button onclick="decrement">−</button>
+      <button onclick="increment">+</button>
+      <button onclick="reset">Reset</button>
+    </div>
+    <div style="display: flex; gap: 1rem; justify-content: center; margin-bottom: 2rem;">
+      <p class="count">{{ count }}!!</p>
+    </div>
+
 </main>
 
 <style>
