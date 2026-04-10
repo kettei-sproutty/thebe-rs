@@ -1,3 +1,7 @@
+<head>
+    <meta name="application-name" content="Thebe Counter" />
+</head>
+
 <header>
     <nav>
         <a href="/">Counter</a>

@@ -30,6 +30,11 @@ pub fn handler_post() -> Props {
 }
 </script>
 
+<head>
+  <title>{{ title }}</title>
+  <meta name="description" content="A server-rendered reactive counter demo for Thebe." />
+</head>
+
 <script lang="ts">
 let props = getProps<Props>();
 

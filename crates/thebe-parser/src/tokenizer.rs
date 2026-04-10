@@ -3,6 +3,8 @@ use crate::error::ParseError;
 /// The four blocks extracted from a `.trs` Single File Component.
 #[derive(Debug, Default)]
 pub struct SfcBlocks {
+  /// Content of `<head>` — route/layout head contribution HTML.
+  pub head: Option<String>,
   /// Content of `<script setup>` — server route module (Rust).
   pub script_setup: Option<String>,
   /// Content of `<script lang="ts">` — browser-side TypeScript.
@@ -15,6 +17,7 @@ pub struct SfcBlocks {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum BlockKind {
+  Head,
   ScriptSetup,
   ScriptTs,
   Style,
@@ -23,6 +26,7 @@ enum BlockKind {
 impl BlockKind {
   fn label(self) -> &'static str {
     match self {
+      Self::Head => "head",
       Self::ScriptSetup => "script setup",
       Self::ScriptTs => r#"script lang="ts""#,
       Self::Style => "style",
@@ -31,6 +35,7 @@ impl BlockKind {
 
   fn close_tag(self) -> &'static str {
     match self {
+      Self::Head => "</head>",
       Self::ScriptSetup | Self::ScriptTs => "</script>",
       Self::Style => "</style>",
     }
@@ -76,6 +81,12 @@ pub fn parse_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
     if let Some((kind, content, after)) = try_extract_block(from_lt)? {
       template_parts.push(before);
       match kind {
+        BlockKind::Head => {
+          if blocks.head.is_some() {
+            return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
+          }
+          blocks.head = Some(trim_newlines(content));
+        }
         BlockKind::ScriptSetup => {
           if blocks.script_setup.is_some() {
             return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
@@ -149,6 +160,9 @@ fn try_extract_block(input: &str) -> Result<Option<(BlockKind, &str, &str)>, Par
 }
 
 fn classify_opening_tag(tag: &OpeningTag<'_>) -> Option<BlockKind> {
+  if tag.name.eq_ignore_ascii_case("head") {
+    return Some(BlockKind::Head);
+  }
   if tag.name.eq_ignore_ascii_case("style") {
     return Some(BlockKind::Style);
   }
@@ -300,6 +314,10 @@ pub fn handler() -> Props { Props { title: "hi".into() } }
 let x = 1;
 </script>
 
+<head>
+<title>Thebe</title>
+</head>
+
 <h1>{{ title }}</h1>
 
 <style>
@@ -307,6 +325,7 @@ h1 { color: red; }
 </style>"#;
 
     let blocks = parse_sfc(input).unwrap();
+    assert!(blocks.head.is_some());
     assert!(blocks.script_setup.is_some());
     assert!(blocks.script_ts.is_some());
     assert!(blocks.style.is_some());
@@ -331,6 +350,15 @@ h1 { color: red; }
   fn parse_sfc_returns_error_on_duplicate_block() {
     let input = "<script setup>fn a() {}</script>\n<script setup>fn b() {}</script>";
     assert!(parse_sfc(input).is_err());
+  }
+
+  #[test]
+  fn parse_sfc_extracts_head_block() {
+    let input = "<head><title>Example</title></head>\n<h1>Hello</h1>";
+    let blocks = parse_sfc(input).unwrap();
+
+    assert_eq!(blocks.head.as_deref(), Some("<title>Example</title>"));
+    assert_eq!(blocks.template, "<h1>Hello</h1>");
   }
 
   #[test]

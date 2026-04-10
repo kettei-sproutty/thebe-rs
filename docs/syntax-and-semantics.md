@@ -7,6 +7,7 @@ Thebe uses the `.trs` extension to define routes and components. To ensure predi
 ### Route Files (`src/routes/**/*.trs`)
 Route files define the entry points for your application.
 
+- `<head>`: Optional route or layout head contribution. Non-title tags are merged into `app.html`'s `%thebe.head%`, and `<title>` content renders into `%thebe.title%` when present.
 - `<script setup>`: Server route module scope. This block is **compiled into the server-side route module**. It may define standard Rust imports, helper functions, the `Props` struct, and HTTP handlers (annotated with `#[thebe::get]`, `#[thebe::post]`, etc.).
 - `<script lang="ts">`: Browser-only client code. Runs after hydration to provide local interactivity.
 - **Template**: HTML layout combining static SSR output and fine-grained hydration targets.

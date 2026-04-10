@@ -29,6 +29,9 @@ pub enum CodegenError {
   #[error("invalid app.html: {0}")]
   InvalidAppHtml(String),
 
+  #[error("invalid <head> block: {0}")]
+  InvalidHead(String),
+
   #[error("CSS error: {0}")]
   CssError(String),
 }

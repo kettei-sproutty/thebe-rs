@@ -146,8 +146,13 @@ my-app/
 ```
 
 `app.html` defines the document shell for every route. Thebe injects route CSS
-into `%thebe.head%` and the rendered page body plus hydration scripts into
-`%thebe.body%`.
+and route/layout head contributions into `%thebe.head%`, and the rendered page
+body plus hydration scripts into `%thebe.body%`.
+
+If you want per-route titles, add `%thebe.title%` inside a `<title>` tag in
+`app.html`. A route or `_layout.trs` file can then declare a top-level
+`<head>` block, and its `<title>` content will be rendered into that
+placeholder while the rest of the head tags are merged into `%thebe.head%`.
 
 ### FS Router Rules
 

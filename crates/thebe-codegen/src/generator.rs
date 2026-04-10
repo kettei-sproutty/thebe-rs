@@ -8,6 +8,7 @@ use thebe_parser::SfcBlocks;
 /// external CDN or npm install is required during `thebe dev`.
 const THEBE_CLIENT_RUNTIME: &str = include_str!("../../../packages/thebe-client/runtime.js");
 
+const APP_HTML_TITLE_PLACEHOLDER: &str = "%thebe.title%";
 const APP_HTML_HEAD_PLACEHOLDER: &str = "%thebe.head%";
 const APP_HTML_BODY_PLACEHOLDER: &str = "%thebe.body%";
 const DEFAULT_APP_HTML: &str = r#"<!DOCTYPE html>
@@ -62,7 +63,9 @@ struct RouteHandler {
 #[derive(Clone, Copy)]
 struct ModuleLiterals<'a> {
   app_html: &'a str,
+  head_template: &'a str,
   template: &'a str,
+  title_template: &'a str,
   runtime: &'a str,
   client_script: &'a str,
   style: &'a str,
@@ -75,6 +78,19 @@ struct ModuleLiterals<'a> {
 struct WrapperSource<'a> {
   params: &'a str,
   call: &'a str,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct HeadFragments {
+  title_template: Option<String>,
+  html_template: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessedLayout {
+  template: String,
+  style: String,
+  head: HeadFragments,
 }
 
 /// Metadata the CLI provides about a discovered route file.
@@ -102,7 +118,8 @@ pub fn default_app_html() -> &'static str {
 /// duplicated.
 pub fn validate_app_html(app_html: &str) -> Result<(), CodegenError> {
   validate_app_html_placeholder(app_html, APP_HTML_HEAD_PLACEHOLDER)?;
-  validate_app_html_placeholder(app_html, APP_HTML_BODY_PLACEHOLDER)
+  validate_app_html_placeholder(app_html, APP_HTML_BODY_PLACEHOLDER)?;
+  validate_optional_app_html_placeholder(app_html, APP_HTML_TITLE_PLACEHOLDER)
 }
 
 fn validate_app_html_placeholder(app_html: &str, placeholder: &str) -> Result<(), CodegenError> {
@@ -115,6 +132,20 @@ fn validate_app_html_placeholder(app_html: &str, placeholder: &str) -> Result<()
     _ => Err(CodegenError::InvalidAppHtml(format!(
       "`{placeholder}` must appear exactly once"
     ))),
+  }
+}
+
+fn validate_optional_app_html_placeholder(
+  app_html: &str,
+  placeholder: &str,
+) -> Result<(), CodegenError> {
+  let count = app_html.match_indices(placeholder).count();
+  if count <= 1 {
+    Ok(())
+  } else {
+    Err(CodegenError::InvalidAppHtml(format!(
+      "`{placeholder}` must appear at most once"
+    )))
   }
 }
 
@@ -154,6 +185,8 @@ pub fn generate_route(
   // Validate the template before committing to codegen.
   template::parse_template(&blocks.template)?;
 
+  let route_head = process_head_block(blocks.head.as_deref())?;
+
   let handler = find_handler(setup)?;
   let setup_clean = strip_thebe_attrs(setup);
   let setup_with_serde = inject_serde_derive(&setup_clean);
@@ -190,9 +223,8 @@ pub fn generate_route(
     .unwrap_or_default();
 
   let app_html_literal = escape_rust_raw_str(app_html);
-  let template_literal = escape_rust_raw_str(&template_scoped);
   let style_literal = escape_rust_raw_str(&style);
-  let route_path_literal = escape_rust_raw_str(route_path);
+  let template_literal = escape_rust_raw_str(&template_scoped);
 
   // Process the optional `<script lang="ts">` block.
   let client_js = blocks
@@ -214,28 +246,47 @@ pub fn generate_route(
     })
     .transpose()?;
 
-  // Build the final style literal and optional layout template literal.
-  // When a layout is present, layout style is prepended to the route style.
-  let (final_style_literal, layout_template_opt) = match layout_processed {
-    Some((scoped_layout_tmpl, layout_style)) => {
-      let merged_style = if layout_style.is_empty() {
+  // Build the final style literal, optional layout template literal, and
+  // merged head contribution. Route titles override layout titles.
+  let (final_style_literal, layout_template_opt, merged_head) = match layout_processed {
+    Some(processed_layout) => {
+      let merged_style = if processed_layout.style.is_empty() {
         style.clone()
       } else if style.is_empty() {
-        layout_style
+        processed_layout.style.clone()
       } else {
-        format!("{layout_style}\n{style}")
+        format!("{}\n{style}", processed_layout.style)
       };
       (
         escape_rust_raw_str(&merged_style),
-        Some(escape_rust_raw_str(&scoped_layout_tmpl)),
+        Some(escape_rust_raw_str(&processed_layout.template)),
+        merge_head_fragments(&processed_layout.head, &route_head),
       )
     }
-    None => (style_literal.clone(), None),
+    None => (style_literal.clone(), None, route_head),
   };
+
+  if merged_head.title_template.is_some() && !app_html.contains(APP_HTML_TITLE_PLACEHOLDER) {
+    return Err(CodegenError::InvalidAppHtml(
+      "route or layout `<head>` uses `<title>`, but app.html is missing `%thebe.title%`"
+        .to_owned(),
+    ));
+  }
+
+  let head_literal = escape_rust_raw_str(&merged_head.html_template);
+  let title_literal = escape_rust_raw_str(
+    merged_head
+      .title_template
+      .as_deref()
+      .unwrap_or_default(),
+  );
+  let route_path_literal = escape_rust_raw_str(route_path);
 
   let literals = ModuleLiterals {
     app_html: &app_html_literal,
+    head_template: &head_literal,
     template: &template_literal,
+    title_template: &title_literal,
     runtime: &runtime_literal,
     client_script: &client_script_literal,
     style: &final_style_literal,
@@ -281,7 +332,11 @@ fn build_route_module(
 
 fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
   writeln!(source, "const __APP_HTML: &str = {};", literals.app_html).expect("infallible");
+  writeln!(source, "const __HEAD_TEMPLATE: &str = {};", literals.head_template)
+    .expect("infallible");
   writeln!(source, "const __TEMPLATE: &str = {};", literals.template).expect("infallible");
+  writeln!(source, "const __TITLE_TEMPLATE: &str = {};", literals.title_template)
+    .expect("infallible");
   writeln!(
     source,
     "const __CLIENT_RUNTIME: &str = {};",
@@ -306,10 +361,23 @@ fn write_support_fns(source: &mut String) {
   source.push_str(
     "type __ThebeResponse = Result<axum::response::Html<String>, axum::response::Response>;\n\n",
   );
-  source.push_str("fn __thebe_render_app_html(head: &str, body: &str) -> String {\n");
+  source.push_str("fn __thebe_render_app_html(title: &str, head: &str, body: &str) -> String {\n");
   source.push_str("    __APP_HTML\n");
+  source.push_str("        .replace(\"%thebe.title%\", title)\n");
   source.push_str("        .replace(\"%thebe.head%\", head)\n");
   source.push_str("        .replace(\"%thebe.body%\", body)\n");
+  source.push_str("}\n\n");
+  source.push_str(
+    "fn __thebe_render_fragment(\n        template_name: &str,\n        template_source: &str,\n        ctx: &serde_json::Value,\n        compile_stage: &str,\n        load_stage: &str,\n        render_stage: &str,\n    ) -> Result<String, axum::response::Response> {\n",
+  );
+  source.push_str("    use minijinja::Environment;\n\n");
+  source.push_str("    let mut env = Environment::new();\n");
+  source.push_str(
+    "    env.add_template(template_name, template_source)\n        .map_err(|err| __thebe_internal_error(compile_stage, err))?;\n",
+  );
+  source.push_str(
+    "    env.get_template(template_name)\n        .map_err(|err| __thebe_internal_error(load_stage, err))?\n        .render(ctx)\n        .map_err(|err| __thebe_internal_error(render_stage, err))\n",
+  );
   source.push_str("}\n\n");
   source.push_str("fn __thebe_escape_html(input: &str) -> String {\n");
   source.push_str("    let mut escaped = String::with_capacity(input.len());\n");
@@ -359,22 +427,15 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
     "    let __ctx = serde_json::to_value(&__props)\
          .map_err(|err| __thebe_internal_error(\"serialize props\", err))?;\n",
   );
-  source.push_str("    let __body = {\n");
-  source.push_str("        use minijinja::Environment;\n");
-  source.push_str("        let mut env = Environment::new();\n");
   source.push_str(
-    "        env.add_template(\"__page\", __TEMPLATE)\
-         .map_err(|err| __thebe_internal_error(\"compile template\", err))?;\n",
+    "    let __title = if __TITLE_TEMPLATE.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__title\",\n            __TITLE_TEMPLATE,\n            &__ctx,\n            \"compile title template\",\n            \"load title template\",\n            \"render title template\",\n        )?\n    };\n",
   );
   source.push_str(
-    "        env.get_template(\"__page\")\
-         .map_err(|err| __thebe_internal_error(\"load template\", err))?\n",
+    "    let __head_html = if __HEAD_TEMPLATE.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__head\",\n            __HEAD_TEMPLATE,\n            &__ctx,\n            \"compile head template\",\n            \"load head template\",\n            \"render head template\",\n        )?\n    };\n",
   );
   source.push_str(
-    "            .render(&__ctx)\
-         .map_err(|err| __thebe_internal_error(\"render template\", err))?\n",
+    "    let __body = __thebe_render_fragment(\n        \"__page\",\n        __TEMPLATE,\n        &__ctx,\n        \"compile template\",\n        \"load template\",\n        \"render template\",\n    )?;\n",
   );
-  source.push_str("    };\n");
   write_html_assembly(source);
   source.push_str("}\n\n");
 }
@@ -384,15 +445,20 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
 ///
 /// Preconditions (variables that must already be in scope in the generated code):
 /// - `__ctx: serde_json::Value`
+/// - `__head_html: String`
+/// - `__title: String`
 /// - `__body: String`
 fn write_html_assembly(source: &mut String) {
   source.push_str("    let __props_json = __ctx.to_string();\n");
   source.push_str(
-    r##"    let __head = if __STYLE.is_empty() {
-        String::new()
-    } else {
-        format!(r#"<style data-thebe-head="style">{style}</style>"#, style = __STYLE)
-    };
+  r##"    let __head = if __STYLE.is_empty() {
+    __head_html
+  } else if __head_html.is_empty() {
+    format!(r#"<style data-thebe-head="style">{style}</style>"#, style = __STYLE)
+  } else {
+    format!(r#"{head}
+<style data-thebe-head="style">{style}</style>"#, head = __head_html, style = __STYLE)
+  };
     let __body_with_scripts = format!(r#"{body}
 <script id="__thebe_props" type="application/json">{props_json}</script>
 <script>{runtime}</script>
@@ -404,7 +470,7 @@ fn write_html_assembly(source: &mut String) {
   source.push_str("        runtime = __CLIENT_RUNTIME,\n");
   source.push_str("        user_script = __CLIENT_SCRIPT,\n");
   source.push_str("    );\n");
-  source.push_str("    let __html = __thebe_render_app_html(&__head, &__body_with_scripts);\n");
+  source.push_str("    let __html = __thebe_render_app_html(&__title, &__head, &__body_with_scripts);\n");
   source.push_str("    Ok(axum::response::Html(__html))\n");
 }
 
@@ -426,43 +492,22 @@ fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<
     "    let __ctx = serde_json::to_value(&__props)\
          .map_err(|err| __thebe_internal_error(\"serialize props\", err))?;\n",
   );
-  // Render the route template into a string first.
-  source.push_str("    let __route_body = {\n");
-  source.push_str("        use minijinja::Environment;\n");
-  source.push_str("        let mut env = Environment::new();\n");
   source.push_str(
-    "        env.add_template(\"__page\", __TEMPLATE)\
-         .map_err(|err| __thebe_internal_error(\"compile template\", err))?;\n",
+    "    let __title = if __TITLE_TEMPLATE.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__title\",\n            __TITLE_TEMPLATE,\n            &__ctx,\n            \"compile title template\",\n            \"load title template\",\n            \"render title template\",\n        )?\n    };\n",
   );
   source.push_str(
-    "        env.get_template(\"__page\")\
-         .map_err(|err| __thebe_internal_error(\"load template\", err))?\n",
+    "    let __head_html = if __HEAD_TEMPLATE.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__head\",\n            __HEAD_TEMPLATE,\n            &__ctx,\n            \"compile head template\",\n            \"load head template\",\n            \"render head template\",\n        )?\n    };\n",
   );
   source.push_str(
-    "            .render(&__ctx)\
-         .map_err(|err| __thebe_internal_error(\"render template\", err))?\n",
+    "    let __route_body = __thebe_render_fragment(\n        \"__page\",\n        __TEMPLATE,\n        &__ctx,\n        \"compile template\",\n        \"load template\",\n        \"render template\",\n    )?;\n",
   );
-  source.push_str("    };\n");
   // Wrap the route body inside the layout template.
-  source.push_str("    let __body = {\n");
-  source.push_str("        use minijinja::Environment;\n");
-  source.push_str("        let mut env = Environment::new();\n");
-  source.push_str(
-    "        env.add_template(\"__layout\", __LAYOUT_TEMPLATE)\
-         .map_err(|err| __thebe_internal_error(\"compile layout template\", err))?;\n",
-  );
   source.push_str(
     "        let __layout_ctx = serde_json::json!({ \"__slot\": __route_body });\n",
   );
   source.push_str(
-    "        env.get_template(\"__layout\")\
-         .map_err(|err| __thebe_internal_error(\"load layout template\", err))?\n",
+    "    let __body = __thebe_render_fragment(\n        \"__layout\",\n        __LAYOUT_TEMPLATE,\n        &__layout_ctx,\n        \"compile layout template\",\n        \"load layout template\",\n        \"render layout template\",\n    )?;\n",
   );
-  source.push_str(
-    "            .render(&__layout_ctx)\
-         .map_err(|err| __thebe_internal_error(\"render layout template\", err))?\n",
-  );
-  source.push_str("    };\n");
   write_html_assembly(source);
   source.push_str("}\n\n");
 }
@@ -516,19 +561,90 @@ fn replace_slot(template: &str) -> String {
     .replace("<slot/>", "{{ __slot }}")
 }
 
-/// Process a `_layout.trs` SFC into a (scoped_template, style_string) pair
-/// ready for embedding in a generated route module.
+fn process_head_block(head: Option<&str>) -> Result<HeadFragments, CodegenError> {
+  let Some(head) = head.map(str::trim).filter(|head| !head.is_empty()) else {
+    return Ok(HeadFragments::default());
+  };
+
+  template::parse_template(head)?;
+
+  let (title_template, html_without_title) = extract_title_template(head)?;
+  let html_template = if html_without_title.trim().is_empty() {
+    String::new()
+  } else {
+    thebe_css::add_html_attr(html_without_title.trim(), "data-thebe-head", "")
+  };
+
+  Ok(HeadFragments {
+    title_template,
+    html_template,
+  })
+}
+
+fn merge_head_fragments(layout_head: &HeadFragments, route_head: &HeadFragments) -> HeadFragments {
+  let title_template = route_head
+    .title_template
+    .clone()
+    .or_else(|| layout_head.title_template.clone());
+
+  let html_template = match (
+    layout_head.html_template.trim(),
+    route_head.html_template.trim(),
+  ) {
+    ("", "") => String::new(),
+    ("", route_html) => route_html.to_owned(),
+    (layout_html, "") => layout_html.to_owned(),
+    (layout_html, route_html) => format!("{layout_html}\n{route_html}"),
+  };
+
+  HeadFragments {
+    title_template,
+    html_template,
+  }
+}
+
+fn extract_title_template(head: &str) -> Result<(Option<String>, String), CodegenError> {
+  let lowercase = head.to_ascii_lowercase();
+  let title_count = lowercase.match_indices("<title").count();
+
+  if title_count == 0 {
+    return Ok((None, head.to_owned()));
+  }
+  if title_count > 1 {
+    return Err(CodegenError::InvalidHead(
+      "only one `<title>` tag is allowed per `<head>` block".to_owned(),
+    ));
+  }
+
+  let title_start = lowercase.find("<title").ok_or_else(|| {
+    CodegenError::InvalidHead("failed to find `<title>` tag start".to_owned())
+  })?;
+  let title_open_end_rel = head[title_start..].find('>').ok_or_else(|| {
+    CodegenError::InvalidHead("`<title>` tag is missing a closing `>`".to_owned())
+  })?;
+  let title_open_end = title_start + title_open_end_rel;
+  let title_close_start_rel = lowercase[title_open_end + 1..]
+    .find("</title>")
+    .ok_or_else(|| CodegenError::InvalidHead("`<title>` tag is missing `</title>`".to_owned()))?;
+  let title_close_start = title_open_end + 1 + title_close_start_rel;
+  let title_close_end = title_close_start + "</title>".len();
+
+  let title_template = head[title_open_end + 1..title_close_start].trim().to_owned();
+  let html_without_title = format!("{}{}", &head[..title_start], &head[title_close_end..]);
+
+  Ok((Some(title_template), html_without_title))
+}
+
+/// Process a `_layout.trs` SFC into a render-ready structure for embedding in
+/// a generated route module.
 ///
 /// The layout template has `<slot />` replaced with `{{ __slot }}` and CSS
 /// scoping applied.  Hydration markers are intentionally **not** injected
 /// since layout templates are rendered server-side only.
-///
-/// Returns `(scoped_template_text, processed_style_css)` — **not** escaped
-/// as Rust raw-string literals; the caller applies [`escape_rust_raw_str`].
 fn process_layout(
   layout_blocks: &SfcBlocks,
   layout_scope_path: &str,
-) -> Result<(String, String), CodegenError> {
+) -> Result<ProcessedLayout, CodegenError> {
   // Validate the layout template (slot placeholder is a valid identifier).
   let with_slot = replace_slot(&layout_blocks.template);
   template::parse_template(&with_slot)?;
@@ -547,7 +663,13 @@ fn process_layout(
     .map_err(|e| CodegenError::CssError(e.to_string()))?
     .unwrap_or_default();
 
-  Ok((scoped_template, layout_style))
+  let head = process_head_block(layout_blocks.head.as_deref())?;
+
+  Ok(ProcessedLayout {
+    template: scoped_template,
+    style: layout_style,
+    head,
+  })
 }
 
 /// Inject `#[derive(serde::Serialize)]` immediately before every `struct Props`
@@ -1021,6 +1143,34 @@ mod tests {
   }
 
   #[test]
+  fn generate_route_supports_head_templates() {
+    use thebe_parser::SfcBlocks;
+
+    let blocks = SfcBlocks {
+      script_setup: Some(
+        "struct Props { title: String }\n\n#[thebe::get]\npub fn handler() -> Props { Props { title: \"Counter\".to_owned() } }".to_owned(),
+      ),
+      head: Some(
+        r#"<title>{{ title }}</title>
+<meta name="description" content="Counter page" />"#
+          .to_owned(),
+      ),
+      template: "<h1>{{ title }}</h1>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let app_html = "<html><head><title>%thebe.title%</title>%thebe.head%</head><body>%thebe.body%</body></html>";
+    let src = generate_route(&blocks, "/", None, app_html).unwrap();
+
+    assert!(src.contains("const __HEAD_TEMPLATE"));
+    assert!(src.contains("const __TITLE_TEMPLATE"));
+    assert!(src.contains("data-thebe-head=\"\""));
+    assert!(src.contains("render title template"));
+    assert!(src.contains("render head template"));
+    assert!(src.contains("replace(\"%thebe.title%\", title)"));
+  }
+
+  #[test]
   fn generate_route_uses_declared_http_method_and_forwarded_extractors() {
     use thebe_parser::SfcBlocks;
 
@@ -1084,6 +1234,22 @@ mod tests {
     };
 
     let err = generate_route(&blocks, "/", None, "<html>%thebe.head%</html>").unwrap_err();
+
+    assert!(matches!(err, CodegenError::InvalidAppHtml(_)));
+  }
+
+  #[test]
+  fn generate_route_requires_title_placeholder_when_head_defines_title() {
+    let blocks = SfcBlocks {
+      script_setup: Some(
+        "#[thebe::get]\npub fn handler() -> Props { Props { counter: 0 } }".to_owned(),
+      ),
+      head: Some("<title>Counter</title>".to_owned()),
+      template: "<span>{{ counter }}</span>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let err = generate_route(&blocks, "/", None, default_app_html()).unwrap_err();
 
     assert!(matches!(err, CodegenError::InvalidAppHtml(_)));
   }

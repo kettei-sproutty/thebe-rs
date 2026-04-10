@@ -13,6 +13,11 @@ pub fn handler() -> Props {
 }
 </script>
 
+<head>
+    <title>About {{ name }}</title>
+    <meta name="description" content="{{ tagline }}" />
+</head>
+
 <main>
     <h1>About {{ name }}</h1>
     <p>{{ tagline }}</p>

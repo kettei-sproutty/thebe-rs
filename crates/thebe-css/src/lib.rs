@@ -67,7 +67,19 @@ pub fn process_style(css: &str, scope_id: &str) -> Result<String, CssError> {
 /// that attribute, so styles are confined to this component.
 #[must_use]
 pub fn add_scope_attrs(template: &str, scope_id: &str) -> String {
-  let attr = format!(" data-thebe-c-{scope_id}=\"\"");
+  add_html_attr(template, &format!("data-thebe-c-{scope_id}"), "")
+}
+
+/// Inject a static attribute onto every HTML opening tag in `template`.
+///
+/// Closing tags, comments, and doctypes are passed through unchanged.
+#[must_use]
+pub fn add_html_attr(template: &str, attr_name: &str, attr_value: &str) -> String {
+  let attr = format!(" {attr_name}=\"{attr_value}\"");
+  add_opening_tag_attr(template, &attr)
+}
+
+fn add_opening_tag_attr(template: &str, attr: &str) -> String {
   let mut out = String::with_capacity(template.len() + attr.len() * 8);
   let mut chars = template.chars().peekable();
 
@@ -239,7 +251,7 @@ fn scope_selector<'i>(selector: &mut Selector<'i>, attr_name: &str) {
 
 #[cfg(test)]
 mod tests {
-  use super::{add_scope_attrs, process_style, scope_id};
+  use super::{add_html_attr, add_scope_attrs, process_style, scope_id};
 
   #[test]
   fn scope_id_is_deterministic() {
@@ -316,6 +328,18 @@ mod tests {
     assert_eq!(
       out.matches("data-thebe-c-abc123").count(),
       1,
+      "output: {out}"
+    );
+  }
+
+  #[test]
+  fn add_html_attr_marks_head_elements() {
+    let html = r#"<title>Page</title><meta name="description" content="Hi">"#;
+    let out = add_html_attr(html, "data-thebe-head", "");
+
+    assert!(out.contains(r#"<title data-thebe-head="">Page</title>"#));
+    assert!(
+      out.contains(r#"<meta name="description" content="Hi" data-thebe-head="">"#),
       "output: {out}"
     );
   }
