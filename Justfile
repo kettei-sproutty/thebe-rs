@@ -25,6 +25,10 @@ dev-example:
     cargo build -p thebe-cli
     cd examples/counter-app && ../../target/debug/thebe dev
 
+dev-example-watch:
+    cargo build -p thebe-cli
+    cd examples/counter-app && ../../target/debug/thebe dev --watch
+
 # Scaffold a new project (usage: just new my-app)
 new name:
     cargo build -p thebe-cli

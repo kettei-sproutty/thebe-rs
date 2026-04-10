@@ -8,11 +8,23 @@ struct Props {
 
 #[thebe::get]
 pub fn handler() -> Props {
+  println!("Handling GET request for /");
   let mut rng = rand::rng();
   let random_number: u32 = rng.random();
 
   Props {
     title: "Thebe Counter".to_string(),
+    count: random_number
+  }
+}
+
+#[thebe::post]
+pub fn handler_post() -> Props {
+  let mut rng = rand::rng();
+  let random_number: u32 = rng.random();
+
+  Props {
+    title: "Thebe Counter POST".to_string(),
     count: random_number
   }
 }
@@ -47,7 +59,6 @@ function reset() {
     <div style="display: flex; gap: 1rem; justify-content: center; margin-bottom: 2rem;">
       <p class="count">{{ count }}!!</p>
     </div>
-
 </main>
 
 <style>

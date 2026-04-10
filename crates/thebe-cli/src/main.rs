@@ -16,7 +16,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
   /// Start the development server (generate code and run `cargo run`).
-  Dev,
+  Dev {
+    /// Watch `.trs` files and auto-restart the server on changes.
+    #[arg(long, short)]
+    watch: bool,
+  },
   /// Scaffold a new Thebe project.
   New {
     /// Name of the project directory to create.
@@ -27,7 +31,7 @@ enum Command {
 fn main() -> anyhow::Result<()> {
   let cli = Cli::parse();
   match cli.command {
-    Command::Dev => commands::dev::run(),
+    Command::Dev { watch } => commands::dev::run(watch),
     Command::New { name } => commands::new::run(&name),
   }
 }

@@ -1,10 +1,12 @@
 use anyhow::Context;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::time::Duration;
 use walkdir::WalkDir;
 
 /// Run `thebe dev`: parse all `.trs` route files, emit generated Rust sources,
-/// and hand off to `cargo run`.
-pub fn run() -> anyhow::Result<()> {
+/// and hand off to `cargo run`. Pass `watch = true` to auto-restart on changes.
+pub fn run(watch: bool) -> anyhow::Result<()> {
   let project_root = find_project_root()?;
   println!("thebe: project root at {}", project_root.display());
 
@@ -15,7 +17,24 @@ pub fn run() -> anyhow::Result<()> {
     "no `src/routes/` directory found — create your route `.trs` files there"
   );
 
-  let trs_files = collect_trs_files(&routes_dir)?;
+  run_codegen(&project_root, &src_dir, &routes_dir)?;
+
+  if watch {
+    run_watch(&project_root, &src_dir, &routes_dir)
+  } else {
+    println!("thebe: running `cargo run`\u{2026}");
+    let status = Command::new("cargo")
+      .arg("run")
+      .current_dir(&project_root)
+      .status()
+      .context("failed to invoke `cargo run`")?;
+    std::process::exit(status.code().unwrap_or(1));
+  }
+}
+
+/// Re-run codegen for every `.trs` file and write `__thebe_routes.rs`.
+fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow::Result<()> {
+  let trs_files = collect_trs_files(routes_dir)?;
   anyhow::ensure!(
     !trs_files.is_empty(),
     "no `.trs` files found in `src/routes/`"
@@ -30,8 +49,8 @@ pub fn run() -> anyhow::Result<()> {
     let blocks = thebe_parser::parse_sfc(&source)
       .with_context(|| format!("parse error in {}", trs_path.display()))?;
 
-    let route_path = file_to_route_path(trs_path, &routes_dir);
-    let mod_name = file_to_mod_name(trs_path, &routes_dir);
+    let route_path = file_to_route_path(trs_path, routes_dir);
+    let mod_name = file_to_mod_name(trs_path, routes_dir);
 
     let generated = thebe_codegen::generate_route(&blocks, &route_path)
       .with_context(|| format!("codegen error for {}", trs_path.display()))?;
@@ -47,7 +66,7 @@ pub fn run() -> anyhow::Result<()> {
     );
 
     let source_path = rs_path
-      .strip_prefix(&src_dir)
+      .strip_prefix(src_dir)
       .with_context(|| format!("generated route {} is outside src/", rs_path.display()))?
       .to_string_lossy()
       .replace('\\', "/");
@@ -63,14 +82,111 @@ pub fn run() -> anyhow::Result<()> {
   std::fs::write(&routes_path, &routes_file).context("failed to write src/__thebe_routes.rs")?;
   println!("thebe: generated src/__thebe_routes.rs");
 
-  println!("thebe: running `cargo run`\u{2026}");
-  let status = std::process::Command::new("cargo")
-    .arg("run")
-    .current_dir(&project_root)
-    .status()
-    .context("failed to invoke `cargo run`")?;
+  Ok(())
+}
 
-  std::process::exit(status.code().unwrap_or(1));
+/// Spawn `cargo run` in `project_root` as a background child process.
+fn spawn_server(project_root: &Path) -> anyhow::Result<Child> {
+  println!("thebe: running `cargo run`\u{2026}");
+  Command::new("cargo")
+    .arg("run")
+    .current_dir(project_root)
+    .spawn()
+    .context("failed to spawn `cargo run`")
+}
+
+/// Terminate a server child and all processes it spawned.
+///
+/// On Unix we use `pkill -P <pid>` to kill the Axum binary that cargo spawned,
+/// then kill cargo itself.  On other platforms we can only kill cargo directly.
+fn kill_server(child: &mut Child) {
+  #[cfg(unix)]
+  {
+    let _ = Command::new("pkill")
+      .args(["-TERM", "-P", &child.id().to_string()])
+      .status();
+    // Give child processes a moment to exit cleanly.
+    std::thread::sleep(Duration::from_millis(200));
+  }
+  let _ = child.kill();
+  let _ = child.wait();
+}
+
+/// Watch `routes_dir` for `.trs` changes and restart the server on each one.
+fn run_watch(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow::Result<()> {
+  use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+  use std::sync::mpsc;
+
+  println!("thebe: watch mode — watching {} for changes\u{2026}", routes_dir.display());
+
+  let mut child = spawn_server(project_root)?;
+
+  let (tx, rx) = mpsc::channel();
+  let mut watcher = RecommendedWatcher::new(
+    move |res| {
+      let _ = tx.send(res);
+    },
+    Config::default(),
+  )
+  .context("failed to create file watcher")?;
+
+  watcher
+    .watch(routes_dir, RecursiveMode::Recursive)
+    .context("failed to watch routes directory")?;
+
+  while let Ok(first) = rx.recv() {
+    // Only act on events that touch `.trs` files.
+    let trs_changed = is_trs_event(&first);
+
+    // Drain any rapid follow-up events (debounce over 150 ms).
+    let mut any_trs = trs_changed;
+    loop {
+      match rx.recv_timeout(Duration::from_millis(150)) {
+        Ok(res) => {
+          if is_trs_event(&res) {
+            any_trs = true;
+          }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => break,
+        Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+      }
+    }
+
+    if !any_trs {
+      continue;
+    }
+
+    println!("thebe: change detected — rebuilding\u{2026}");
+
+    kill_server(&mut child);
+
+    match run_codegen(project_root, src_dir, routes_dir) {
+      Err(e) => eprintln!("thebe: codegen error: {e:#}"),
+      Ok(()) => match spawn_server(project_root) {
+        Ok(new_child) => child = new_child,
+        Err(e) => eprintln!("thebe: failed to restart server: {e:#}"),
+      },
+    }
+  }
+
+  Ok(())
+}
+
+/// Return `true` if a notify result represents a create/modify/remove on a `.trs` file.
+fn is_trs_event(res: &notify::Result<notify::Event>) -> bool {
+  use notify::event::EventKind;
+  match res {
+    Ok(event) => {
+      matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+      ) && event
+        .paths
+        .iter()
+        .any(|p| p.extension().is_some_and(|e| e == "trs"))
+    }
+    Err(_) => false,
+  }
 }
 
 /// Walk up from the current directory to find the nearest `Cargo.toml`.
