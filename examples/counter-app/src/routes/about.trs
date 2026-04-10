@@ -1,0 +1,75 @@
+<script setup>
+struct Props {
+    name: String,
+    tagline: String,
+}
+
+#[thebe::get]
+pub fn handler() -> Props {
+    Props {
+        name: "Thebe".to_string(),
+        tagline: "A compiler-driven full-stack Rust web framework using Single File Components.".to_string(),
+    }
+}
+</script>
+
+<main>
+    <h1>About {{ name }}</h1>
+    <p>{{ tagline }}</p>
+    <ul>
+        <li>Server-side rendering via Axum</li>
+        <li>Fine-grained client reactivity — no virtual DOM</li>
+        <li>Single File Components (<code>.trs</code>)</li>
+        <li>Zero config — just run <code>thebe dev</code></li>
+    </ul>
+    <nav>
+        <a href="/">Back to counter</a>
+    </nav>
+</main>
+
+<style>
+body {
+    font-family: system-ui, sans-serif;
+    max-width: 600px;
+    margin: 4rem auto;
+    padding: 0 1rem;
+    background: #f8f8f8;
+    color: #1a1a1a;
+}
+
+h1 {
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
+}
+
+p {
+    color: #444;
+    line-height: 1.6;
+    margin-bottom: 1.5rem;
+}
+
+ul {
+    padding-left: 1.5rem;
+    line-height: 2;
+}
+
+code {
+    background: #e8e8e8;
+    padding: 0.1em 0.4em;
+    border-radius: 0.25rem;
+    font-size: 0.9em;
+}
+
+nav {
+    margin-top: 2rem;
+}
+
+nav a {
+    color: #555;
+    text-decoration: none;
+}
+
+nav a:hover {
+    text-decoration: underline;
+}
+</style>

@@ -58,10 +58,10 @@ pub fn run() -> anyhow::Result<()> {
     });
   }
 
-  let main_rs = thebe_codegen::generate_main(&route_entries);
-  let main_path = project_root.join("src").join("main.rs");
-  std::fs::write(&main_path, &main_rs).context("failed to write src/main.rs")?;
-  println!("thebe: generated src/main.rs");
+  let routes_file = thebe_codegen::generate_routes_file(&route_entries);
+  let routes_path = project_root.join("src").join("__thebe_routes.rs");
+  std::fs::write(&routes_path, &routes_file).context("failed to write src/__thebe_routes.rs")?;
+  println!("thebe: generated src/__thebe_routes.rs");
 
   println!("thebe: running `cargo run`\u{2026}");
   let status = std::process::Command::new("cargo")

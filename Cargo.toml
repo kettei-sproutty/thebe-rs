@@ -8,6 +8,7 @@ members = [
   "crates/thebe-cli",
 ]
 default-members = ["crates/thebe-cli"]
+exclude = ["examples/counter-app"]
 
 [workspace.dependencies]
 thiserror = "2"

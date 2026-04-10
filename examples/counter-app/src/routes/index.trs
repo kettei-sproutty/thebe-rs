@@ -1,0 +1,96 @@
+<script setup>
+struct Props {
+    title: String,
+    count: i32,
+}
+
+#[thebe::get]
+pub fn handler() -> Props {
+    Props {
+        title: "Thebe Counter".to_string(),
+        count: 0,
+    }
+}
+</script>
+
+<script lang="ts">
+let props = getProps<Props>();
+
+function increment() {
+    props.count += 1;
+}
+
+function decrement() {
+    props.count -= 1;
+}
+</script>
+
+<main>
+    <h1>{{ title }}</h1>
+    <p class="count">{{ count }}</p>
+    <div class="controls">
+        <button onclick="decrement">−</button>
+        <button onclick="increment">+</button>
+    </div>
+    <nav>
+        <a href="/about">About</a>
+    </nav>
+</main>
+
+<style>
+body {
+    font-family: system-ui, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 4rem 1rem;
+    background: #f8f8f8;
+    color: #1a1a1a;
+}
+
+main {
+    text-align: center;
+}
+
+h1 {
+    font-size: 2rem;
+    margin-bottom: 1rem;
+}
+
+.count {
+    font-size: 4rem;
+    font-weight: bold;
+    margin: 1rem 0;
+}
+
+.controls {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    margin-bottom: 2rem;
+}
+
+button {
+    width: 3rem;
+    height: 3rem;
+    font-size: 1.5rem;
+    border: 2px solid #1a1a1a;
+    background: white;
+    border-radius: 0.5rem;
+    cursor: pointer;
+}
+
+button:hover {
+    background: #1a1a1a;
+    color: white;
+}
+
+nav a {
+    color: #555;
+    text-decoration: none;
+    font-size: 0.9rem;
+}
+
+nav a:hover {
+    text-decoration: underline;
+}
+</style>
