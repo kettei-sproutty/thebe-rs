@@ -1,8 +1,8 @@
 mod error;
 mod extract;
 mod strip;
-
 pub use error::AnalyzerError;
+use std::fmt::Write as _;
 
 /// The result of analysing a `<script lang="ts">` block.
 #[derive(Debug)]
@@ -23,6 +23,10 @@ pub struct ClientModule {
 /// 1. Strip TypeScript type annotations → browser-runnable JS.
 /// 2. Extract top-level function names.
 /// 3. Append `__thebe_register` calls so the onclick wiring can find them.
+///
+/// # Errors
+///
+/// Returns [`AnalyzerError`] if the TypeScript block cannot be processed.
 pub fn analyze(script_ts: &str) -> Result<ClientModule, AnalyzerError> {
     let js_raw = strip::strip_ts_types(script_ts);
     let event_fns = extract::extract_function_names(&js_raw);
@@ -31,9 +35,8 @@ pub fn analyze(script_ts: &str) -> Result<ClientModule, AnalyzerError> {
     if !event_fns.is_empty() {
         js.push_str("\n// thebe: register event handlers\n");
         for name in &event_fns {
-            js.push_str(&format!(
-                "__thebe_register(\"{name}\", {name});\n"
-            ));
+            writeln!(js, r#"__thebe_register("{name}", {name});"#)
+                .expect("writing to String is infallible");
         }
     }
 

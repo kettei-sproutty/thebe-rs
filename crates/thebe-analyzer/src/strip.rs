@@ -73,11 +73,11 @@ pub fn strip_ts_types(src: &str) -> String {
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric() || c == '_');
-            if prev_is_ident {
-                if let Some(end) = try_match_type_params(&chars, i) {
-                    i = end; // skip the entire `<…>`
-                    continue;
-                }
+            if prev_is_ident
+                && let Some(end) = try_match_type_params(&chars, i)
+            {
+                i = end; // skip the entire `<…>`
+                continue;
             }
             out.push(ch);
             i += 1;
@@ -90,11 +90,11 @@ pub fn strip_ts_types(src: &str) -> String {
             let prev_is_valid = prev.is_some_and(|c| {
                 c.is_alphanumeric() || c == '_' || c == ')' || c == '?'
             });
-            if prev_is_valid {
-                if let Some(end) = try_match_type_annotation(&chars, i + 1) {
-                    i = end; // skip `: TypeExpr`
-                    continue;
-                }
+            if prev_is_valid
+                && let Some(end) = try_match_type_annotation(&chars, i + 1)
+            {
+                i = end; // skip `: TypeExpr`
+                continue;
             }
             out.push(ch);
             i += 1;

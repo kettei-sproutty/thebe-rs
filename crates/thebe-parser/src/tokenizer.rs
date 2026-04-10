@@ -42,6 +42,11 @@ impl BlockKind {
 /// Uses an HTML5-aware approach: `<script>` and `<style>` are treated as
 /// raw-text elements (their content is scanned until the matching close tag,
 /// not re-parsed as HTML).
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when a recognised block is missing its closing tag
+/// or the same block kind appears more than once.
 pub fn parse_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
     let mut blocks = SfcBlocks::default();
     let mut template_parts: Vec<&str> = Vec::new();
@@ -57,40 +62,37 @@ pub fn parse_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
         let before = &remaining[..lt_pos];
         let from_lt = &remaining[lt_pos..];
 
-        match try_extract_block(from_lt)? {
-            Some((kind, content, after)) => {
-                template_parts.push(before);
-                match kind {
-                    BlockKind::ScriptSetup => {
-                        if blocks.script_setup.is_some() {
-                            return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
-                        }
-                        blocks.script_setup = Some(trim_newlines(content));
+        if let Some((kind, content, after)) = try_extract_block(from_lt)? {
+            template_parts.push(before);
+            match kind {
+                BlockKind::ScriptSetup => {
+                    if blocks.script_setup.is_some() {
+                        return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
                     }
-                    BlockKind::ScriptTs => {
-                        if blocks.script_ts.is_some() {
-                            return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
-                        }
-                        blocks.script_ts = Some(trim_newlines(content));
-                    }
-                    BlockKind::Style => {
-                        if blocks.style.is_some() {
-                            return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
-                        }
-                        blocks.style = Some(trim_newlines(content));
-                    }
+                    blocks.script_setup = Some(trim_newlines(content));
                 }
-                remaining = after;
+                BlockKind::ScriptTs => {
+                    if blocks.script_ts.is_some() {
+                        return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
+                    }
+                    blocks.script_ts = Some(trim_newlines(content));
+                }
+                BlockKind::Style => {
+                    if blocks.style.is_some() {
+                        return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
+                    }
+                    blocks.style = Some(trim_newlines(content));
+                }
             }
-            None => {
-                // Not a recognised block — include `<` in template and advance.
-                template_parts.push(&remaining[..lt_pos + 1]);
-                remaining = &remaining[lt_pos + 1..];
-            }
+            remaining = after;
+        } else {
+            // Not a recognised block — include `<` in template and advance.
+            template_parts.push(&remaining[..=lt_pos]);
+            remaining = &remaining[lt_pos + 1..];
         }
     }
 
-    blocks.template = template_parts.concat().trim().to_owned();
+    template_parts.concat().trim().clone_into(&mut blocks.template);
     Ok(blocks)
 }
 
@@ -99,9 +101,9 @@ pub fn parse_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
 ///
 /// Returns `Some((kind, inner_content, rest_of_input))` on success, or `None`
 /// if the current position is not the start of a recognised block.
-fn try_extract_block<'a>(
-    input: &'a str,
-) -> Result<Option<(BlockKind, &'a str, &'a str)>, ParseError> {
+fn try_extract_block(
+    input: &str,
+) -> Result<Option<(BlockKind, &str, &str)>, ParseError> {
     // Identify the block kind by matching the opening tag prefix.
     // All comparisons are on ASCII characters, so a byte-level lower-case
     // check is sufficient and avoids allocating a lowercase copy of the full

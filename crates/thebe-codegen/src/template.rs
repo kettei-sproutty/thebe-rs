@@ -1,4 +1,5 @@
 use crate::error::CodegenError;
+use std::fmt::Write as _;
 
 /// A segment of a parsed Thebe template.
 ///
@@ -186,13 +187,11 @@ pub fn inject_hydration_markers(template: &str) -> String {
                 .any(|t| UNSAFE_CTX_TAGS.contains(&t.as_str()));
 
             if in_unsafe_ctx {
-                out.push_str(&format!(
-                    r#"<span data-thebe-bind="{ident}">{{{{ {ident} }}}}</span>"#
-                ));
+                write!(out, r#"<span data-thebe-bind="{ident}">{{{{ {ident} }}}}</span>"#)
+                    .expect("infallible");
             } else {
-                out.push_str(&format!(
-                    "<!--thebe:{ident}-->{{{{ {ident} }}}}<!--/thebe:{ident}-->"
-                ));
+                write!(out, "<!--thebe:{ident}-->{{{{ {ident} }}}}<!--/thebe:{ident}-->")
+                    .expect("infallible");
             }
         } else {
             out.push(ch);
