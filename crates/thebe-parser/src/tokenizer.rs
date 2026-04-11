@@ -1,18 +1,47 @@
 use crate::error::ParseError;
 
+/// A byte range within a source file.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSpan {
+  /// Inclusive start byte offset.
+  pub start: usize,
+  /// Exclusive end byte offset.
+  pub end: usize,
+}
+
+impl SourceSpan {
+  #[must_use]
+  pub fn offset(self, delta: usize) -> Self {
+    Self {
+      start: self.start + delta,
+      end: self.end + delta,
+    }
+  }
+}
+
 /// The four blocks extracted from a `.trs` Single File Component.
 #[derive(Debug, Default)]
 pub struct SfcBlocks {
   /// Content of `<head>` — route/layout head contribution HTML.
   pub head: Option<String>,
+  /// Source span of the trimmed `<head>` content.
+  pub head_span: Option<SourceSpan>,
   /// Content of `<script setup>` — server route module (Rust).
   pub script_setup: Option<String>,
+  /// Source span of the trimmed `<script setup>` content.
+  pub script_setup_span: Option<SourceSpan>,
   /// Content of `<script lang="ts">` — browser-side TypeScript.
   pub script_ts: Option<String>,
+  /// Source span of the trimmed `<script lang="ts">` content.
+  pub script_ts_span: Option<SourceSpan>,
   /// Content of `<style>` — scoped CSS.
   pub style: Option<String>,
+  /// Source span of the trimmed `<style>` content.
+  pub style_span: Option<SourceSpan>,
   /// Everything else — the HTML template.
   pub template: String,
+  /// Source spans of template segments in the original file.
+  pub template_spans: Vec<SourceSpan>,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -53,6 +82,13 @@ struct Attribute<'a> {
   value: Option<&'a str>,
 }
 
+struct ExtractedBlock<'a> {
+  kind: BlockKind,
+  content: &'a str,
+  after: &'a str,
+  content_span: SourceSpan,
+}
+
 /// Parse a `.trs` file into its constituent blocks.
 ///
 /// Uses an HTML5-aware approach: `<script>` and `<style>` are treated as
@@ -69,47 +105,79 @@ pub fn parse_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
   let mut remaining = input;
 
   while !remaining.is_empty() {
+    let base_offset = input.len() - remaining.len();
     // Find the next `<` — potential start of a block we care about.
     let Some(lt_pos) = remaining.find('<') else {
       template_parts.push(remaining);
+      blocks.template_spans.push(SourceSpan {
+        start: base_offset,
+        end: base_offset + remaining.len(),
+      });
       break;
     };
 
     let before = &remaining[..lt_pos];
     let from_lt = &remaining[lt_pos..];
 
-    if let Some((kind, content, after)) = try_extract_block(from_lt)? {
-      template_parts.push(before);
-      match kind {
+    if let Some(extracted) = try_extract_block(from_lt)? {
+      if !before.is_empty() {
+        template_parts.push(before);
+        blocks.template_spans.push(SourceSpan {
+          start: base_offset,
+          end: base_offset + lt_pos,
+        });
+      }
+      let content_span = extracted.content_span.offset(base_offset + lt_pos);
+      match extracted.kind {
         BlockKind::Head => {
           if blocks.head.is_some() {
-            return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
+            return Err(ParseError::DuplicateBlock(
+              extracted.kind.label().to_owned(),
+            ));
           }
-          blocks.head = Some(trim_newlines(content));
+          let (content, span) = trim_block_content(extracted.content, content_span);
+          blocks.head = Some(content);
+          blocks.head_span = Some(span);
         }
         BlockKind::ScriptSetup => {
           if blocks.script_setup.is_some() {
-            return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
+            return Err(ParseError::DuplicateBlock(
+              extracted.kind.label().to_owned(),
+            ));
           }
-          blocks.script_setup = Some(trim_newlines(content));
+          let (content, span) = trim_block_content(extracted.content, content_span);
+          blocks.script_setup = Some(content);
+          blocks.script_setup_span = Some(span);
         }
         BlockKind::ScriptTs => {
           if blocks.script_ts.is_some() {
-            return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
+            return Err(ParseError::DuplicateBlock(
+              extracted.kind.label().to_owned(),
+            ));
           }
-          blocks.script_ts = Some(trim_newlines(content));
+          let (content, span) = trim_block_content(extracted.content, content_span);
+          blocks.script_ts = Some(content);
+          blocks.script_ts_span = Some(span);
         }
         BlockKind::Style => {
           if blocks.style.is_some() {
-            return Err(ParseError::DuplicateBlock(kind.label().to_owned()));
+            return Err(ParseError::DuplicateBlock(
+              extracted.kind.label().to_owned(),
+            ));
           }
-          blocks.style = Some(trim_newlines(content));
+          let (content, span) = trim_block_content(extracted.content, content_span);
+          blocks.style = Some(content);
+          blocks.style_span = Some(span);
         }
       }
-      remaining = after;
+      remaining = extracted.after;
     } else {
       // Not a recognised block — include `<` in template and advance.
       template_parts.push(&remaining[..=lt_pos]);
+      blocks.template_spans.push(SourceSpan {
+        start: base_offset,
+        end: base_offset + lt_pos + 1,
+      });
       remaining = &remaining[lt_pos + 1..];
     }
   }
@@ -126,7 +194,7 @@ pub fn parse_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
 ///
 /// Returns `Some((kind, inner_content, rest_of_input))` on success, or `None`
 /// if the current position is not the start of a recognised block.
-fn try_extract_block(input: &str) -> Result<Option<(BlockKind, &str, &str)>, ParseError> {
+fn try_extract_block(input: &str) -> Result<Option<ExtractedBlock<'_>>, ParseError> {
   let Some(tag) = parse_opening_tag(input) else {
     return Ok(None);
   };
@@ -151,12 +219,28 @@ fn try_extract_block(input: &str) -> Result<Option<(BlockKind, &str, &str)>, Par
     };
     let content = &content_and_rest[..close_pos];
     let after = &content_and_rest[close_pos + close_tag_upper.len()..];
-    return Ok(Some((kind, content, after)));
+    return Ok(Some(ExtractedBlock {
+      kind,
+      content,
+      after,
+      content_span: SourceSpan {
+        start: content_start,
+        end: content_start + close_pos,
+      },
+    }));
   };
 
   let content = &content_and_rest[..close_pos];
   let after = &content_and_rest[close_pos + close_tag.len()..];
-  Ok(Some((kind, content, after)))
+  Ok(Some(ExtractedBlock {
+    kind,
+    content,
+    after,
+    content_span: SourceSpan {
+      start: content_start,
+      end: content_start + close_pos,
+    },
+  }))
 }
 
 fn classify_opening_tag(tag: &OpeningTag<'_>) -> Option<BlockKind> {
@@ -294,8 +378,28 @@ fn is_tag_name_byte(byte: u8) -> bool {
   byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-')
 }
 
-fn trim_newlines(s: &str) -> String {
-  s.trim_matches('\n').trim_matches('\r').trim().to_owned()
+fn trim_block_content(s: &str, span: SourceSpan) -> (String, SourceSpan) {
+  let trimmed = s.trim().to_owned();
+  let leading_trim = s.len() - s.trim_start().len();
+  if trimmed.is_empty() {
+    let offset = span.start + leading_trim;
+    return (
+      trimmed,
+      SourceSpan {
+        start: offset,
+        end: offset,
+      },
+    );
+  }
+
+  let trailing_trim = s.len() - s.trim_end().len();
+  (
+    trimmed,
+    SourceSpan {
+      start: span.start + leading_trim,
+      end: span.end - trailing_trim,
+    },
+  )
 }
 
 #[cfg(test)]
@@ -330,6 +434,10 @@ h1 { color: red; }
     assert!(blocks.script_ts.is_some());
     assert!(blocks.style.is_some());
     assert!(blocks.template.contains("{{ title }}"));
+    assert_eq!(
+      &input[blocks.script_setup_span.unwrap().start..blocks.script_setup_span.unwrap().end],
+      blocks.script_setup.as_deref().unwrap()
+    );
   }
 
   #[test]
@@ -338,6 +446,12 @@ h1 { color: red; }
     let blocks = parse_sfc(input).unwrap();
     assert_eq!(blocks.template, "<h1>Hello</h1>");
     assert!(blocks.script_setup.is_none());
+    let reconstructed = blocks
+      .template_spans
+      .iter()
+      .map(|span| &input[span.start..span.end])
+      .collect::<String>();
+    assert_eq!(reconstructed, input);
   }
 
   #[test]
@@ -384,5 +498,20 @@ pub fn handler() {}
         .template
         .contains("<script data-kind=\"setup\" data-lang=\"lang=ts\">")
     );
+  }
+
+  #[test]
+  fn parse_sfc_tracks_template_segment_source_spans() {
+    let input =
+      "<script setup>pub fn handler() {}</script>\n<div>{{ title }}</div>\n<style>.x {}</style>";
+    let blocks = parse_sfc(input).unwrap();
+    let template_source = blocks
+      .template_spans
+      .iter()
+      .map(|span| &input[span.start..span.end])
+      .collect::<String>();
+
+    assert!(template_source.contains("{{ title }}"));
+    assert_eq!(blocks.template, "<div>{{ title }}</div>");
   }
 }

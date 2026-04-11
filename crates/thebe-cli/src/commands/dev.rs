@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
+use thebe_parser::SourceSpan;
 use walkdir::WalkDir;
 
 const THEBE_DIR: &str = ".thebe";
@@ -30,18 +31,25 @@ const TYPECHECK_TSCONFIG: &str = r#"{
 const TYPECHECK_ENV_DECLS: &str = "declare function getProps<T = unknown>(): T;\n";
 
 struct ParsedRoute {
+  source: String,
   trs_path: PathBuf,
   blocks: thebe_parser::SfcBlocks,
   route_path: String,
   mod_name: String,
+  handler_info: thebe_codegen::RouteHandlerInfo,
   state_type: Option<String>,
+  template_bindings: Vec<String>,
+  template_binding_spans: Vec<thebe_codegen::TemplateBindingOccurrence>,
   types_export_path: Option<String>,
 }
 
 struct ParsedLayout {
+  source: String,
   blocks: thebe_parser::SfcBlocks,
   scope_path: String,
   trs_path: PathBuf,
+  template_bindings: Vec<String>,
+  template_binding_spans: Vec<thebe_codegen::TemplateBindingOccurrence>,
 }
 
 struct LoadedAppHtml {
@@ -198,17 +206,35 @@ fn collect_parsed_routes(
 
     let blocks = thebe_parser::parse_sfc(&source)
       .with_context(|| format!("parse error in {}", trs_path.display()))?;
-    let state_type = thebe_codegen::route_state_type(&blocks)
-      .with_context(|| format!("failed to inspect handler state in {}", trs_path.display()))?;
+    let handler_info = thebe_codegen::route_handler_info(&blocks)
+      .with_context(|| format!("failed to inspect handler in {}", trs_path.display()))?;
+    let template_bindings =
+      thebe_codegen::list_template_bindings(&blocks.template).with_context(|| {
+        format!(
+          "failed to inspect template bindings in {}",
+          trs_path.display()
+        )
+      })?;
+    let template_binding_spans =
+      collect_template_binding_occurrences(&source, &blocks.template_spans).with_context(|| {
+        format!(
+          "failed to inspect template binding spans in {}",
+          trs_path.display()
+        )
+      })?;
 
     let types_export_path =
       route_has_client_script(&blocks).then(|| type_bridge_export_path(trs_path, routes_dir));
 
     routes.push(ParsedRoute {
+      source,
       trs_path: trs_path.clone(),
       route_path: file_to_route_path(trs_path, routes_dir),
       mod_name: file_to_mod_name(trs_path, routes_dir),
-      state_type,
+      state_type: handler_info.state_type.clone(),
+      handler_info,
+      template_bindings,
+      template_binding_spans,
       blocks,
       types_export_path,
     });
@@ -387,13 +413,14 @@ fn build_thebe_manifest(
   layouts: &HashMap<PathBuf, ParsedLayout>,
   app_html_path: Option<&Path>,
 ) -> anyhow::Result<String> {
+  let layout_entries = build_thebe_manifest_layouts(project_root, layouts)?;
   let routes = routes
     .iter()
     .map(|route| build_thebe_manifest_route(project_root, routes_dir, route, layouts))
     .collect::<anyhow::Result<Vec<_>>>()?;
 
   let manifest = serde_json::json!({
-    "version": 1,
+    "version": 3,
     "serverRouterPath": THEBE_SERVER_ROUTES_FILE,
     "appHtml": {
       "sourcePath": app_html_path
@@ -401,6 +428,7 @@ fn build_thebe_manifest(
         .transpose()?,
       "usesDefault": app_html_path.is_none(),
     },
+    "layouts": layout_entries,
     "routes": routes,
   });
 
@@ -428,7 +456,23 @@ fn build_thebe_manifest_route(
       "{THEBE_SERVER_ROUTES_DIR}/{}",
       relative_rs_path.to_string_lossy().replace('\\', "/")
     ),
-    "stateType": route.state_type,
+    "handler": {
+      "method": route.handler_info.method,
+      "name": &route.handler_info.name,
+      "isAsync": route.handler_info.is_async,
+      "paramTypes": &route.handler_info.param_types,
+      "sourceSpan": route
+        .handler_info
+        .source_span
+        .map(|span| source_span_json(&route.source, span)),
+    },
+    "stateType": &route.state_type,
+    "templateBindings": &route.template_bindings,
+    "templateBindingSpans": route
+      .template_binding_spans
+      .iter()
+      .map(|binding| template_binding_span_json(&route.source, binding))
+      .collect::<Vec<_>>(),
     "hasClientScript": route_has_client_script(&route.blocks),
     "hasHead": has_meaningful_block(route.blocks.head.as_deref()),
     "hasStyle": has_meaningful_block(route.blocks.style.as_deref()),
@@ -439,6 +483,96 @@ fn build_thebe_manifest_route(
     "generatedTypesPath": route.types_export_path.as_ref().map(|path| format!("{TYPECHECK_TYPES_DIR}/{path}")),
     "generatedClientPath": route.types_export_path.as_ref().map(|path| format!("{TYPECHECK_CLIENT_DIR}/{path}")),
   }))
+}
+
+fn build_thebe_manifest_layouts(
+  project_root: &Path,
+  layouts: &HashMap<PathBuf, ParsedLayout>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+  let mut layouts = layouts.values().collect::<Vec<_>>();
+  layouts.sort_by(|left, right| left.trs_path.cmp(&right.trs_path));
+
+  layouts
+    .into_iter()
+    .map(|layout| {
+      Ok(serde_json::json!({
+        "sourcePath": to_project_relative_path(project_root, &layout.trs_path)?,
+        "scopePath": &layout.scope_path,
+        "templateBindings": &layout.template_bindings,
+        "templateBindingSpans": layout
+          .template_binding_spans
+          .iter()
+          .map(|binding| template_binding_span_json(&layout.source, binding))
+          .collect::<Vec<_>>(),
+        "hasHead": has_meaningful_block(layout.blocks.head.as_deref()),
+        "hasStyle": has_meaningful_block(layout.blocks.style.as_deref()),
+      }))
+    })
+    .collect()
+}
+
+fn collect_template_binding_occurrences(
+  source: &str,
+  template_spans: &[SourceSpan],
+) -> anyhow::Result<Vec<thebe_codegen::TemplateBindingOccurrence>> {
+  let mut bindings = Vec::new();
+
+  for span in template_spans {
+    let segment = &source[span.start..span.end];
+    let occurrences = thebe_codegen::list_template_binding_occurrences(segment)
+      .context("failed to list template binding occurrences")?;
+    bindings.extend(occurrences.into_iter().map(|binding| {
+      thebe_codegen::TemplateBindingOccurrence {
+        name: binding.name,
+        span: binding.span.offset(span.start),
+      }
+    }));
+  }
+
+  Ok(bindings)
+}
+
+fn template_binding_span_json(
+  source: &str,
+  binding: &thebe_codegen::TemplateBindingOccurrence,
+) -> serde_json::Value {
+  serde_json::json!({
+    "name": binding.name,
+    "sourceSpan": source_span_json(source, binding.span),
+  })
+}
+
+fn source_span_json(source: &str, span: SourceSpan) -> serde_json::Value {
+  let (start_line, start_column) = byte_offset_to_line_column(source, span.start);
+  let (end_line, end_column) = byte_offset_to_line_column(source, span.end);
+
+  serde_json::json!({
+    "startByte": span.start,
+    "endByte": span.end,
+    "startLine": start_line,
+    "startColumn": start_column,
+    "endLine": end_line,
+    "endColumn": end_column,
+  })
+}
+
+fn byte_offset_to_line_column(source: &str, offset: usize) -> (usize, usize) {
+  let mut line = 1usize;
+  let mut column = 1usize;
+
+  for (idx, ch) in source.char_indices() {
+    if idx >= offset {
+      break;
+    }
+    if ch == '\n' {
+      line += 1;
+      column = 1;
+    } else {
+      column += 1;
+    }
+  }
+
+  (line, column)
 }
 
 fn has_meaningful_block(block: Option<&str>) -> bool {
@@ -651,6 +785,22 @@ fn collect_layouts(routes_dir: &Path) -> anyhow::Result<HashMap<PathBuf, ParsedL
         .with_context(|| format!("failed to read {}", layout_path.display()))?;
       let blocks = thebe_parser::parse_sfc(&source)
         .with_context(|| format!("parse error in {}", layout_path.display()))?;
+      let template_bindings = thebe_codegen::list_template_bindings(&blocks.template)
+        .with_context(|| {
+          format!(
+            "failed to inspect template bindings in {}",
+            layout_path.display()
+          )
+        })?;
+      let template_binding_spans =
+        collect_template_binding_occurrences(&source, &blocks.template_spans).with_context(
+          || {
+            format!(
+              "failed to inspect template binding spans in {}",
+              layout_path.display()
+            )
+          },
+        )?;
 
       // Derive a stable scope path: relative to routes_dir, no extension.
       let rel = layout_path.strip_prefix(routes_dir).unwrap_or(&layout_path);
@@ -661,9 +811,12 @@ fn collect_layouts(routes_dir: &Path) -> anyhow::Result<HashMap<PathBuf, ParsedL
       map.insert(
         dir,
         ParsedLayout {
+          source,
           blocks,
           scope_path,
           trs_path: layout_path.clone(),
+          template_bindings,
+          template_binding_spans,
         },
       );
 
@@ -851,13 +1004,20 @@ mod tests {
     layouts.insert(
       PathBuf::from("/tmp/app/src/routes/blog"),
       ParsedLayout {
+        source: "<div>{{ slot_title }}</div>".to_owned(),
         blocks: thebe_parser::SfcBlocks::default(),
         scope_path: "blog/_layout".to_owned(),
         trs_path: PathBuf::from("/tmp/app/src/routes/blog/_layout.trs"),
+        template_bindings: vec!["slot_title".to_owned()],
+        template_binding_spans: vec![thebe_codegen::TemplateBindingOccurrence {
+          name: "slot_title".to_owned(),
+          span: SourceSpan { start: 5, end: 21 },
+        }],
       },
     );
 
     let route = ParsedRoute {
+      source: "<script setup>#[thebe::get]\npub fn handler(State(state): State<crate::AppState>) -> Props { todo!() }</script>\n<h1>{{ post.title }}</h1>\n<p>{{ post.author.name }}</p>".to_owned(),
       trs_path: PathBuf::from("/tmp/app/src/routes/blog/[slug].trs"),
       blocks: thebe_parser::SfcBlocks {
         head: Some("<title>Blog</title>".to_owned()),
@@ -867,7 +1027,32 @@ mod tests {
       },
       route_path: "/blog/:slug".to_owned(),
       mod_name: "route__blog__dyn_slug".to_owned(),
+      handler_info: thebe_codegen::RouteHandlerInfo {
+        method: "get",
+        name: "handler".to_owned(),
+        param_types: vec!["State<crate::AppState>".to_owned()],
+        is_async: false,
+        state_type: Some("crate::AppState".to_owned()),
+        source_span: Some(SourceSpan { start: 28, end: 91 }),
+      },
       state_type: Some("crate::AppState".to_owned()),
+      template_bindings: vec!["post.title".to_owned(), "post.author.name".to_owned()],
+      template_binding_spans: vec![
+        thebe_codegen::TemplateBindingOccurrence {
+          name: "post.title".to_owned(),
+          span: SourceSpan {
+            start: 113,
+            end: 129,
+          },
+        },
+        thebe_codegen::TemplateBindingOccurrence {
+          name: "post.author.name".to_owned(),
+          span: SourceSpan {
+            start: 138,
+            end: 160,
+          },
+        },
+      ],
       types_export_path: Some("routes/blog/[slug].ts".to_owned()),
     };
 
@@ -881,9 +1066,23 @@ mod tests {
     .unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
 
+    assert_eq!(manifest["version"], 3);
     assert_eq!(manifest["serverRouterPath"], THEBE_SERVER_ROUTES_FILE);
     assert_eq!(manifest["appHtml"]["sourcePath"], "app.html");
     assert_eq!(manifest["appHtml"]["usesDefault"], false);
+    assert_eq!(
+      manifest["layouts"][0]["sourcePath"],
+      "src/routes/blog/_layout.trs"
+    );
+    assert_eq!(manifest["layouts"][0]["scopePath"], "blog/_layout");
+    assert_eq!(
+      manifest["layouts"][0]["templateBindings"],
+      serde_json::json!(["slot_title"])
+    );
+    assert_eq!(
+      manifest["layouts"][0]["templateBindingSpans"][0]["sourceSpan"]["startByte"],
+      5
+    );
     assert_eq!(
       manifest["routes"][0]["sourcePath"],
       "src/routes/blog/[slug].trs"
@@ -891,6 +1090,29 @@ mod tests {
     assert_eq!(
       manifest["routes"][0]["generatedServerPath"],
       ".thebe/server/routes/blog/[slug].rs"
+    );
+    assert_eq!(manifest["routes"][0]["handler"]["method"], "get");
+    assert_eq!(manifest["routes"][0]["handler"]["name"], "handler");
+    assert_eq!(manifest["routes"][0]["handler"]["isAsync"], false);
+    assert_eq!(
+      manifest["routes"][0]["handler"]["sourceSpan"]["startByte"],
+      28
+    );
+    assert_eq!(
+      manifest["routes"][0]["handler"]["paramTypes"],
+      serde_json::json!(["State<crate::AppState>"])
+    );
+    assert_eq!(
+      manifest["routes"][0]["templateBindings"],
+      serde_json::json!(["post.title", "post.author.name"])
+    );
+    assert_eq!(
+      manifest["routes"][0]["templateBindingSpans"][0]["name"],
+      "post.title"
+    );
+    assert_eq!(
+      manifest["routes"][0]["templateBindingSpans"][0]["sourceSpan"]["startByte"],
+      113
     );
     assert_eq!(
       manifest["routes"][0]["layoutSourcePath"],
@@ -923,8 +1145,10 @@ mod tests {
     .unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
 
+    assert_eq!(manifest["version"], 3);
     assert_eq!(manifest["appHtml"]["sourcePath"], serde_json::Value::Null);
     assert_eq!(manifest["appHtml"]["usesDefault"], true);
+    assert_eq!(manifest["layouts"], serde_json::json!([]));
     assert_eq!(manifest["routes"], serde_json::json!([]));
   }
 }

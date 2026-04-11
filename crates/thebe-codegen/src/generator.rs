@@ -2,7 +2,7 @@ use crate::{error::CodegenError, template};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use syn::{Fields, GenericArgument, Item, PathArguments, Type};
-use thebe_parser::SfcBlocks;
+use thebe_parser::{SfcBlocks, SourceSpan};
 
 /// The thebe-client runtime JS, compiled into the binary at build time.
 ///
@@ -62,6 +62,29 @@ struct RouteHandler {
   is_async: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct LocatedRouteHandler {
+  handler: RouteHandler,
+  span: SourceSpan,
+}
+
+/// Semantic handler metadata for a route discovered from `<script setup>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteHandlerInfo {
+  /// HTTP method declared via `#[thebe::get]`, `#[thebe::post]`, and friends.
+  pub method: &'static str,
+  /// Rust function name of the route handler.
+  pub name: String,
+  /// Extractor and argument types preserved from the handler signature.
+  pub param_types: Vec<String>,
+  /// Whether the handler is declared `async`.
+  pub is_async: bool,
+  /// Concrete `State<T>` type required by the route handler, when present.
+  pub state_type: Option<String>,
+  /// Absolute source span of the handler declaration when the parser provided it.
+  pub source_span: Option<SourceSpan>,
+}
+
 #[derive(Clone, Copy)]
 struct ModuleLiterals<'a> {
   app_html: &'a str,
@@ -117,13 +140,32 @@ pub fn default_app_html() -> &'static str {
 ///
 /// Returns the same handler discovery errors as [`generate_route`].
 pub fn route_state_type(blocks: &SfcBlocks) -> Result<Option<String>, CodegenError> {
+  Ok(route_handler_info(blocks)?.state_type)
+}
+
+/// Return semantic handler metadata for a route.
+///
+/// # Errors
+///
+/// Returns the same handler discovery errors as [`generate_route`].
+pub fn route_handler_info(blocks: &SfcBlocks) -> Result<RouteHandlerInfo, CodegenError> {
   let setup = blocks
     .script_setup
     .as_deref()
     .ok_or(CodegenError::MissingScriptSetup)?;
-  let handler = find_handler(setup)?;
+  let located = find_handler_with_span(setup)?;
+  let handler = &located.handler;
 
-  Ok(handler_state_type(&handler).map(ToOwned::to_owned))
+  Ok(RouteHandlerInfo {
+    method: handler.method.as_attr_name(),
+    name: handler.name.clone(),
+    param_types: handler.param_types.clone(),
+    is_async: handler.is_async,
+    state_type: handler_state_type(&handler).map(ToOwned::to_owned),
+    source_span: blocks
+      .script_setup_span
+      .map(|script_setup_span| located.span.offset(script_setup_span.start)),
+  })
 }
 
 /// Validate that `app.html` contains the required Thebe placeholders.
@@ -1070,7 +1112,12 @@ fn escape_rust_raw_str(template: &str) -> String {
 }
 
 fn find_handler(setup: &str) -> Result<RouteHandler, CodegenError> {
+  Ok(find_handler_with_span(setup)?.handler)
+}
+
+fn find_handler_with_span(setup: &str) -> Result<LocatedRouteHandler, CodegenError> {
   let lines: Vec<&str> = setup.lines().collect();
+  let line_starts = line_start_offsets(setup);
 
   for (idx, line) in lines.iter().enumerate() {
     let trimmed = line.trim();
@@ -1079,15 +1126,27 @@ fn find_handler(setup: &str) -> Result<RouteHandler, CodegenError> {
     };
 
     let mut signature = String::new();
-    let remainder = line.split_once(']').map_or("", |(_, rest)| rest).trim();
+    let mut signature_start = None;
+    let raw_remainder = line.split_once(']').map_or("", |(_, rest)| rest);
+    let remainder = raw_remainder.trim_start();
     if !remainder.is_empty() {
+      let remainder_offset = line_starts[idx]
+        + (line.len() - raw_remainder.len())
+        + (raw_remainder.len() - remainder.len());
+      signature_start = Some(remainder_offset);
       signature.push_str(remainder);
-      if signature_complete(&signature) {
-        return parse_handler_signature(&signature, method);
+      if let Some(boundary) = signature_boundary_offset(&signature) {
+        return parse_handler_signature(&signature, method).map(|handler| LocatedRouteHandler {
+          handler,
+          span: SourceSpan {
+            start: remainder_offset,
+            end: remainder_offset + boundary,
+          },
+        });
       }
     }
 
-    for next in &lines[idx + 1..] {
+    for (next_idx, next) in lines.iter().enumerate().skip(idx + 1) {
       let trimmed = next.trim();
       if signature.is_empty()
         && (trimmed.is_empty()
@@ -1099,13 +1158,23 @@ fn find_handler(setup: &str) -> Result<RouteHandler, CodegenError> {
         continue;
       }
 
+      if signature.is_empty() {
+        signature_start = Some(line_starts[next_idx] + (next.len() - next.trim_start().len()));
+      }
+
       if !signature.is_empty() {
         signature.push('\n');
       }
       signature.push_str(next);
 
-      if signature_complete(&signature) {
-        return parse_handler_signature(&signature, method);
+      if let Some(boundary) = signature_boundary_offset(&signature) {
+        return parse_handler_signature(&signature, method).map(|handler| LocatedRouteHandler {
+          handler,
+          span: SourceSpan {
+            start: signature_start.unwrap_or(line_starts[next_idx]),
+            end: signature_start.unwrap_or(line_starts[next_idx]) + boundary,
+          },
+        });
       }
     }
 
@@ -1139,14 +1208,14 @@ fn parse_thebe_method(line: &str) -> Result<Option<HttpMethod>, CodegenError> {
   Ok(Some(method))
 }
 
-fn signature_complete(signature: &str) -> bool {
+fn signature_boundary_offset(signature: &str) -> Option<usize> {
   let mut paren_depth = 0u32;
   let mut bracket_depth = 0u32;
   let mut angle_depth = 0u32;
   let mut in_string: Option<char> = None;
-  let mut chars = signature.chars();
+  let mut chars = signature.char_indices().peekable();
 
-  while let Some(ch) = chars.next() {
+  while let Some((idx, ch)) = chars.next() {
     if let Some(delim) = in_string {
       if ch == '\\' {
         chars.next();
@@ -1165,13 +1234,19 @@ fn signature_complete(signature: &str) -> bool {
       '<' => angle_depth += 1,
       '>' if angle_depth > 0 => angle_depth -= 1,
       '{' | ';' if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 => {
-        return true;
+        return Some(idx + ch.len_utf8());
       }
       _ => {}
     }
   }
 
-  false
+  None
+}
+
+fn line_start_offsets(source: &str) -> Vec<usize> {
+  let mut starts = vec![0];
+  starts.extend(source.match_indices('\n').map(|(idx, _)| idx + 1));
+  starts
 }
 
 fn parse_handler_signature(
@@ -1399,6 +1474,40 @@ mod tests {
       find_handler(setup),
       Err(CodegenError::MissingHandler)
     ));
+  }
+
+  #[test]
+  fn find_handler_with_span_tracks_declaration_extent() {
+    let setup = "#[thebe::post]\npub async fn submit(\n    Json(body): Json<FormData>,\n) -> Props {\n    todo!()\n}";
+    let located = find_handler_with_span(setup).unwrap();
+
+    assert_eq!(
+      &setup[located.span.start..located.span.end],
+      "pub async fn submit(\n    Json(body): Json<FormData>,\n) -> Props {"
+    );
+  }
+
+  #[test]
+  fn route_handler_info_reports_handler_metadata() {
+    let blocks = SfcBlocks {
+      script_setup: Some(
+        "#[thebe::patch]\npub async fn update(State(state): State<crate::AppState>, Json(body): Json<UpdateBody>) -> Props { todo!() }"
+          .to_owned(),
+      ),
+      ..SfcBlocks::default()
+    };
+
+    let info = route_handler_info(&blocks).unwrap();
+
+    assert_eq!(info.method, "patch");
+    assert_eq!(info.name, "update");
+    assert!(info.is_async);
+    assert_eq!(
+      info.param_types,
+      vec!["State<crate::AppState>", "Json<UpdateBody>"]
+    );
+    assert_eq!(info.state_type.as_deref(), Some("crate::AppState"));
+    assert!(info.source_span.is_none());
   }
 
   #[test]

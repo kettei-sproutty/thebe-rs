@@ -1,5 +1,6 @@
 use crate::error::CodegenError;
 use std::fmt::Write as _;
+use thebe_parser::SourceSpan;
 
 /// A segment of a parsed Thebe template.
 ///
@@ -11,6 +12,15 @@ pub enum TemplatePart {
   Literal(#[allow(dead_code)] String),
   /// A `{{ ident }}` or `{{ ident.field }}` binding.
   Binding(#[allow(dead_code)] String),
+}
+
+/// A validated binding occurrence within a template segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateBindingOccurrence {
+  /// Binding path, e.g. `title` or `post.author.name`.
+  pub name: String,
+  /// Byte range of the full `{{ ... }}` token within the template segment.
+  pub span: SourceSpan,
 }
 
 /// Parse a Thebe template string into a flat list of [`TemplatePart`]s.
@@ -56,6 +66,68 @@ pub fn parse_template(template: &str) -> Result<Vec<TemplatePart>, CodegenError>
   }
 
   Ok(parts)
+}
+
+/// Return the distinct template bindings in order of first appearance.
+///
+/// # Errors
+///
+/// Returns the same validation errors as [`parse_template`].
+pub fn list_template_bindings(template: &str) -> Result<Vec<String>, CodegenError> {
+  let mut bindings = Vec::new();
+
+  for binding in list_template_binding_occurrences(template)? {
+    if !bindings.contains(&binding.name) {
+      bindings.push(binding.name);
+    }
+  }
+
+  Ok(bindings)
+}
+
+/// Return all validated binding occurrences in source order.
+///
+/// # Errors
+///
+/// Returns the same validation errors as [`parse_template`].
+pub fn list_template_binding_occurrences(
+  template: &str,
+) -> Result<Vec<TemplateBindingOccurrence>, CodegenError> {
+  let mut bindings = Vec::new();
+  let bytes = template.as_bytes();
+  let mut idx = 0usize;
+
+  while idx < bytes.len() {
+    if bytes[idx] == b'{' && bytes.get(idx + 1).is_some_and(|byte| *byte == b'{') {
+      let start = idx;
+      idx += 2;
+      let content_start = idx;
+
+      loop {
+        match (bytes.get(idx), bytes.get(idx + 1)) {
+          (None, _) => return Err(CodegenError::UnclosedBinding),
+          (Some(b'}'), Some(b'}')) => {
+            let binding = template[content_start..idx].trim().to_owned();
+            validate_binding(&binding)?;
+            bindings.push(TemplateBindingOccurrence {
+              name: binding,
+              span: SourceSpan {
+                start,
+                end: idx + 2,
+              },
+            });
+            idx += 2;
+            break;
+          }
+          _ => idx += 1,
+        }
+      }
+    } else {
+      idx += 1;
+    }
+  }
+
+  Ok(bindings)
 }
 
 /// Validate that a binding is a simple identifier or dotted field path.
@@ -264,6 +336,32 @@ mod tests {
     assert!(parse_template("{{ a + b }}").is_err());
     assert!(parse_template("{{ fn() }}").is_err());
     assert!(parse_template("{{ }}").is_err());
+  }
+
+  #[test]
+  fn list_template_bindings_deduplicates_in_appearance_order() {
+    let bindings =
+      list_template_bindings("<h1>{{ title }}</h1><p>{{ user.name }}</p><span>{{ title }}</span>")
+        .unwrap();
+
+    assert_eq!(bindings, vec!["title", "user.name"]);
+  }
+
+  #[test]
+  fn list_template_binding_occurrences_preserves_spans() {
+    let template = "<h1>{{ title }}</h1><p>{{ user.name }}</p>";
+    let occurrences = list_template_binding_occurrences(template).unwrap();
+
+    assert_eq!(occurrences[0].name, "title");
+    assert_eq!(
+      &template[occurrences[0].span.start..occurrences[0].span.end],
+      "{{ title }}"
+    );
+    assert_eq!(occurrences[1].name, "user.name");
+    assert_eq!(
+      &template[occurrences[1].span.start..occurrences[1].span.end],
+      "{{ user.name }}"
+    );
   }
 
   // ── inject_hydration_markers ────────────────────────────────────────────

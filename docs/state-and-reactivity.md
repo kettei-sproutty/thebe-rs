@@ -13,7 +13,7 @@ It represents the state of the system at the exact moment the HTTP request was f
 `thebe dev` emits a generated `.thebe/` workspace:
 - `.thebe/server/routes.rs` is included by `src/main.rs` and exposes `thebe_routes()`.
 - `.thebe/server/routes/**` contains the generated Rust route modules.
-- `.thebe/manifest.json` records route paths, layout usage, and generated artifact paths for tooling.
+- `.thebe/manifest.json` records route and layout metadata for tooling, including generated paths, handler signatures, template bindings, and source spans for direct editor navigation.
 - `.thebe/types/**` contains the `ts-rs` export for that route's `Props` type.
 - `.thebe/client/**` contains a typed mirror of the route's `<script lang="ts">` block that imports `Props` from the generated bindings.
 - `.thebe/tsconfig.json` lets the editor type-check those mirrors without requiring a root TypeScript config.
