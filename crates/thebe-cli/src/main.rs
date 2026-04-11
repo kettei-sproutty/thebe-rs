@@ -21,6 +21,8 @@ enum Command {
     #[arg(long, short)]
     watch: bool,
   },
+  /// Validate the project and emit `.thebe/diagnostics.json`.
+  Check,
   /// Scaffold a new Thebe project.
   New {
     /// Name of the project directory to create.
@@ -32,6 +34,7 @@ fn main() -> anyhow::Result<()> {
   let cli = Cli::parse();
   match cli.command {
     Command::Dev { watch } => commands::dev::run(watch),
+    Command::Check => commands::dev::check(),
     Command::New { name } => commands::new::run(&name),
   }
 }

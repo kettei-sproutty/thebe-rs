@@ -224,7 +224,7 @@ pub async fn handler(
 
 `<script lang="ts">` runs in the browser. `getProps<Props>()` reads the server-inlined JSON.
 
-Routes that include `<script lang="ts">` should keep `ts-rs = "12"` in the app's `Cargo.toml`. During `thebe dev`, Thebe writes all generated artifacts into `.thebe/`: `.thebe/server/routes.rs` exposes `thebe_routes()`, `.thebe/server/routes/**` contains the generated Rust modules, `.thebe/manifest.json` describes route/layout/generated-path metadata plus semantic facts like handler signatures, template bindings, and source spans, `.thebe/types/**` contains exported `Props` bindings, and `.thebe/client/**` mirrors each client script with a local `Props` import so editors have a concrete TypeScript project to read.
+Routes that include `<script lang="ts">` should keep `ts-rs = "12"` in the app's `Cargo.toml`. During `thebe dev`, Thebe writes all generated artifacts into `.thebe/`: `.thebe/server/routes.rs` exposes `thebe_routes()`, `.thebe/server/routes/**` contains the generated Rust modules, `.thebe/manifest.json` describes route/layout/generated-path metadata plus semantic facts like handler signatures, template bindings, and source spans, `.thebe/types/**` contains exported `Props` bindings, and `.thebe/client/**` mirrors each client script with a local `Props` import so editors have a concrete TypeScript project to read. `thebe check` complements that output with `.thebe/diagnostics.json`, a versioned diagnostics file that records project-level and file-level validation errors with relative paths and source spans.
 
 For **v0**, `getProps<Props>()` returns a deeply reactive Proxy object (like Vue 3's `reactive`). This gives deep mutation tracking for free, so you can write normal JavaScript without worrying about assignment rewriting or forced destructuring.
 
@@ -479,6 +479,7 @@ thebe/
   - `.thebe/server/routes.rs` is included by `src/main.rs` and exposes `thebe_routes()` for app composition.
   - `.thebe/server/routes/**` contains the generated Rust route modules.
   - `.thebe/manifest.json` records route and layout metadata for tooling, including source files, generated artifact paths, handler signatures, template bindings, and source spans for direct editor navigation.
+  - `.thebe/diagnostics.json` is written by `thebe check` and captures structured project/file diagnostics with relative source paths and source spans.
   - `.thebe/types/**` contains the exported `ts-rs` bindings for each client route's `Props` type.
   - `.thebe/client/**` contains a typed mirror of each `<script lang="ts">` block that imports its matching `Props` definition.
   - `.thebe/tsconfig.json` gives the editor a dedicated TypeScript project without forcing a root `tsconfig.json` on the app.

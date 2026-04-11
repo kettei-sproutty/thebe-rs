@@ -8,6 +8,7 @@ use thebe_parser::SourceSpan;
 use walkdir::WalkDir;
 
 const THEBE_DIR: &str = ".thebe";
+const THEBE_DIAGNOSTICS_FILE: &str = ".thebe/diagnostics.json";
 const THEBE_MANIFEST_FILE: &str = ".thebe/manifest.json";
 const THEBE_SERVER_ROUTES_DIR: &str = ".thebe/server/routes";
 const THEBE_SERVER_ROUTES_FILE: &str = ".thebe/server/routes.rs";
@@ -83,6 +84,22 @@ pub fn run(watch: bool) -> anyhow::Result<()> {
       .context("failed to invoke `cargo run`")?;
     std::process::exit(status.code().unwrap_or(1));
   }
+}
+
+/// Run `thebe check`: validate project files and emit `.thebe/diagnostics.json`.
+pub fn check() -> anyhow::Result<()> {
+  let project_root = find_project_root()?;
+  println!("thebe: project root at {}", project_root.display());
+
+  let diagnostics = collect_project_diagnostics(&project_root)?;
+  write_diagnostics_file(&project_root, &diagnostics)?;
+
+  if diagnostics.is_empty() {
+    println!("thebe: no diagnostics");
+    return Ok(());
+  }
+
+  anyhow::bail!("found {} diagnostic(s)", diagnostics.len())
 }
 
 /// Re-run codegen for every `.trs` file and refresh generated `.thebe` artifacts.
@@ -189,6 +206,8 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
     .with_context(|| format!("failed to write {}", manifest_path.display()))?;
   println!("thebe: generated {}", manifest_path.display());
 
+  write_diagnostics_file(project_root, &[])?;
+
   remove_legacy_generated_sources(src_dir)?;
 
   Ok(())
@@ -250,18 +269,510 @@ fn route_has_client_script(blocks: &thebe_parser::SfcBlocks) -> bool {
     .is_some_and(|script| !script.trim().is_empty())
 }
 
+fn collect_project_diagnostics(project_root: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+  let mut diagnostics = Vec::new();
+  let src_dir = project_root.join("src");
+  let routes_dir = src_dir.join("routes");
+
+  if !routes_dir.exists() {
+    diagnostics.push(project_diagnostic(
+      "project",
+      "missing-routes-dir",
+      format!(
+        "no `{}` directory found — create your route `.trs` files there",
+        routes_dir.strip_prefix(project_root).unwrap_or(&routes_dir).display()
+      ),
+    ));
+    return Ok(diagnostics);
+  }
+
+  let route_files = collect_trs_files(&routes_dir)?;
+  let layout_files = collect_layout_files(&routes_dir)?;
+  let cargo_has_ts_rs = has_ts_rs_dependency(project_root)?;
+
+  if route_files.is_empty() {
+    diagnostics.push(project_diagnostic(
+      "project",
+      "missing-routes",
+      "no `.trs` files found in `src/routes/`".to_owned(),
+    ));
+  }
+
+  let app_html = read_app_html_for_diagnostics(project_root)?;
+  if let Some(diagnostic) = validate_app_html_for_diagnostics(project_root, &app_html)? {
+    diagnostics.push(diagnostic);
+  }
+  let app_html_source = app_html
+    .as_ref()
+    .map_or_else(|| thebe_codegen::default_app_html().to_owned(), |loaded| loaded.contents.clone());
+  let app_html_valid = app_html
+    .as_ref()
+    .is_none_or(|loaded| thebe_codegen::validate_app_html(&loaded.contents).is_ok());
+
+  let mut layouts = HashMap::new();
+  for layout_path in layout_files {
+    match parse_layout_for_diagnostics(project_root, &layout_path, &routes_dir)? {
+      Ok(layout) => {
+        let dir = layout_path.parent().unwrap_or(&routes_dir).to_path_buf();
+        layouts.insert(dir, layout);
+      }
+      Err(diagnostic) => diagnostics.push(diagnostic),
+    }
+  }
+
+  let mut route_entries = Vec::new();
+  let mut any_client_routes = false;
+
+  for route_path in route_files {
+    let analysis = analyze_route_for_diagnostics(
+      project_root,
+      &routes_dir,
+      &layouts,
+      &app_html_source,
+      app_html_valid,
+      &route_path,
+      &mut diagnostics,
+    )?;
+
+    if let Some(route) = analysis {
+      any_client_routes |= route.types_export_path.is_some();
+      let relative_rs_path = route
+        .trs_path
+        .strip_prefix(&routes_dir)
+        .with_context(|| format!("route {} is outside src/routes/", route.trs_path.display()))?
+        .with_extension("rs");
+      let source_path = Path::new("routes")
+        .join(relative_rs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+      route_entries.push(thebe_codegen::RouteEntry {
+        mod_name: route.mod_name.clone(),
+        source_path,
+        state_type: route.state_type.clone(),
+      });
+    }
+  }
+
+  if any_client_routes && !cargo_has_ts_rs {
+    let cargo_toml_path = project_root.join("Cargo.toml");
+    let cargo_toml = std::fs::read_to_string(&cargo_toml_path)
+      .with_context(|| format!("failed to read {}", cargo_toml_path.display()))?;
+    diagnostics.push(file_diagnostic(
+      project_root,
+      &cargo_toml_path,
+      &cargo_toml,
+      None,
+      "project",
+      "missing-ts-rs",
+      "typed `<script lang=\"ts\">` routes require `ts-rs = \"12\"` under `[dependencies]`"
+        .to_owned(),
+    )?);
+  }
+
+  if let Err(err) = thebe_codegen::generate_routes_file(&route_entries) {
+    diagnostics.push(project_diagnostic(
+      "project",
+      "mixed-route-state-types",
+      err.to_string(),
+    ));
+  }
+
+  Ok(diagnostics)
+}
+
+fn collect_layout_files(routes_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+  let mut files = Vec::new();
+
+  for entry in WalkDir::new(routes_dir).min_depth(1) {
+    let entry = entry.context("failed to read directory entry")?;
+    if entry.file_type().is_file()
+      && entry.path().extension().is_some_and(|ext| ext == "trs")
+      && entry
+        .path()
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        == "_layout"
+    {
+      files.push(entry.into_path());
+    }
+  }
+
+  files.sort();
+  Ok(files)
+}
+
+fn analyze_route_for_diagnostics(
+  project_root: &Path,
+  routes_dir: &Path,
+  layouts: &HashMap<PathBuf, ParsedLayout>,
+  app_html: &str,
+  app_html_valid: bool,
+  route_path: &Path,
+  diagnostics: &mut Vec<serde_json::Value>,
+) -> anyhow::Result<Option<ParsedRoute>> {
+  let source = std::fs::read_to_string(route_path)
+    .with_context(|| format!("failed to read {}", route_path.display()))?;
+
+  let blocks = match thebe_parser::parse_sfc(&source) {
+    Ok(blocks) => blocks,
+    Err(err) => {
+      diagnostics.push(file_diagnostic(
+        project_root,
+        route_path,
+        &source,
+        None,
+        "parser",
+        "parse-error",
+        err.to_string(),
+      )?);
+      return Ok(None);
+    }
+  };
+
+  let handler_info = match thebe_codegen::route_handler_info(&blocks) {
+    Ok(info) => info,
+    Err(err) => {
+      diagnostics.push(codegen_error_diagnostic(
+        project_root,
+        route_path,
+        &source,
+        &blocks,
+        &err,
+      )?);
+      return Ok(None);
+    }
+  };
+
+  let template_bindings = match thebe_codegen::list_template_bindings(&blocks.template) {
+    Ok(bindings) => bindings,
+    Err(err) => {
+      diagnostics.push(codegen_error_diagnostic(
+        project_root,
+        route_path,
+        &source,
+        &blocks,
+        &err,
+      )?);
+      return Ok(None);
+    }
+  };
+
+  let template_binding_spans = match collect_template_binding_occurrences(&source, &blocks.template_spans) {
+    Ok(bindings) => bindings,
+    Err(err) => {
+      diagnostics.push(file_diagnostic(
+        project_root,
+        route_path,
+        &source,
+        Some(template_area_span(&blocks, &source)),
+        "template",
+        "template-analysis-error",
+        err.to_string(),
+      )?);
+      return Ok(None);
+    }
+  };
+
+  let types_export_path =
+    route_has_client_script(&blocks).then(|| type_bridge_export_path(route_path, routes_dir));
+
+  let route = ParsedRoute {
+    source,
+    trs_path: route_path.to_path_buf(),
+    route_path: file_to_route_path(route_path, routes_dir),
+    mod_name: file_to_mod_name(route_path, routes_dir),
+    state_type: handler_info.state_type.clone(),
+    handler_info,
+    template_bindings,
+    template_binding_spans,
+    blocks,
+    types_export_path,
+  };
+
+  if app_html_valid {
+    let layout_arg = find_layout(layouts, &route.trs_path, routes_dir)
+      .map(|layout| (&layout.blocks, layout.scope_path.as_str()));
+    if let Err(err) = thebe_codegen::generate_route(
+      &route.blocks,
+      &route.route_path,
+      layout_arg,
+      app_html,
+      route.types_export_path.as_deref(),
+    ) {
+      diagnostics.push(codegen_error_diagnostic(
+        project_root,
+        &route.trs_path,
+        &route.source,
+        &route.blocks,
+        &err,
+      )?);
+      return Ok(None);
+    }
+  }
+
+  Ok(Some(route))
+}
+
+fn parse_layout_for_diagnostics(
+  project_root: &Path,
+  layout_path: &Path,
+  routes_dir: &Path,
+) -> anyhow::Result<Result<ParsedLayout, serde_json::Value>> {
+  let source = std::fs::read_to_string(layout_path)
+    .with_context(|| format!("failed to read {}", layout_path.display()))?;
+
+  let blocks = match thebe_parser::parse_sfc(&source) {
+    Ok(blocks) => blocks,
+    Err(err) => {
+      return Ok(Err(file_diagnostic(
+        project_root,
+        layout_path,
+        &source,
+        None,
+        "parser",
+        "parse-error",
+        err.to_string(),
+      )?));
+    }
+  };
+
+  let template_bindings = match thebe_codegen::list_template_bindings(&blocks.template) {
+    Ok(bindings) => bindings,
+    Err(err) => {
+      return Ok(Err(file_diagnostic(
+        project_root,
+        layout_path,
+        &source,
+        Some(template_area_span(&blocks, &source)),
+        "template",
+        "template-analysis-error",
+        err.to_string(),
+      )?));
+    }
+  };
+
+  let template_binding_spans =
+    match collect_template_binding_occurrences(&source, &blocks.template_spans) {
+      Ok(bindings) => bindings,
+      Err(err) => {
+        return Ok(Err(file_diagnostic(
+          project_root,
+          layout_path,
+          &source,
+          Some(template_area_span(&blocks, &source)),
+          "template",
+          "template-analysis-error",
+          err.to_string(),
+        )?));
+      }
+    };
+
+  let rel = layout_path.strip_prefix(routes_dir).unwrap_or(layout_path);
+  let scope_path = rel.with_extension("").to_string_lossy().replace('\\', "/");
+
+  Ok(Ok(ParsedLayout {
+    source,
+    blocks,
+    scope_path,
+    trs_path: layout_path.to_path_buf(),
+    template_bindings,
+    template_binding_spans,
+  }))
+}
+
+fn write_diagnostics_file(
+  project_root: &Path,
+  diagnostics: &[serde_json::Value],
+) -> anyhow::Result<()> {
+  let diagnostics_path = project_root.join(THEBE_DIAGNOSTICS_FILE);
+  if let Some(parent) = diagnostics_path.parent() {
+    std::fs::create_dir_all(parent)
+      .with_context(|| format!("failed to create {}", parent.display()))?;
+  }
+
+  let diagnostics_contents = build_diagnostics_file(diagnostics)?;
+  std::fs::write(&diagnostics_path, diagnostics_contents)
+    .with_context(|| format!("failed to write {}", diagnostics_path.display()))
+}
+
+fn build_diagnostics_file(diagnostics: &[serde_json::Value]) -> anyhow::Result<String> {
+  let diagnostics_file = serde_json::json!({
+    "version": 1,
+    "diagnostics": diagnostics,
+  });
+
+  serde_json::to_string_pretty(&diagnostics_file)
+    .context("failed to serialize .thebe/diagnostics.json")
+}
+
+fn project_diagnostic(category: &str, code: &str, message: String) -> serde_json::Value {
+  serde_json::json!({
+    "kind": "project",
+    "severity": "error",
+    "category": category,
+    "code": code,
+    "message": message,
+    "filePath": serde_json::Value::Null,
+    "sourceSpan": serde_json::Value::Null,
+  })
+}
+
+fn file_diagnostic(
+  project_root: &Path,
+  file_path: &Path,
+  source: &str,
+  span: Option<SourceSpan>,
+  category: &str,
+  code: &str,
+  message: String,
+) -> anyhow::Result<serde_json::Value> {
+  Ok(serde_json::json!({
+    "kind": "file",
+    "severity": "error",
+    "category": category,
+    "code": code,
+    "message": message,
+    "filePath": to_project_relative_path(project_root, file_path)?,
+    "sourceSpan": span
+      .or_else(|| whole_source_span(source))
+      .map(|span| source_span_json(source, span)),
+  }))
+}
+
+fn codegen_error_diagnostic(
+  project_root: &Path,
+  file_path: &Path,
+  source: &str,
+  blocks: &thebe_parser::SfcBlocks,
+  err: &thebe_codegen::CodegenError,
+) -> anyhow::Result<serde_json::Value> {
+  let (category, code, span) = match err {
+    thebe_codegen::CodegenError::Parse(_) => ("parser", "parse-error", None),
+    thebe_codegen::CodegenError::UnsupportedMethod(_) => {
+      ("handler", "unsupported-method", blocks.script_setup_span)
+    }
+    thebe_codegen::CodegenError::InvalidHandlerSignature(_) => {
+      ("handler", "invalid-handler-signature", blocks.script_setup_span)
+    }
+    thebe_codegen::CodegenError::UnclosedBinding => (
+      "template",
+      "unclosed-binding",
+      Some(template_area_span(blocks, source)),
+    ),
+    thebe_codegen::CodegenError::InvalidBinding(_) => (
+      "template",
+      "invalid-binding",
+      Some(template_area_span(blocks, source)),
+    ),
+    thebe_codegen::CodegenError::MissingHandler => {
+      ("handler", "missing-handler", blocks.script_setup_span)
+    }
+    thebe_codegen::CodegenError::MissingScriptSetup => {
+      ("handler", "missing-script-setup", None)
+    }
+    thebe_codegen::CodegenError::InvalidAppHtml(_) => ("app-html", "invalid-app-html", None),
+    thebe_codegen::CodegenError::InvalidHead(_) => ("head", "invalid-head", blocks.head_span),
+    thebe_codegen::CodegenError::TypeBridge(_) => (
+      "typecheck",
+      "type-bridge-error",
+      blocks.script_setup_span.or(blocks.script_ts_span),
+    ),
+    thebe_codegen::CodegenError::MixedRouteStateTypes(_) => {
+      return Ok(project_diagnostic(
+        "project",
+        "mixed-route-state-types",
+        err.to_string(),
+      ));
+    }
+    thebe_codegen::CodegenError::CssError(_) => ("style", "css-error", blocks.style_span),
+  };
+
+  file_diagnostic(project_root, file_path, source, span, category, code, err.to_string())
+}
+
+fn template_area_span(blocks: &thebe_parser::SfcBlocks, source: &str) -> SourceSpan {
+  match (
+    blocks.template_spans.first().copied(),
+    blocks.template_spans.last().copied(),
+  ) {
+    (Some(first), Some(last)) => SourceSpan {
+      start: first.start,
+      end: last.end,
+    },
+    _ => whole_source_span(source).unwrap_or_default(),
+  }
+}
+
+fn whole_source_span(source: &str) -> Option<SourceSpan> {
+  (!source.is_empty()).then_some(SourceSpan {
+    start: 0,
+    end: source.len(),
+  })
+}
+
+fn read_app_html_for_diagnostics(project_root: &Path) -> anyhow::Result<Option<LoadedAppHtml>> {
+  let app_html_path = project_root.join("app.html");
+  if !app_html_path.exists() {
+    return Ok(None);
+  }
+
+  let contents = std::fs::read_to_string(&app_html_path)
+    .with_context(|| format!("failed to read {}", app_html_path.display()))?;
+
+  Ok(Some(LoadedAppHtml {
+    contents,
+    source_path: Some(app_html_path),
+  }))
+}
+
+fn validate_app_html_for_diagnostics(
+  project_root: &Path,
+  app_html: &Option<LoadedAppHtml>,
+) -> anyhow::Result<Option<serde_json::Value>> {
+  let Some(app_html) = app_html else {
+    return Ok(None);
+  };
+
+  if let Err(err) = thebe_codegen::validate_app_html(&app_html.contents) {
+    if let Some(source_path) = app_html.source_path.as_deref() {
+      return Ok(Some(file_diagnostic(
+        project_root,
+        source_path,
+        &app_html.contents,
+        None,
+        "app-html",
+        "invalid-app-html",
+        err.to_string(),
+      )?));
+    }
+
+    return Ok(Some(project_diagnostic(
+      "app-html",
+      "invalid-app-html",
+      err.to_string(),
+    )));
+  }
+
+  Ok(None)
+}
+
 fn ensure_ts_rs_dependency(project_root: &Path) -> anyhow::Result<()> {
+  anyhow::ensure!(
+    has_ts_rs_dependency(project_root)?,
+    "typed `<script lang=\"ts\">` routes require `ts-rs` in {} — add `ts-rs = \"12\"` under `[dependencies]`",
+    project_root.join("Cargo.toml").display()
+  );
+
+  Ok(())
+}
+
+fn has_ts_rs_dependency(project_root: &Path) -> anyhow::Result<bool> {
   let cargo_toml_path = project_root.join("Cargo.toml");
   let cargo_toml = std::fs::read_to_string(&cargo_toml_path)
     .with_context(|| format!("failed to read {}", cargo_toml_path.display()))?;
 
-  anyhow::ensure!(
-    cargo_toml.contains("ts-rs"),
-    "typed `<script lang=\"ts\">` routes require `ts-rs` in {} — add `ts-rs = \"12\"` under `[dependencies]`",
-    cargo_toml_path.display()
-  );
-
-  Ok(())
+  Ok(cargo_toml.contains("ts-rs"))
 }
 
 fn prepare_generated_workspace(project_root: &Path, typecheck_enabled: bool) -> anyhow::Result<()> {
@@ -1150,5 +1661,96 @@ mod tests {
     assert_eq!(manifest["appHtml"]["usesDefault"], true);
     assert_eq!(manifest["layouts"], serde_json::json!([]));
     assert_eq!(manifest["routes"], serde_json::json!([]));
+  }
+
+  #[test]
+  fn build_diagnostics_file_wraps_versioned_diagnostics() {
+    let diagnostics = vec![project_diagnostic(
+      "project",
+      "missing-routes",
+      "no `.trs` files found in `src/routes/`".to_owned(),
+    )];
+
+    let diagnostics = build_diagnostics_file(&diagnostics).unwrap();
+    let diagnostics: serde_json::Value = serde_json::from_str(&diagnostics).unwrap();
+
+    assert_eq!(diagnostics["version"], 1);
+    assert_eq!(diagnostics["diagnostics"][0]["kind"], "project");
+    assert_eq!(diagnostics["diagnostics"][0]["code"], "missing-routes");
+  }
+
+  #[test]
+  fn file_diagnostic_records_relative_path_and_span() {
+    let diagnostic = file_diagnostic(
+      Path::new("/tmp/app"),
+      Path::new("/tmp/app/src/routes/index.trs"),
+      "abc\ndef",
+      Some(SourceSpan { start: 4, end: 7 }),
+      "template",
+      "invalid-binding",
+      "binding error".to_owned(),
+    )
+    .unwrap();
+
+    assert_eq!(diagnostic["kind"], "file");
+    assert_eq!(diagnostic["filePath"], "src/routes/index.trs");
+    assert_eq!(diagnostic["sourceSpan"]["startLine"], 2);
+    assert_eq!(diagnostic["sourceSpan"]["startColumn"], 1);
+    assert_eq!(diagnostic["sourceSpan"]["endByte"], 7);
+  }
+
+  #[test]
+  fn validate_app_html_for_diagnostics_reports_invalid_shell() {
+    let app_html = Some(LoadedAppHtml {
+      contents: "<!DOCTYPE html><html><body>%thebe.body%</body></html>".to_owned(),
+      source_path: Some(PathBuf::from("/tmp/app/app.html")),
+    });
+
+    let diagnostic = validate_app_html_for_diagnostics(Path::new("/tmp/app"), &app_html)
+      .unwrap()
+      .unwrap();
+
+    assert_eq!(diagnostic["kind"], "file");
+    assert_eq!(diagnostic["category"], "app-html");
+    assert_eq!(diagnostic["code"], "invalid-app-html");
+    assert_eq!(diagnostic["filePath"], "app.html");
+  }
+
+  #[test]
+  fn template_area_span_covers_all_template_segments() {
+    let blocks = thebe_parser::SfcBlocks {
+      template_spans: vec![
+        SourceSpan { start: 5, end: 9 },
+        SourceSpan { start: 14, end: 22 },
+      ],
+      ..thebe_parser::SfcBlocks::default()
+    };
+
+    assert_eq!(
+      template_area_span(&blocks, "012345678901234567890123456789"),
+      SourceSpan { start: 5, end: 22 }
+    );
+  }
+
+  #[test]
+  fn codegen_error_diagnostic_maps_template_errors_to_template_spans() {
+    let blocks = thebe_parser::SfcBlocks {
+      template_spans: vec![SourceSpan { start: 5, end: 24 }],
+      ..thebe_parser::SfcBlocks::default()
+    };
+
+    let diagnostic = codegen_error_diagnostic(
+      Path::new("/tmp/app"),
+      Path::new("/tmp/app/src/routes/index.trs"),
+      "<div>{{ invalid + 1 }}</div>",
+      &blocks,
+      &thebe_codegen::CodegenError::InvalidBinding("invalid + 1".to_owned()),
+    )
+    .unwrap();
+
+    assert_eq!(diagnostic["category"], "template");
+    assert_eq!(diagnostic["code"], "invalid-binding");
+    assert_eq!(diagnostic["sourceSpan"]["startByte"], 5);
+    assert_eq!(diagnostic["sourceSpan"]["endByte"], 24);
   }
 }

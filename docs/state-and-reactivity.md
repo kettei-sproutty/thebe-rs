@@ -14,6 +14,7 @@ It represents the state of the system at the exact moment the HTTP request was f
 - `.thebe/server/routes.rs` is included by `src/main.rs` and exposes `thebe_routes()`.
 - `.thebe/server/routes/**` contains the generated Rust route modules.
 - `.thebe/manifest.json` records route and layout metadata for tooling, including generated paths, handler signatures, template bindings, and source spans for direct editor navigation.
+- `.thebe/diagnostics.json` is written by `thebe check` and records structured project/file diagnostics with relative paths and source spans.
 - `.thebe/types/**` contains the `ts-rs` export for that route's `Props` type.
 - `.thebe/client/**` contains a typed mirror of the route's `<script lang="ts">` block that imports `Props` from the generated bindings.
 - `.thebe/tsconfig.json` lets the editor type-check those mirrors without requiring a root TypeScript config.
