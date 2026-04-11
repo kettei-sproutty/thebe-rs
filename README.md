@@ -427,7 +427,8 @@ thebe/
 │   ├── thebe-css/          # LightningCSS transform + style scoping
 │   ├── thebe-macros/       # proc-macro: #[thebe::get], #[thebe::post], etc.
 │   ├── thebe-runtime/      # SSR render, Props injection, Axum re-export
-│   └── thebe-cli/          # `thebe dev`, `thebe build`, FS scanner
+│   ├── thebe-cli/          # `thebe dev`, `thebe build`, FS scanner
+│   └── thebe-lsp/          # `tower-lsp` server over `.thebe` manifest + diagnostics artifacts
 └── packages/
     └── thebe-client/       # npm package: signals, hydration runtime, getProps
         └── src/

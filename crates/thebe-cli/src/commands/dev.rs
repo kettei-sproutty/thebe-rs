@@ -280,7 +280,10 @@ fn collect_project_diagnostics(project_root: &Path) -> anyhow::Result<Vec<serde_
       "missing-routes-dir",
       format!(
         "no `{}` directory found — create your route `.trs` files there",
-        routes_dir.strip_prefix(project_root).unwrap_or(&routes_dir).display()
+        routes_dir
+          .strip_prefix(project_root)
+          .unwrap_or(&routes_dir)
+          .display()
       ),
     ));
     return Ok(diagnostics);
@@ -302,9 +305,10 @@ fn collect_project_diagnostics(project_root: &Path) -> anyhow::Result<Vec<serde_
   if let Some(diagnostic) = validate_app_html_for_diagnostics(project_root, &app_html)? {
     diagnostics.push(diagnostic);
   }
-  let app_html_source = app_html
-    .as_ref()
-    .map_or_else(|| thebe_codegen::default_app_html().to_owned(), |loaded| loaded.contents.clone());
+  let app_html_source = app_html.as_ref().map_or_else(
+    || thebe_codegen::default_app_html().to_owned(),
+    |loaded| loaded.contents.clone(),
+  );
   let app_html_valid = app_html
     .as_ref()
     .is_none_or(|loaded| thebe_codegen::validate_app_html(&loaded.contents).is_ok());
@@ -458,21 +462,22 @@ fn analyze_route_for_diagnostics(
     }
   };
 
-  let template_binding_spans = match collect_template_binding_occurrences(&source, &blocks.template_spans) {
-    Ok(bindings) => bindings,
-    Err(err) => {
-      diagnostics.push(file_diagnostic(
-        project_root,
-        route_path,
-        &source,
-        Some(template_area_span(&blocks, &source)),
-        "template",
-        "template-analysis-error",
-        err.to_string(),
-      )?);
-      return Ok(None);
-    }
-  };
+  let template_binding_spans =
+    match collect_template_binding_occurrences(&source, &blocks.template_spans) {
+      Ok(bindings) => bindings,
+      Err(err) => {
+        diagnostics.push(file_diagnostic(
+          project_root,
+          route_path,
+          &source,
+          Some(template_area_span(&blocks, &source)),
+          "template",
+          "template-analysis-error",
+          err.to_string(),
+        )?);
+        return Ok(None);
+      }
+    };
 
   let types_export_path =
     route_has_client_script(&blocks).then(|| type_bridge_export_path(route_path, routes_dir));
@@ -652,9 +657,11 @@ fn codegen_error_diagnostic(
     thebe_codegen::CodegenError::UnsupportedMethod(_) => {
       ("handler", "unsupported-method", blocks.script_setup_span)
     }
-    thebe_codegen::CodegenError::InvalidHandlerSignature(_) => {
-      ("handler", "invalid-handler-signature", blocks.script_setup_span)
-    }
+    thebe_codegen::CodegenError::InvalidHandlerSignature(_) => (
+      "handler",
+      "invalid-handler-signature",
+      blocks.script_setup_span,
+    ),
     thebe_codegen::CodegenError::UnclosedBinding => (
       "template",
       "unclosed-binding",
@@ -668,9 +675,7 @@ fn codegen_error_diagnostic(
     thebe_codegen::CodegenError::MissingHandler => {
       ("handler", "missing-handler", blocks.script_setup_span)
     }
-    thebe_codegen::CodegenError::MissingScriptSetup => {
-      ("handler", "missing-script-setup", None)
-    }
+    thebe_codegen::CodegenError::MissingScriptSetup => ("handler", "missing-script-setup", None),
     thebe_codegen::CodegenError::InvalidAppHtml(_) => ("app-html", "invalid-app-html", None),
     thebe_codegen::CodegenError::InvalidHead(_) => ("head", "invalid-head", blocks.head_span),
     thebe_codegen::CodegenError::TypeBridge(_) => (
@@ -688,7 +693,15 @@ fn codegen_error_diagnostic(
     thebe_codegen::CodegenError::CssError(_) => ("style", "css-error", blocks.style_span),
   };
 
-  file_diagnostic(project_root, file_path, source, span, category, code, err.to_string())
+  file_diagnostic(
+    project_root,
+    file_path,
+    source,
+    span,
+    category,
+    code,
+    err.to_string(),
+  )
 }
 
 fn template_area_span(blocks: &thebe_parser::SfcBlocks, source: &str) -> SourceSpan {

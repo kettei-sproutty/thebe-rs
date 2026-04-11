@@ -7,6 +7,7 @@ members = [
   "crates/thebe-css",
   "crates/thebe-runtime",
   "crates/thebe-cli",
+  "crates/thebe-lsp",
 ]
 default-members = ["crates/thebe-cli"]
 exclude = ["examples/counter-app"]
