@@ -1,0 +1,15 @@
+[package]
+name = "thebe-project"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+thebe-codegen = { path = "../thebe-codegen" }
+thebe-parser = { path = "../thebe-parser" }
+walkdir = "2"
+
+[lints]
+workspace = true

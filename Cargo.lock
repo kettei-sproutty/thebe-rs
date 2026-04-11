@@ -1407,10 +1407,8 @@ dependencies = [
  "anyhow",
  "clap",
  "notify",
- "serde_json",
  "thebe-codegen",
- "thebe-parser",
- "walkdir",
+ "thebe-project",
 ]
 
 [[package]]
@@ -1437,8 +1435,7 @@ name = "thebe-lsp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "serde",
- "serde_json",
+ "thebe-project",
  "tokio",
  "tower-lsp",
 ]
@@ -1448,6 +1445,18 @@ name = "thebe-parser"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "thebe-project"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thebe-codegen",
+ "thebe-parser",
+ "walkdir",
 ]
 
 [[package]]

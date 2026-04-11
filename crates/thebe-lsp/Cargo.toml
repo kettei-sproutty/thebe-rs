@@ -9,8 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-serde_json = { workspace = true }
+thebe-project = { path = "../thebe-project" }
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
 tower-lsp = "0.20"
 

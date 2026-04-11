@@ -6,6 +6,7 @@ members = [
   "crates/thebe-codegen",
   "crates/thebe-css",
   "crates/thebe-runtime",
+  "crates/thebe-project",
   "crates/thebe-cli",
   "crates/thebe-lsp",
 ]

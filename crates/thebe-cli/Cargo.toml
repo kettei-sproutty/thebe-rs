@@ -8,13 +8,11 @@ name = "thebe"
 path = "src/main.rs"
 
 [dependencies]
-thebe-parser = { path = "../thebe-parser" }
+thebe-project = { path = "../thebe-project" }
 thebe-codegen = { path = "../thebe-codegen" }
 anyhow = { workspace = true }
-serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 notify = "6"
-walkdir = "2"
 
 [lints]
 workspace = true

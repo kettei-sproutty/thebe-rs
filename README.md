@@ -425,6 +425,7 @@ thebe/
 │   ├── thebe-template/     # template compiler → SSR string + hydration map
 │   ├── thebe-codegen/      # Rust handler + Axum route generation
 │   ├── thebe-css/          # LightningCSS transform + style scoping
+│   ├── thebe-project/      # shared manifest/diagnostics generation + .thebe workspace refresh
 │   ├── thebe-macros/       # proc-macro: #[thebe::get], #[thebe::post], etc.
 │   ├── thebe-runtime/      # SSR render, Props injection, Axum re-export
 │   ├── thebe-cli/          # `thebe dev`, `thebe build`, FS scanner

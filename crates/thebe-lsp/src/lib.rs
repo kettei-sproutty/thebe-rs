@@ -1,102 +1,22 @@
-use anyhow::{Context, Result};
-use serde::Deserialize;
+use anyhow::Result;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use thebe_project::{
+  EditorRefresh, LayoutMetadata, ProjectArtifacts, RouteMetadata, SourceSpanMetadata,
+  THEBE_DIAGNOSTICS_FILE, THEBE_MANIFEST_FILE, TemplateBindingMetadata, ThebeDiagnostic,
+  ThebeDiagnosticsFile, ThebeManifest,
+};
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::{
   Diagnostic, DiagnosticSeverity, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-  DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Hover, HoverContents, HoverParams,
-  HoverProviderCapability, InitializeParams, InitializeResult, MarkupContent, MarkupKind,
-  MessageType, NumberOrString, OneOf, Position, Range, ServerCapabilities, ServerInfo, SymbolKind,
-  TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+  DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+  GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+  InitializeParams, InitializeResult, Location, MarkupContent, MarkupKind, MessageType,
+  NumberOrString, OneOf, Position, Range, ReferenceParams, ServerCapabilities, ServerInfo,
+  SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 use tower_lsp::{Client, LanguageServer};
-
-const THEBE_MANIFEST_FILE: &str = ".thebe/manifest.json";
-const THEBE_DIAGNOSTICS_FILE: &str = ".thebe/diagnostics.json";
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ThebeManifest {
-  app_html: AppHtmlMetadata,
-  layouts: Vec<LayoutMetadata>,
-  routes: Vec<RouteMetadata>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AppHtmlMetadata {
-  source_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LayoutMetadata {
-  scope_path: String,
-  source_path: String,
-  template_binding_spans: Vec<TemplateBindingMetadata>,
-  template_bindings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RouteMetadata {
-  route_path: String,
-  source_path: String,
-  state_type: Option<String>,
-  handler: HandlerMetadata,
-  template_binding_spans: Vec<TemplateBindingMetadata>,
-  template_bindings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HandlerMetadata {
-  method: String,
-  name: String,
-  is_async: bool,
-  param_types: Vec<String>,
-  source_span: Option<SourceSpanMetadata>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TemplateBindingMetadata {
-  name: String,
-  source_span: SourceSpanMetadata,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct SourceSpanMetadata {
-  start_line: usize,
-  start_column: usize,
-  end_line: usize,
-  end_column: usize,
-}
-
-#[derive(Debug, Default, Clone, Deserialize)]
-struct ThebeDiagnosticsFile {
-  diagnostics: Vec<ThebeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ThebeDiagnostic {
-  severity: String,
-  category: String,
-  code: String,
-  message: String,
-  file_path: Option<String>,
-  source_span: Option<SourceSpanMetadata>,
-}
-
-#[derive(Debug, Clone)]
-struct ProjectArtifacts {
-  manifest: ThebeManifest,
-  diagnostics: ThebeDiagnosticsFile,
-}
 
 #[derive(Debug)]
 pub struct Backend {
@@ -109,14 +29,34 @@ impl Backend {
     Self { client }
   }
 
-  async fn refresh_diagnostics_for_uri(&self, uri: &Url) {
+  async fn refresh_project_for_uri(&self, uri: &Url) {
     let Some(project_root) = find_project_root_from_uri(uri) else {
       return;
     };
 
-    match ProjectArtifacts::load(&project_root) {
-      Ok(artifacts) => {
+    match thebe_project::refresh_project_for_editor(&project_root) {
+      Ok(EditorRefresh::Generated(artifacts)) => {
         if let Err(err) = publish_project_diagnostics(&self.client, &project_root, &artifacts).await
+        {
+          self
+            .client
+            .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
+            .await;
+        }
+      }
+      Ok(EditorRefresh::Diagnostics(diagnostics)) => {
+        if let Ok(mut artifacts) = thebe_project::load_project_artifacts(&project_root) {
+          artifacts.diagnostics = diagnostics.clone();
+          if let Err(err) =
+            publish_project_diagnostics(&self.client, &project_root, &artifacts).await
+          {
+            self
+              .client
+              .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
+              .await;
+          }
+        } else if let Err(err) =
+          publish_diagnostics_without_manifest(&self.client, &project_root, &diagnostics).await
         {
           self
             .client
@@ -130,7 +70,7 @@ impl Backend {
           .log_message(
             MessageType::WARNING,
             format!(
-              "thebe-lsp: failed to load {} or {} for {}: {err:#}",
+              "thebe-lsp: failed to refresh {} or {} for {}: {err:#}",
               THEBE_MANIFEST_FILE,
               THEBE_DIAGNOSTICS_FILE,
               project_root.display()
@@ -142,6 +82,20 @@ impl Backend {
           .publish_diagnostics(uri.clone(), Vec::new(), None)
           .await;
       }
+    }
+  }
+
+  fn load_or_refresh_artifacts(&self, uri: &Url) -> Option<(PathBuf, ProjectArtifacts)> {
+    let project_root = find_project_root_from_uri(uri)?;
+    if let Ok(artifacts) = thebe_project::load_project_artifacts(&project_root) {
+      return Some((project_root, artifacts));
+    }
+
+    match thebe_project::refresh_project_for_editor(&project_root).ok()? {
+      EditorRefresh::Generated(artifacts) => Some((project_root, artifacts)),
+      EditorRefresh::Diagnostics(_) => thebe_project::load_project_artifacts(&project_root)
+        .ok()
+        .map(|artifacts| (project_root, artifacts)),
     }
   }
 }
@@ -157,6 +111,8 @@ impl LanguageServer for Backend {
       capabilities: ServerCapabilities {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         ..ServerCapabilities::default()
       },
@@ -169,7 +125,7 @@ impl LanguageServer for Backend {
       .client
       .log_message(
         MessageType::INFO,
-        "thebe-lsp initialized — run `thebe check` or `thebe dev` to refresh .thebe artifacts",
+        "thebe-lsp initialized — compiler state now refreshes through the shared thebe-project crate",
       )
       .await;
   }
@@ -180,24 +136,20 @@ impl LanguageServer for Backend {
 
   async fn did_open(&self, params: DidOpenTextDocumentParams) {
     self
-      .refresh_diagnostics_for_uri(&params.text_document.uri)
+      .refresh_project_for_uri(&params.text_document.uri)
       .await;
   }
 
   async fn did_save(&self, params: DidSaveTextDocumentParams) {
     self
-      .refresh_diagnostics_for_uri(&params.text_document.uri)
+      .refresh_project_for_uri(&params.text_document.uri)
       .await;
   }
 
   async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
     let uri = &params.text_document_position_params.text_document.uri;
-    let Some(project_root) = find_project_root_from_uri(uri) else {
+    let Some((project_root, artifacts)) = self.load_or_refresh_artifacts(uri) else {
       return Ok(None);
-    };
-    let artifacts = match ProjectArtifacts::load(&project_root) {
-      Ok(artifacts) => artifacts,
-      Err(_) => return Ok(None),
     };
     let Some(relative_path) = relative_path_from_uri(&project_root, uri) else {
       return Ok(None);
@@ -215,12 +167,8 @@ impl LanguageServer for Backend {
     params: DocumentSymbolParams,
   ) -> LspResult<Option<DocumentSymbolResponse>> {
     let uri = &params.text_document.uri;
-    let Some(project_root) = find_project_root_from_uri(uri) else {
+    let Some((project_root, artifacts)) = self.load_or_refresh_artifacts(uri) else {
       return Ok(None);
-    };
-    let artifacts = match ProjectArtifacts::load(&project_root) {
-      Ok(artifacts) => artifacts,
-      Err(_) => return Ok(None),
     };
     let Some(relative_path) = relative_path_from_uri(&project_root, uri) else {
       return Ok(None);
@@ -231,45 +179,51 @@ impl LanguageServer for Backend {
       &relative_path,
     ))
   }
-}
 
-impl ProjectArtifacts {
-  fn load(project_root: &Path) -> Result<Self> {
-    let manifest_path = project_root.join(THEBE_MANIFEST_FILE);
-    let diagnostics_path = project_root.join(THEBE_DIAGNOSTICS_FILE);
-    let manifest = load_json::<ThebeManifest>(&manifest_path)?;
-    let diagnostics = load_json::<ThebeDiagnosticsFile>(&diagnostics_path)?;
+  async fn goto_definition(
+    &self,
+    params: GotoDefinitionParams,
+  ) -> LspResult<Option<GotoDefinitionResponse>> {
+    let uri = &params.text_document_position_params.text_document.uri;
+    let Some((project_root, artifacts)) = self.load_or_refresh_artifacts(uri) else {
+      return Ok(None);
+    };
+    let Some(relative_path) = relative_path_from_uri(&project_root, uri) else {
+      return Ok(None);
+    };
 
-    Ok(Self {
-      manifest,
-      diagnostics,
-    })
+    definition_for_manifest_file(
+      &project_root,
+      &artifacts.manifest,
+      &relative_path,
+      params.text_document_position_params.position,
+    )
+    .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())
   }
-}
 
-fn load_json<T>(path: &Path) -> Result<T>
-where
-  T: for<'de> Deserialize<'de>,
-{
-  let source =
-    std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-  serde_json::from_str(&source).with_context(|| format!("failed to parse {}", path.display()))
+  async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
+    let uri = &params.text_document_position.text_document.uri;
+    let Some((project_root, artifacts)) = self.load_or_refresh_artifacts(uri) else {
+      return Ok(None);
+    };
+    let Some(relative_path) = relative_path_from_uri(&project_root, uri) else {
+      return Ok(None);
+    };
+
+    references_for_manifest_file(
+      &project_root,
+      &artifacts.manifest,
+      &relative_path,
+      params.text_document_position.position,
+      params.context.include_declaration,
+    )
+    .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())
+  }
 }
 
 fn find_project_root_from_uri(uri: &Url) -> Option<PathBuf> {
   let path = uri.to_file_path().ok()?;
-  let mut current = if path.is_file() {
-    path.parent()?.to_path_buf()
-  } else {
-    path
-  };
-
-  loop {
-    if current.join("Cargo.toml").exists() {
-      return Some(current);
-    }
-    current = current.parent()?.to_path_buf();
-  }
+  thebe_project::find_project_root_from(&path).ok()
 }
 
 fn relative_path_from_uri(project_root: &Path, uri: &Url) -> Option<String> {
@@ -305,7 +259,7 @@ fn hover_for_manifest_file(
       .find(|binding| position_in_span(position, &binding.source_span))
     {
       return Some(binding_hover(
-        &binding.name,
+        binding,
         &format!("Route `{}`", route.route_path),
       ));
     }
@@ -321,7 +275,7 @@ fn hover_for_manifest_file(
       .find(|binding| position_in_span(position, &binding.source_span))
   {
     return Some(binding_hover(
-      &binding.name,
+      binding,
       &format!("Layout `{}`", layout.scope_path),
     ));
   }
@@ -360,6 +314,207 @@ fn document_symbols_for_manifest_file(
   None
 }
 
+fn definition_for_manifest_file(
+  project_root: &Path,
+  manifest: &ThebeManifest,
+  relative_path: &str,
+  position: Position,
+) -> Result<Option<GotoDefinitionResponse>> {
+  match find_route_document_match(manifest, relative_path) {
+    Some(RouteDocumentMatch::Source(route)) => {
+      if let Some(source_span) = route.handler.source_span
+        && position_in_span(position, &source_span)
+      {
+        return file_start_definition(project_root, &route.generated_server_path).map(Some);
+      }
+
+      if let Some(binding) = route
+        .template_binding_spans
+        .iter()
+        .find(|binding| position_in_span(position, &binding.source_span))
+      {
+        if let Some(generated_types_path) = route.generated_types_path.as_deref() {
+          return file_start_definition(project_root, generated_types_path).map(Some);
+        }
+        if let Some(generated_client_path) = route.generated_client_path.as_deref() {
+          return file_start_definition(project_root, generated_client_path).map(Some);
+        }
+
+        return location_for_relative_path(project_root, &route.source_path, binding.source_span)
+          .map(|location| Some(GotoDefinitionResponse::Scalar(location)));
+      }
+    }
+    Some(RouteDocumentMatch::GeneratedServer(route)) => {
+      if let Some(source_span) = route.handler.source_span {
+        let location = location_for_relative_path(project_root, &route.source_path, source_span)?;
+        return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+      }
+    }
+    Some(RouteDocumentMatch::GeneratedClient(route))
+    | Some(RouteDocumentMatch::GeneratedTypes(route)) => {
+      let location = if let Some(source_span) = route.handler.source_span {
+        location_for_relative_path(project_root, &route.source_path, source_span)?
+      } else {
+        file_start_location(project_root, &route.source_path)?
+      };
+      return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+    }
+    None => {}
+  }
+
+  if let Some(layout) = manifest
+    .layouts
+    .iter()
+    .find(|layout| layout.source_path == relative_path)
+    && let Some(binding) = layout
+      .template_binding_spans
+      .iter()
+      .find(|binding| position_in_span(position, &binding.source_span))
+  {
+    let definition_span = layout
+      .template_binding_spans
+      .iter()
+      .find(|candidate| candidate.name == binding.name)
+      .map(|candidate| candidate.source_span)
+      .unwrap_or(binding.source_span);
+    let location = location_for_relative_path(project_root, &layout.source_path, definition_span)?;
+    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+  }
+
+  Ok(None)
+}
+
+fn references_for_manifest_file(
+  project_root: &Path,
+  manifest: &ThebeManifest,
+  relative_path: &str,
+  position: Position,
+  include_declaration: bool,
+) -> Result<Option<Vec<Location>>> {
+  let mut locations = Vec::new();
+
+  match find_route_document_match(manifest, relative_path) {
+    Some(RouteDocumentMatch::Source(route)) => {
+      if let Some(source_span) = route.handler.source_span
+        && position_in_span(position, &source_span)
+      {
+        if include_declaration {
+          locations.push(location_for_relative_path(
+            project_root,
+            &route.source_path,
+            source_span,
+          )?);
+        }
+        locations.push(file_start_location(
+          project_root,
+          &route.generated_server_path,
+        )?);
+        return Ok((!locations.is_empty()).then_some(locations));
+      }
+
+      if let Some(binding) = route
+        .template_binding_spans
+        .iter()
+        .find(|binding| position_in_span(position, &binding.source_span))
+      {
+        locations.extend(binding_reference_locations(
+          project_root,
+          &route.source_path,
+          &route.template_binding_spans,
+          &binding.name,
+          include_declaration,
+          Some(binding.source_span),
+        )?);
+        if let Some(generated_client_path) = route.generated_client_path.as_deref() {
+          locations.push(file_start_location(project_root, generated_client_path)?);
+        }
+        if let Some(generated_types_path) = route.generated_types_path.as_deref() {
+          locations.push(file_start_location(project_root, generated_types_path)?);
+        }
+        dedup_locations(&mut locations);
+        return Ok((!locations.is_empty()).then_some(locations));
+      }
+    }
+    Some(RouteDocumentMatch::GeneratedServer(route)) => {
+      if include_declaration {
+        locations.push(file_start_location(
+          project_root,
+          &route.generated_server_path,
+        )?);
+      }
+      if let Some(source_span) = route.handler.source_span {
+        locations.push(location_for_relative_path(
+          project_root,
+          &route.source_path,
+          source_span,
+        )?);
+      }
+      return Ok((!locations.is_empty()).then_some(locations));
+    }
+    Some(RouteDocumentMatch::GeneratedClient(route)) => {
+      if include_declaration {
+        if let Some(generated_client_path) = route.generated_client_path.as_deref() {
+          locations.push(file_start_location(project_root, generated_client_path)?);
+        }
+      }
+      if let Some(source_span) = route.handler.source_span {
+        locations.push(location_for_relative_path(
+          project_root,
+          &route.source_path,
+          source_span,
+        )?);
+      }
+      if let Some(generated_types_path) = route.generated_types_path.as_deref() {
+        locations.push(file_start_location(project_root, generated_types_path)?);
+      }
+      dedup_locations(&mut locations);
+      return Ok((!locations.is_empty()).then_some(locations));
+    }
+    Some(RouteDocumentMatch::GeneratedTypes(route)) => {
+      if include_declaration {
+        if let Some(generated_types_path) = route.generated_types_path.as_deref() {
+          locations.push(file_start_location(project_root, generated_types_path)?);
+        }
+      }
+      if let Some(source_span) = route.handler.source_span {
+        locations.push(location_for_relative_path(
+          project_root,
+          &route.source_path,
+          source_span,
+        )?);
+      }
+      if let Some(generated_client_path) = route.generated_client_path.as_deref() {
+        locations.push(file_start_location(project_root, generated_client_path)?);
+      }
+      dedup_locations(&mut locations);
+      return Ok((!locations.is_empty()).then_some(locations));
+    }
+    None => {}
+  }
+
+  if let Some(layout) = manifest
+    .layouts
+    .iter()
+    .find(|layout| layout.source_path == relative_path)
+    && let Some(binding) = layout
+      .template_binding_spans
+      .iter()
+      .find(|binding| position_in_span(position, &binding.source_span))
+  {
+    locations.extend(binding_reference_locations(
+      project_root,
+      &layout.source_path,
+      &layout.template_binding_spans,
+      &binding.name,
+      include_declaration,
+      Some(binding.source_span),
+    )?);
+  }
+
+  dedup_locations(&mut locations);
+  Ok((!locations.is_empty()).then_some(locations))
+}
+
 async fn publish_project_diagnostics(
   client: &Client,
   project_root: &Path,
@@ -381,6 +536,31 @@ async fn publish_project_diagnostics(
   for relative_path in known_source_paths(&artifacts.manifest) {
     let file_url = file_url(project_root, &relative_path)?;
     diagnostics_by_file.entry(file_url).or_default();
+  }
+
+  for (uri, diagnostics) in diagnostics_by_file {
+    client.publish_diagnostics(uri, diagnostics, None).await;
+  }
+
+  Ok(())
+}
+
+async fn publish_diagnostics_without_manifest(
+  client: &Client,
+  project_root: &Path,
+  diagnostics: &ThebeDiagnosticsFile,
+) -> Result<()> {
+  let mut diagnostics_by_file = BTreeMap::<Url, Vec<Diagnostic>>::new();
+
+  for diagnostic in &diagnostics.diagnostics {
+    let Some(relative_path) = diagnostic.file_path.as_deref() else {
+      continue;
+    };
+    let file_url = file_url(project_root, relative_path)?;
+    diagnostics_by_file
+      .entry(file_url)
+      .or_default()
+      .push(to_lsp_diagnostic(diagnostic));
   }
 
   for (uri, diagnostics) in diagnostics_by_file {
@@ -413,6 +593,84 @@ fn known_source_paths(manifest: &ThebeManifest) -> Vec<String> {
   paths.sort();
   paths.dedup();
   paths
+}
+
+fn find_route_document_match<'a>(
+  manifest: &'a ThebeManifest,
+  relative_path: &str,
+) -> Option<RouteDocumentMatch<'a>> {
+  for route in &manifest.routes {
+    if route.source_path == relative_path {
+      return Some(RouteDocumentMatch::Source(route));
+    }
+    if route.generated_server_path == relative_path {
+      return Some(RouteDocumentMatch::GeneratedServer(route));
+    }
+    if route.generated_client_path.as_deref() == Some(relative_path) {
+      return Some(RouteDocumentMatch::GeneratedClient(route));
+    }
+    if route.generated_types_path.as_deref() == Some(relative_path) {
+      return Some(RouteDocumentMatch::GeneratedTypes(route));
+    }
+  }
+
+  None
+}
+
+fn binding_reference_locations(
+  project_root: &Path,
+  relative_path: &str,
+  binding_spans: &[TemplateBindingMetadata],
+  binding_name: &str,
+  include_declaration: bool,
+  current_span: Option<SourceSpanMetadata>,
+) -> Result<Vec<Location>> {
+  binding_spans
+    .iter()
+    .filter(|binding| binding.name == binding_name)
+    .filter(|binding| include_declaration || Some(binding.source_span) != current_span)
+    .map(|binding| location_for_relative_path(project_root, relative_path, binding.source_span))
+    .collect()
+}
+
+fn file_start_definition(
+  project_root: &Path,
+  relative_path: &str,
+) -> Result<GotoDefinitionResponse> {
+  Ok(GotoDefinitionResponse::Scalar(file_start_location(
+    project_root,
+    relative_path,
+  )?))
+}
+
+fn file_start_location(project_root: &Path, relative_path: &str) -> Result<Location> {
+  Ok(Location {
+    uri: file_url(project_root, relative_path)?,
+    range: full_document_range(),
+  })
+}
+
+fn location_for_relative_path(
+  project_root: &Path,
+  relative_path: &str,
+  span: SourceSpanMetadata,
+) -> Result<Location> {
+  Ok(Location {
+    uri: file_url(project_root, relative_path)?,
+    range: range_from_span(&span),
+  })
+}
+
+fn dedup_locations(locations: &mut Vec<Location>) {
+  locations.sort_by(|left, right| {
+    left
+      .uri
+      .as_str()
+      .cmp(right.uri.as_str())
+      .then_with(|| compare_positions(left.range.start, right.range.start))
+      .then_with(|| compare_positions(left.range.end, right.range.end))
+  });
+  locations.dedup_by(|left, right| left.uri == right.uri && left.range == right.range);
 }
 
 fn file_url(project_root: &Path, relative_path: &str) -> Result<Url> {
@@ -481,13 +739,13 @@ fn handler_hover(route: &RouteMetadata) -> Hover {
   }
 }
 
-fn binding_hover(binding_name: &str, owner: &str) -> Hover {
+fn binding_hover(binding: &TemplateBindingMetadata, owner: &str) -> Hover {
   Hover {
     contents: HoverContents::Markup(MarkupContent {
       kind: MarkupKind::Markdown,
-      value: format!("**Template binding** `{binding_name}`\n\n{owner}"),
+      value: format!("**Template binding** `{}`\n\n{owner}", binding.name),
     }),
-    range: None,
+    range: Some(range_from_span(&binding.source_span)),
   }
 }
 
@@ -592,22 +850,36 @@ fn compare_positions(left: Position, right: Position) -> Ordering {
   }
 }
 
+enum RouteDocumentMatch<'a> {
+  Source(&'a RouteMetadata),
+  GeneratedServer(&'a RouteMetadata),
+  GeneratedClient(&'a RouteMetadata),
+  GeneratedTypes(&'a RouteMetadata),
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
 
   fn fixture_manifest() -> ThebeManifest {
     ThebeManifest {
-      app_html: AppHtmlMetadata {
+      version: 3,
+      server_router_path: ".thebe/server/routes.rs".to_owned(),
+      app_html: thebe_project::AppHtmlMetadata {
         source_path: Some("app.html".to_owned()),
+        uses_default: false,
       },
       layouts: vec![LayoutMetadata {
+        has_head: true,
+        has_style: true,
         scope_path: "_layout".to_owned(),
         source_path: "src/routes/_layout.trs".to_owned(),
         template_bindings: vec!["nav_title".to_owned()],
         template_binding_spans: vec![TemplateBindingMetadata {
           name: "nav_title".to_owned(),
           source_span: SourceSpanMetadata {
+            start_byte: 20,
+            end_byte: 33,
             start_line: 4,
             start_column: 3,
             end_line: 4,
@@ -616,26 +888,39 @@ mod tests {
         }],
       }],
       routes: vec![RouteMetadata {
-        route_path: "/profile".to_owned(),
-        source_path: "src/routes/profile.trs".to_owned(),
-        state_type: Some("crate::AppState".to_owned()),
-        handler: HandlerMetadata {
+        generated_client_path: Some(".thebe/client/routes/profile.ts".to_owned()),
+        generated_server_path: ".thebe/server/routes/profile.rs".to_owned(),
+        generated_types_path: Some(".thebe/types/routes/profile.ts".to_owned()),
+        handler: thebe_project::HandlerMetadata {
+          is_async: false,
           method: "get".to_owned(),
           name: "handler".to_owned(),
-          is_async: false,
           param_types: vec!["State<crate::AppState>".to_owned()],
           source_span: Some(SourceSpanMetadata {
+            start_byte: 67,
+            end_byte: 94,
             start_line: 7,
             start_column: 1,
             end_line: 7,
             end_column: 28,
           }),
         },
+        has_client_script: true,
+        has_head: false,
+        has_style: true,
+        layout_scope_path: Some("_layout".to_owned()),
+        layout_source_path: Some("src/routes/_layout.trs".to_owned()),
+        module_name: "route__profile".to_owned(),
+        route_path: "/profile".to_owned(),
+        source_path: "src/routes/profile.trs".to_owned(),
+        state_type: Some("crate::AppState".to_owned()),
         template_bindings: vec!["username".to_owned()],
         template_binding_spans: vec![
           TemplateBindingMetadata {
             name: "username".to_owned(),
             source_span: SourceSpanMetadata {
+              start_byte: 367,
+              end_byte: 381,
               start_line: 25,
               start_column: 17,
               end_line: 25,
@@ -645,6 +930,8 @@ mod tests {
           TemplateBindingMetadata {
             name: "username".to_owned(),
             source_span: SourceSpanMetadata {
+              start_byte: 403,
+              end_byte: 417,
               start_line: 26,
               start_column: 17,
               end_line: 26,
@@ -659,6 +946,8 @@ mod tests {
   #[test]
   fn range_from_span_converts_to_zero_based_positions() {
     let range = range_from_span(&SourceSpanMetadata {
+      start_byte: 1,
+      end_byte: 11,
       start_line: 8,
       start_column: 2,
       end_line: 8,
@@ -683,19 +972,6 @@ mod tests {
   }
 
   #[test]
-  fn hover_for_manifest_file_returns_binding_hover() {
-    let manifest = fixture_manifest();
-    let hover =
-      hover_for_manifest_file(&manifest, "src/routes/profile.trs", Position::new(24, 18)).unwrap();
-    let HoverContents::Markup(contents) = hover.contents else {
-      panic!("expected markdown hover");
-    };
-
-    assert!(contents.value.contains("Template binding"));
-    assert!(contents.value.contains("username"));
-  }
-
-  #[test]
   fn document_symbols_for_route_use_first_binding_span() {
     let manifest = fixture_manifest();
     let Some(DocumentSymbolResponse::Nested(symbols)) =
@@ -711,17 +987,77 @@ mod tests {
   }
 
   #[test]
-  fn known_source_paths_cover_manifest_files() {
+  fn definition_for_handler_points_to_generated_server_file() {
     let manifest = fixture_manifest();
-    let paths = known_source_paths(&manifest);
+    let response = definition_for_manifest_file(
+      Path::new("/tmp/app"),
+      &manifest,
+      "src/routes/profile.trs",
+      Position::new(6, 3),
+    )
+    .unwrap()
+    .unwrap();
+    let GotoDefinitionResponse::Scalar(location) = response else {
+      panic!("expected scalar definition");
+    };
 
-    assert_eq!(
-      paths,
-      vec![
-        "app.html".to_owned(),
-        "src/routes/_layout.trs".to_owned(),
-        "src/routes/profile.trs".to_owned(),
-      ]
+    assert!(
+      location
+        .uri
+        .path()
+        .ends_with("/.thebe/server/routes/profile.rs")
     );
+  }
+
+  #[test]
+  fn definition_for_generated_server_points_back_to_source_handler() {
+    let manifest = fixture_manifest();
+    let response = definition_for_manifest_file(
+      Path::new("/tmp/app"),
+      &manifest,
+      ".thebe/server/routes/profile.rs",
+      Position::new(0, 0),
+    )
+    .unwrap()
+    .unwrap();
+    let GotoDefinitionResponse::Scalar(location) = response else {
+      panic!("expected scalar definition");
+    };
+
+    assert!(location.uri.path().ends_with("/src/routes/profile.trs"));
+    assert_eq!(location.range.start, Position::new(6, 0));
+  }
+
+  #[test]
+  fn references_for_binding_include_all_occurrences_and_generated_files() {
+    let manifest = fixture_manifest();
+    let locations = references_for_manifest_file(
+      Path::new("/tmp/app"),
+      &manifest,
+      "src/routes/profile.trs",
+      Position::new(24, 18),
+      true,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(locations.len(), 4);
+    assert!(
+      locations
+        .iter()
+        .any(|location| location.uri.path().ends_with("/src/routes/profile.trs"))
+    );
+    assert!(locations.iter().any(|location| {
+      location
+        .uri
+        .path()
+        .ends_with("/.thebe/client/routes/profile.ts")
+    }));
+    assert!(locations.iter().any(|location| {
+      location
+        .uri
+        .path()
+        .ends_with("/.thebe/types/routes/profile.ts")
+    }));
   }
 }
