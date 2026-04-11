@@ -11,6 +11,7 @@ path = "src/main.rs"
 thebe-parser = { path = "../thebe-parser" }
 thebe-codegen = { path = "../thebe-codegen" }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 notify = "6"
 walkdir = "2"

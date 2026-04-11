@@ -7,6 +7,7 @@ use std::time::Duration;
 use walkdir::WalkDir;
 
 const THEBE_DIR: &str = ".thebe";
+const THEBE_MANIFEST_FILE: &str = ".thebe/manifest.json";
 const THEBE_SERVER_ROUTES_DIR: &str = ".thebe/server/routes";
 const THEBE_SERVER_ROUTES_FILE: &str = ".thebe/server/routes.rs";
 const TYPECHECK_CLIENT_DIR: &str = ".thebe/client";
@@ -35,6 +36,17 @@ struct ParsedRoute {
   mod_name: String,
   state_type: Option<String>,
   types_export_path: Option<String>,
+}
+
+struct ParsedLayout {
+  blocks: thebe_parser::SfcBlocks,
+  scope_path: String,
+  trs_path: PathBuf,
+}
+
+struct LoadedAppHtml {
+  contents: String,
+  source_path: Option<PathBuf>,
 }
 
 /// Run `thebe dev`: parse all `.trs` route files, emit generated Rust sources,
@@ -92,13 +104,13 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
   for route in &parsed_routes {
     // Find the nearest `_layout.trs` ancestor for this route.
     let layout_arg = find_layout(&layouts, &route.trs_path, routes_dir)
-      .map(|(blocks, scope_path)| (blocks, scope_path.as_str()));
+      .map(|layout| (&layout.blocks, layout.scope_path.as_str()));
 
     let generated = thebe_codegen::generate_route(
       &route.blocks,
       &route.route_path,
       layout_arg,
-      &app_html,
+      &app_html.contents,
       route.types_export_path.as_deref(),
     )
     .with_context(|| format!("codegen error for {}", route.trs_path.display()))?;
@@ -156,6 +168,18 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
   std::fs::write(&routes_path, &routes_file)
     .with_context(|| format!("failed to write {}", routes_path.display()))?;
   println!("thebe: generated {}", routes_path.display());
+
+  let manifest = build_thebe_manifest(
+    project_root,
+    routes_dir,
+    &parsed_routes,
+    &layouts,
+    app_html.source_path.as_deref(),
+  )?;
+  let manifest_path = project_root.join(THEBE_MANIFEST_FILE);
+  std::fs::write(&manifest_path, manifest)
+    .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+  println!("thebe: generated {}", manifest_path.display());
 
   remove_legacy_generated_sources(src_dir)?;
 
@@ -356,7 +380,82 @@ fn build_typecheck_mirror(client_ts: &str, props_import_path: &str) -> String {
   output
 }
 
-fn load_app_html(project_root: &Path) -> anyhow::Result<String> {
+fn build_thebe_manifest(
+  project_root: &Path,
+  routes_dir: &Path,
+  routes: &[ParsedRoute],
+  layouts: &HashMap<PathBuf, ParsedLayout>,
+  app_html_path: Option<&Path>,
+) -> anyhow::Result<String> {
+  let routes = routes
+    .iter()
+    .map(|route| build_thebe_manifest_route(project_root, routes_dir, route, layouts))
+    .collect::<anyhow::Result<Vec<_>>>()?;
+
+  let manifest = serde_json::json!({
+    "version": 1,
+    "serverRouterPath": THEBE_SERVER_ROUTES_FILE,
+    "appHtml": {
+      "sourcePath": app_html_path
+        .map(|path| to_project_relative_path(project_root, path))
+        .transpose()?,
+      "usesDefault": app_html_path.is_none(),
+    },
+    "routes": routes,
+  });
+
+  serde_json::to_string_pretty(&manifest).context("failed to serialize .thebe/manifest.json")
+}
+
+fn build_thebe_manifest_route(
+  project_root: &Path,
+  routes_dir: &Path,
+  route: &ParsedRoute,
+  layouts: &HashMap<PathBuf, ParsedLayout>,
+) -> anyhow::Result<serde_json::Value> {
+  let layout = find_layout(layouts, &route.trs_path, routes_dir);
+  let relative_rs_path = route
+    .trs_path
+    .strip_prefix(routes_dir)
+    .with_context(|| format!("route {} is outside src/routes/", route.trs_path.display()))?
+    .with_extension("rs");
+
+  Ok(serde_json::json!({
+    "routePath": route.route_path,
+    "sourcePath": to_project_relative_path(project_root, &route.trs_path)?,
+    "moduleName": route.mod_name,
+    "generatedServerPath": format!(
+      "{THEBE_SERVER_ROUTES_DIR}/{}",
+      relative_rs_path.to_string_lossy().replace('\\', "/")
+    ),
+    "stateType": route.state_type,
+    "hasClientScript": route_has_client_script(&route.blocks),
+    "hasHead": has_meaningful_block(route.blocks.head.as_deref()),
+    "hasStyle": has_meaningful_block(route.blocks.style.as_deref()),
+    "layoutSourcePath": layout
+      .map(|layout| to_project_relative_path(project_root, &layout.trs_path))
+      .transpose()?,
+    "layoutScopePath": layout.map(|layout| layout.scope_path.as_str()),
+    "generatedTypesPath": route.types_export_path.as_ref().map(|path| format!("{TYPECHECK_TYPES_DIR}/{path}")),
+    "generatedClientPath": route.types_export_path.as_ref().map(|path| format!("{TYPECHECK_CLIENT_DIR}/{path}")),
+  }))
+}
+
+fn has_meaningful_block(block: Option<&str>) -> bool {
+  block.is_some_and(|block| !block.trim().is_empty())
+}
+
+fn to_project_relative_path(project_root: &Path, path: &Path) -> anyhow::Result<String> {
+  Ok(
+    path
+      .strip_prefix(project_root)
+      .with_context(|| format!("path {} is outside project root", path.display()))?
+      .to_string_lossy()
+      .replace('\\', "/"),
+  )
+}
+
+fn load_app_html(project_root: &Path) -> anyhow::Result<LoadedAppHtml> {
   let app_html_path = project_root.join("app.html");
 
   if app_html_path.exists() {
@@ -364,12 +463,18 @@ fn load_app_html(project_root: &Path) -> anyhow::Result<String> {
       .with_context(|| format!("failed to read {}", app_html_path.display()))?;
     thebe_codegen::validate_app_html(&app_html)
       .with_context(|| format!("invalid {}", app_html_path.display()))?;
-    return Ok(app_html);
+    return Ok(LoadedAppHtml {
+      contents: app_html,
+      source_path: Some(app_html_path),
+    });
   }
 
   let app_html = thebe_codegen::default_app_html().to_owned();
   thebe_codegen::validate_app_html(&app_html).context("internal default app.html is invalid")?;
-  Ok(app_html)
+  Ok(LoadedAppHtml {
+    contents: app_html,
+    source_path: None,
+  })
 }
 
 /// Spawn `cargo run` in `project_root` as a background child process.
@@ -525,12 +630,10 @@ fn collect_trs_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 
 /// Walk `routes_dir` and parse every `_layout.trs` file found.
 ///
-/// Returns a map from **directory path** → (parsed `SfcBlocks`, scope path
-/// string).  The scope path is the layout file's path relative to `routes_dir`
-/// (without the `.trs` extension), used as the CSS scope identifier.
-fn collect_layouts(
-  routes_dir: &Path,
-) -> anyhow::Result<HashMap<PathBuf, (thebe_parser::SfcBlocks, String)>> {
+/// Returns a map from **directory path** → parsed layout metadata. The scope
+/// path is the layout file's path relative to `routes_dir` (without the `.trs`
+/// extension), used as the CSS scope identifier.
+fn collect_layouts(routes_dir: &Path) -> anyhow::Result<HashMap<PathBuf, ParsedLayout>> {
   let mut map = HashMap::new();
   for entry in WalkDir::new(routes_dir).min_depth(1) {
     let entry = entry.context("failed to read directory entry")?;
@@ -555,7 +658,14 @@ fn collect_layouts(
 
       // Key by the directory that contains the layout file.
       let dir = layout_path.parent().unwrap_or(routes_dir).to_path_buf();
-      map.insert(dir, (blocks, scope_path));
+      map.insert(
+        dir,
+        ParsedLayout {
+          blocks,
+          scope_path,
+          trs_path: layout_path.clone(),
+        },
+      );
 
       println!("thebe: found layout {}", layout_path.display());
     }
@@ -568,14 +678,14 @@ fn collect_layouts(
 /// Walks up from the route file's directory towards (and including) `routes_dir`
 /// and returns a reference to the first layout found, or `None`.
 fn find_layout<'a>(
-  layouts: &'a HashMap<PathBuf, (thebe_parser::SfcBlocks, String)>,
+  layouts: &'a HashMap<PathBuf, ParsedLayout>,
   route_file: &Path,
   routes_dir: &Path,
-) -> Option<(&'a thebe_parser::SfcBlocks, &'a String)> {
+) -> Option<&'a ParsedLayout> {
   let mut dir = route_file.parent().unwrap_or(routes_dir).to_path_buf();
   loop {
-    if let Some((blocks, scope)) = layouts.get(&dir) {
-      return Some((blocks, scope));
+    if let Some(layout) = layouts.get(&dir) {
+      return Some(layout);
     }
     // Stop after checking routes_dir itself.
     if dir == routes_dir {
@@ -731,5 +841,90 @@ mod tests {
 
     assert!(source.contains("import type { Props } from \"../../types/routes/index\";"));
     assert!(source.contains("let props = getProps<Props>();"));
+  }
+
+  #[test]
+  fn build_thebe_manifest_records_generated_paths_and_layouts() {
+    let project_root = Path::new("/tmp/app");
+    let routes_dir = Path::new("/tmp/app/src/routes");
+    let mut layouts = HashMap::new();
+    layouts.insert(
+      PathBuf::from("/tmp/app/src/routes/blog"),
+      ParsedLayout {
+        blocks: thebe_parser::SfcBlocks::default(),
+        scope_path: "blog/_layout".to_owned(),
+        trs_path: PathBuf::from("/tmp/app/src/routes/blog/_layout.trs"),
+      },
+    );
+
+    let route = ParsedRoute {
+      trs_path: PathBuf::from("/tmp/app/src/routes/blog/[slug].trs"),
+      blocks: thebe_parser::SfcBlocks {
+        head: Some("<title>Blog</title>".to_owned()),
+        script_ts: Some("let props = getProps<Props>();".to_owned()),
+        style: Some(".blog { color: red; }".to_owned()),
+        ..thebe_parser::SfcBlocks::default()
+      },
+      route_path: "/blog/:slug".to_owned(),
+      mod_name: "route__blog__dyn_slug".to_owned(),
+      state_type: Some("crate::AppState".to_owned()),
+      types_export_path: Some("routes/blog/[slug].ts".to_owned()),
+    };
+
+    let manifest = build_thebe_manifest(
+      project_root,
+      routes_dir,
+      &[route],
+      &layouts,
+      Some(Path::new("/tmp/app/app.html")),
+    )
+    .unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+
+    assert_eq!(manifest["serverRouterPath"], THEBE_SERVER_ROUTES_FILE);
+    assert_eq!(manifest["appHtml"]["sourcePath"], "app.html");
+    assert_eq!(manifest["appHtml"]["usesDefault"], false);
+    assert_eq!(
+      manifest["routes"][0]["sourcePath"],
+      "src/routes/blog/[slug].trs"
+    );
+    assert_eq!(
+      manifest["routes"][0]["generatedServerPath"],
+      ".thebe/server/routes/blog/[slug].rs"
+    );
+    assert_eq!(
+      manifest["routes"][0]["layoutSourcePath"],
+      "src/routes/blog/_layout.trs"
+    );
+    assert_eq!(manifest["routes"][0]["layoutScopePath"], "blog/_layout");
+    assert_eq!(
+      manifest["routes"][0]["generatedTypesPath"],
+      ".thebe/types/routes/blog/[slug].ts"
+    );
+    assert_eq!(
+      manifest["routes"][0]["generatedClientPath"],
+      ".thebe/client/routes/blog/[slug].ts"
+    );
+    assert_eq!(manifest["routes"][0]["stateType"], "crate::AppState");
+    assert_eq!(manifest["routes"][0]["hasClientScript"], true);
+    assert_eq!(manifest["routes"][0]["hasHead"], true);
+    assert_eq!(manifest["routes"][0]["hasStyle"], true);
+  }
+
+  #[test]
+  fn build_thebe_manifest_marks_default_app_html_usage() {
+    let manifest = build_thebe_manifest(
+      Path::new("/tmp/app"),
+      Path::new("/tmp/app/src/routes"),
+      &[],
+      &HashMap::new(),
+      None,
+    )
+    .unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+
+    assert_eq!(manifest["appHtml"]["sourcePath"], serde_json::Value::Null);
+    assert_eq!(manifest["appHtml"]["usesDefault"], true);
+    assert_eq!(manifest["routes"], serde_json::json!([]));
   }
 }

@@ -1086,6 +1086,7 @@ dependencies = [
  "anyhow",
  "clap",
  "notify",
+ "serde_json",
  "thebe-codegen",
  "thebe-parser",
  "walkdir",
