@@ -1,68 +1,68 @@
 <script setup>
-use rand::RngExt;
+use axum::extract::State;
 
 struct Props {
     title: String,
-    count: u32,
+    count: i64,
 }
 
 #[thebe::get]
-pub fn handler() -> Props {
-  println!("Handling GET request for /");
-  let mut rng = rand::rng();
-  let random_number: u32 = rng.random();
-
+pub fn handler(State(state): State<crate::AppState>) -> Props {
   Props {
     title: "Thebe Counter".to_string(),
-    count: random_number
-  }
-}
-
-#[thebe::post]
-pub fn handler_post() -> Props {
-  let mut rng = rand::rng();
-  let random_number: u32 = rng.random();
-
-  Props {
-    title: "Thebe Counter POST".to_string(),
-    count: random_number
+    count: state.count()
   }
 }
 </script>
 
 <head>
   <title>{{ title }}</title>
-  <meta name="description" content="A server-rendered reactive counter demo for Thebe." />
+  <meta name="description" content="A server-backed counter demo for Thebe using Axum state." />
 </head>
 
 <script lang="ts">
 let props = getProps<Props>();
 
+async function requestCount(path) {
+    try {
+        let response = await fetch(path, { method: "POST" });
+        if (!response.ok) {
+            throw new Error(`Counter request failed: ${response.status}`);
+        }
+
+        let payload = await response.json();
+        props.count = payload.count;
+    } catch (error) {
+        console.error(error);
+    }
+}
+
 function increment() {
-    props.count += 1;
+    void requestCount("/api/counter/increment");
 }
 
 function decrement() {
-    props.count -= 1;
+    void requestCount("/api/counter/decrement");
 }
 
 function reset() {
-    props.count = 0;
+    void requestCount("/api/counter/reset");
 }
 </script>
 
 <main>
-    <h1>{{ title }}, World!</h1>
+    <h1>{{ title }}</h1>
     <nav>
         <a href="/about">About</a>
     </nav>
+    <p class="hint">The count lives in Axum state. Buttons post to the server and hydrate the returned value.</p>
      <div class="controls">
       <button onclick="decrement">−</button>
       <button onclick="increment">+</button>
       <button onclick="reset">Reset</button>
     </div>
     <div style="display: flex; gap: 1rem; justify-content: center; margin-bottom: 2rem;">
-      <p class="count">{{ count }}!!</p>
+      <p class="count">{{ count }}</p>
     </div>
 </main>
 
@@ -80,6 +80,14 @@ main {
 h1 {
     font-size: 2rem;
     margin-bottom: 1rem;
+}
+
+.hint {
+  max-width: 28rem;
+  text-align: center;
+  color: #555;
+  margin: 0 0 1.5rem;
+  line-height: 1.5;
 }
 
 .count {

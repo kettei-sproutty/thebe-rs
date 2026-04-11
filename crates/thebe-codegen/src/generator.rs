@@ -513,8 +513,18 @@ fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<
 }
 
 fn write_router_fn(source: &mut String, handler: &RouteHandler, route_path: &str) {
-  source.push_str("pub fn router() -> axum::Router {\n");
-  source.push_str("    axum::Router::new().route(\n");
+  if let Some(state_type) = handler_state_type(handler) {
+    writeln!(source, "pub fn router() -> axum::Router<{state_type}> {{")
+      .expect("infallible");
+    writeln!(source, "    axum::Router::<{state_type}>::new().route(")
+      .expect("infallible");
+  } else {
+    source.push_str("pub fn router<S>() -> axum::Router<S>\n");
+    source.push_str("where\n");
+    source.push_str("    S: Clone + Send + Sync + 'static,\n");
+    source.push_str("{\n");
+    source.push_str("    axum::Router::<S>::new().route(\n");
+  }
   writeln!(source, "        \"{route_path}\",").expect("infallible");
   writeln!(
     source,
@@ -528,6 +538,29 @@ fn write_router_fn(source: &mut String, handler: &RouteHandler, route_path: &str
 
 /// Generate `src/__thebe_routes.rs` that declares all route modules and
 /// exposes a `__thebe_router()` helper.  The static `src/main.rs`
+
+fn handler_state_type(handler: &RouteHandler) -> Option<&str> {
+  handler
+    .param_types
+    .iter()
+    .find_map(|param_type| extract_state_type(param_type))
+}
+
+fn extract_state_type(param_type: &str) -> Option<&str> {
+  let trimmed = param_type.trim();
+  let open_angle = trimmed.find('<')?;
+  let prefix = trimmed[..open_angle].trim();
+  if prefix.rsplit("::").next()? != "State" {
+    return None;
+  }
+
+  let close_angle = trimmed.rfind('>')?;
+  if close_angle <= open_angle + 1 {
+    return None;
+  }
+
+  Some(trimmed[open_angle + 1..close_angle].trim())
+}
 /// (scaffolded by `thebe new`, never regenerated) does
 /// `include!("__thebe_routes.rs")` and owns the `main()` entry-point.
 #[must_use]
@@ -1063,6 +1096,16 @@ mod tests {
   }
 
   #[test]
+  fn extract_state_type_detects_plain_and_qualified_extractors() {
+    assert_eq!(extract_state_type("State<AppState>"), Some("AppState"));
+    assert_eq!(
+      extract_state_type("axum::extract::State<crate::AppState>"),
+      Some("crate::AppState")
+    );
+    assert_eq!(extract_state_type("Path<String>"), None);
+  }
+
+  #[test]
   fn find_handler_returns_error_when_missing() {
     let setup = "pub fn helper() {}";
     assert!(matches!(
@@ -1190,6 +1233,26 @@ mod tests {
     ));
     assert!(src.contains("let __props = create(__thebe_arg0, __thebe_arg1).await;"));
     assert!(src.contains("axum::routing::post(__thebe_render_handler)"));
+    assert!(src.contains("pub fn router() -> axum::Router<AppState>"));
+  }
+
+  #[test]
+  fn generate_route_keeps_stateless_router_generic() {
+    use thebe_parser::SfcBlocks;
+
+    let blocks = SfcBlocks {
+      script_setup: Some(
+        "struct Props { title: String }\n\n#[thebe::get]\npub fn handler() -> Props { Props { title: \"Counter\".to_owned() } }"
+          .to_owned(),
+      ),
+      template: "<h1>{{ title }}</h1>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let src = generate_route(&blocks, "/", None, default_app_html()).unwrap();
+
+    assert!(src.contains("pub fn router<S>() -> axum::Router<S>"));
+    assert!(src.contains("axum::Router::<S>::new().route("));
   }
 
   #[test]
