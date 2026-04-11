@@ -44,7 +44,7 @@ To keep parsing and hydration reliable, Thebe restricts template expressions to 
 - Component tags (`<Card>`)
 - Simple bindings: `{{ ident }}` or `{{ ident.prop.deep }}`
 - Dynamic attributes: `:attr="ident.prop"`
-- Event bindings: `onclick="fnName"`
+- Event bindings: `on*="fnName"` or simple calls like `oninput="fnName(this.value)"`
 - Slots: `<slot />` and `<thebe:slot name="...">`
 
 **Not Supported (Use `derived()` instead):**

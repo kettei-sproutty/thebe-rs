@@ -10,6 +10,8 @@ use std::sync::{
 mod route__about;
 #[path = "routes/index.rs"]
 mod route__index;
+#[path = "routes/profile.rs"]
+mod route__profile;
 
 #[derive(Clone)]
 struct AppState {
@@ -52,6 +54,7 @@ async fn main() {
     let app = axum::Router::<AppState>::new()
         .merge(route__about::router::<AppState>())
         .merge(route__index::router())
+        .merge(route__profile::router())
         .route("/api/counter/increment", post(increment))
         .route("/api/counter/decrement", post(decrement))
         .route("/api/counter/reset", post(reset))

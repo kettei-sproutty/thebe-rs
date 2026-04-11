@@ -5,8 +5,9 @@
  *  1. `getProps()` — reads the SSR props JSON and wraps it in a deep reactive
  *     Proxy.  Mutations trigger immediate DOM patches via hydration anchors.
  *  2. `__thebe_register(name, fn)` — registers event-handler functions so the
- *     onclick wiring below can call them by name.
- *  3. Auto-wires `onclick="fnName"` attributes after the DOM is ready.
+ *     DOM event wiring below can call them by name.
+ *  3. Auto-wires `on*="fnName"` and `on*="fnName(this.value)"` attributes
+ *     after the DOM is ready.
  *  4. `_updateDOM(key, value)` — finds all anchors for `key` and patches
  *     the bound text nodes or data-attribute elements.
  */
@@ -117,19 +118,215 @@
     });
   }
 
-  /** Wire `onclick="fnName"` attributes to the handlers registry. */
+  function _readMemberPath(root, path) {
+    var current = root;
+    var parts = path.split(".");
+    var i;
+
+    for (i = 0; i < parts.length; i++) {
+      if (current == null) {
+        return undefined;
+      }
+      current = current[parts[i]];
+    }
+
+    return current;
+  }
+
+  function _splitHandlerArgs(source) {
+    var args = [];
+    var current = "";
+    var quote = null;
+    var escaped = false;
+    var i;
+    var ch;
+
+    for (i = 0; i < source.length; i++) {
+      ch = source.charAt(i);
+
+      if (quote) {
+        current += ch;
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === quote) {
+          quote = null;
+        }
+        continue;
+      }
+
+      if (ch === '"' || ch === "'" || ch === "`") {
+        quote = ch;
+        current += ch;
+        continue;
+      }
+
+      if (ch === ",") {
+        args.push(current.trim());
+        current = "";
+        continue;
+      }
+
+      current += ch;
+    }
+
+    if (current.trim()) {
+      args.push(current.trim());
+    }
+
+    return args;
+  }
+
+  function _parseHandlerExpression(expression) {
+    var trimmed = (expression || "").trim();
+    var openParen;
+    var closeParen;
+    var name;
+
+    if (!trimmed) {
+      return null;
+    }
+
+    openParen = trimmed.indexOf("(");
+    if (openParen === -1) {
+      if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(trimmed)) {
+        return null;
+      }
+      return { name: trimmed, args: null };
+    }
+
+    closeParen = trimmed.lastIndexOf(")");
+    if (closeParen !== trimmed.length - 1) {
+      return null;
+    }
+
+    name = trimmed.slice(0, openParen).trim();
+    if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) {
+      return null;
+    }
+
+    return {
+      name: name,
+      args: _splitHandlerArgs(trimmed.slice(openParen + 1, closeParen))
+    };
+  }
+
+  function _resolveHandlerArg(expression, event, el) {
+    var trimmed = expression.trim();
+    var lastChar;
+
+    if (!trimmed) {
+      return undefined;
+    }
+
+    if (trimmed === "event") {
+      return event;
+    }
+
+    if (trimmed === "this") {
+      return el;
+    }
+
+    if (trimmed.indexOf("this.") === 0) {
+      return _readMemberPath(el, trimmed.slice(5));
+    }
+
+    if (trimmed.indexOf("event.") === 0) {
+      return _readMemberPath(event, trimmed.slice(6));
+    }
+
+    if (trimmed === "true") {
+      return true;
+    }
+
+    if (trimmed === "false") {
+      return false;
+    }
+
+    if (trimmed === "null") {
+      return null;
+    }
+
+    if (trimmed === "undefined") {
+      return undefined;
+    }
+
+    if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
+      return Number(trimmed);
+    }
+
+    lastChar = trimmed.charAt(trimmed.length - 1);
+    if (
+      trimmed.length >= 2 &&
+      ((trimmed.charAt(0) === '"' && lastChar === '"') ||
+        (trimmed.charAt(0) === "'" && lastChar === "'"))
+    ) {
+      return trimmed.slice(1, -1);
+    }
+
+    return undefined;
+  }
+
+  function _invokeHandler(spec, event, el) {
+    var fn = _handlers[spec.name];
+    var args;
+    var i;
+
+    if (typeof fn !== "function") {
+      return;
+    }
+
+    if (spec.args === null) {
+      fn.call(el, event);
+      return;
+    }
+
+    args = [];
+    for (i = 0; i < spec.args.length; i++) {
+      args.push(_resolveHandlerArg(spec.args[i], event, el));
+    }
+    fn.apply(el, args);
+  }
+
+  /** Wire `on*="fnName"` attributes to the handlers registry. */
   function _wireEvents() {
-    var els = win.document.querySelectorAll("[onclick]");
+    var els = win.document.querySelectorAll("*");
     for (var i = 0; i < els.length; i++) {
       /* jshint loopfunc: true */
       (function (el) {
-        var fn = el.getAttribute("onclick");
-        el.removeAttribute("onclick");
-        el.addEventListener("click", function () {
-          if (typeof _handlers[fn] === "function") {
-            _handlers[fn]();
+        var attrs = [];
+        var j;
+        var attr;
+        var spec;
+        var eventName;
+
+        for (j = 0; j < el.attributes.length; j++) {
+          attrs.push({
+            name: el.attributes[j].name,
+            value: el.attributes[j].value
+          });
+        }
+
+        for (j = 0; j < attrs.length; j++) {
+          attr = attrs[j];
+          if (attr.name.slice(0, 2).toLowerCase() !== "on" || attr.name.length <= 2) {
+            continue;
           }
-        });
+
+          spec = _parseHandlerExpression(attr.value);
+          if (!spec) {
+            continue;
+          }
+
+          eventName = attr.name.slice(2).toLowerCase();
+          (function (boundAttrName, boundEventName, boundSpec) {
+            el.removeAttribute(boundAttrName);
+            el.addEventListener(boundEventName, function (event) {
+              _invokeHandler(boundSpec, event, el);
+            });
+          })(attr.name, eventName, spec);
+        }
       })(els[i]);
     }
   }
@@ -265,7 +462,7 @@
         // Re-evaluate the new page's inline scripts (user script + props).
         _evalScripts(doc.body);
 
-        // Re-wire onclick attributes emitted by codegen.
+        // Re-wire managed DOM event attributes emitted by codegen.
         _wireEvents();
       })
       .catch(function () {

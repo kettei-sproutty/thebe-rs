@@ -1,0 +1,33 @@
+<script setup>
+struct Props {
+  username: String,
+}
+
+#[thebe::get]
+pub fn handler() -> Props {
+  Props {
+    username: String::from("Thebe"),
+  }
+}
+</script>
+
+<script lang="ts">
+let props = getProps<Props>();
+
+function handleChange(event: Event) {
+  const input = event.target;
+  props.username = input.value;
+}
+</script>
+
+<main>
+    <h1>Profile</h1>
+    <p>Welcome, {{ username }}!</p>
+  <input value="{{ username }}" oninput="handleChange" />
+</main>
+
+<style>
+main {
+    padding: 1rem;
+}
+</style>
