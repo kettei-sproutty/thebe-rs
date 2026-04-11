@@ -1,6 +1,2 @@
 /target
 /.thebe
-
-# thebe-generated files — do not edit
-src/__thebe_routes.rs
-src/routes/**/*.rs

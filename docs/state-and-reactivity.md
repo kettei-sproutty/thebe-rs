@@ -10,7 +10,9 @@ It represents the state of the system at the exact moment the HTTP request was f
 2. On the client, `<script lang="ts">` calls `getProps<Props>()`.
 3. `getProps()` immediately parses the JSON and exposes a reactive, local view of that initial payload.
 
-When a route has a client script, `thebe dev` also emits a generated `.thebe/` workspace:
+`thebe dev` emits a generated `.thebe/` workspace:
+- `.thebe/server/routes.rs` is included by `src/main.rs` and exposes `thebe_routes()`.
+- `.thebe/server/routes/**` contains the generated Rust route modules.
 - `.thebe/types/**` contains the `ts-rs` export for that route's `Props` type.
 - `.thebe/client/**` contains a typed mirror of the route's `<script lang="ts">` block that imports `Props` from the generated bindings.
 - `.thebe/tsconfig.json` lets the editor type-check those mirrors without requiring a root TypeScript config.

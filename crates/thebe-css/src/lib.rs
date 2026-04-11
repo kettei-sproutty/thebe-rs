@@ -4,13 +4,13 @@ pub use error::CssError;
 
 use std::convert::Infallible;
 
+use lightningcss::visit_types;
 use lightningcss::{
   selector::{Combinator, Component, Selector, SelectorList},
   stylesheet::{MinifyOptions, ParserOptions, PrinterOptions, StyleSheet},
   values::{ident::Ident, string::CowArcStr},
   visitor::{Visit, VisitTypes, Visitor},
 };
-use lightningcss::visit_types;
 
 /// Compute a deterministic 8-hex-char scope ID from a route file path using
 /// FNV-1a (32-bit) so that the same file always produces the same string.
@@ -37,10 +37,12 @@ pub fn scope_id(file_path: &str) -> String {
 /// Returns [`CssError`] on CSS parse, transform, or print failure.
 pub fn process_style(css: &str, scope_id: &str) -> Result<String, CssError> {
   let attr_name = format!("data-thebe-c-{scope_id}");
-  let mut stylesheet = StyleSheet::parse(css, ParserOptions::default())
-    .map_err(|e| CssError::Parse(e.to_string()))?;
+  let mut stylesheet =
+    StyleSheet::parse(css, ParserOptions::default()).map_err(|e| CssError::Parse(e.to_string()))?;
 
-  let mut visitor = ScopeVisitor { attr_name: &attr_name };
+  let mut visitor = ScopeVisitor {
+    attr_name: &attr_name,
+  };
   // The error type is `Infallible`, so `unwrap` is safe here.
   Visit::visit(&mut stylesheet, &mut visitor).unwrap();
 
@@ -169,10 +171,7 @@ impl<'i> Visitor<'i> for ScopeVisitor<'_> {
     visit_types!(SELECTORS)
   }
 
-  fn visit_selector_list(
-    &mut self,
-    selectors: &mut SelectorList<'i>,
-  ) -> Result<(), Self::Error> {
+  fn visit_selector_list(&mut self, selectors: &mut SelectorList<'i>) -> Result<(), Self::Error> {
     for selector in &mut selectors.0 {
       scope_selector(selector, self.attr_name);
     }
@@ -221,10 +220,17 @@ fn scope_selector<'i>(selector: &mut Selector<'i>, attr_name: &str) {
 
   // Append scope to the last compound in source order (the element being styled),
   // before any pseudo-class components so the attribute precedes them.
-  let last = compounds.last_mut().expect("selector has at least one compound");
+  let last = compounds
+    .last_mut()
+    .expect("selector has at least one compound");
   let insert_pos = last
     .iter()
-    .position(|c| matches!(c, Component::NonTSPseudoClass(_) | Component::PseudoElement(_)))
+    .position(|c| {
+      matches!(
+        c,
+        Component::NonTSPseudoClass(_) | Component::PseudoElement(_)
+      )
+    })
     .unwrap_or(last.len());
 
   // `CowArcStr` accepts `String`, which it wraps in an Arc internally.
@@ -232,7 +238,10 @@ fn scope_selector<'i>(selector: &mut Selector<'i>, attr_name: &str) {
   let local_name_lower = Ident(CowArcStr::from(attr_name.to_owned()));
   last.insert(
     insert_pos,
-    Component::AttributeInNoNamespaceExists { local_name, local_name_lower },
+    Component::AttributeInNoNamespaceExists {
+      local_name,
+      local_name_lower,
+    },
   );
 
   // Reassemble in source order for Selector::from.

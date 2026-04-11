@@ -35,6 +35,9 @@ pub enum CodegenError {
   #[error("typed props bridge error: {0}")]
   TypeBridge(String),
 
+  #[error("generated thebe_routes() requires a single shared route state type, found: {0}")]
+  MixedRouteStateTypes(String),
+
   #[error("CSS error: {0}")]
   CssError(String),
 }

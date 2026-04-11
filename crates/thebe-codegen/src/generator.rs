@@ -99,14 +99,31 @@ struct ProcessedLayout {
 pub struct RouteEntry {
   /// The Rust module name (e.g. `"index"`, `"about"`).
   pub mod_name: String,
-  /// Path to the generated route module relative to `src/main.rs`.
+  /// Path to the generated route module relative to the aggregate routes file.
   pub source_path: String,
+  /// Concrete `State<T>` type required by the route handler, when present.
+  pub state_type: Option<String>,
 }
 
 /// Return the built-in app shell used when a project does not provide `app.html`.
 #[must_use]
 pub fn default_app_html() -> &'static str {
   DEFAULT_APP_HTML
+}
+
+/// Return the concrete `State<T>` type required by a route, if any.
+///
+/// # Errors
+///
+/// Returns the same handler discovery errors as [`generate_route`].
+pub fn route_state_type(blocks: &SfcBlocks) -> Result<Option<String>, CodegenError> {
+  let setup = blocks
+    .script_setup
+    .as_deref()
+    .ok_or(CodegenError::MissingScriptSetup)?;
+  let handler = find_handler(setup)?;
+
+  Ok(handler_state_type(&handler).map(ToOwned::to_owned))
 }
 
 /// Validate that `app.html` contains the required Thebe placeholders.
@@ -192,7 +209,10 @@ pub fn generate_route(
 
   let handler = find_handler(setup)?;
   let setup_clean = strip_thebe_attrs(setup);
-  let client_script_ts = blocks.script_ts.as_deref().filter(|ts| !ts.trim().is_empty());
+  let client_script_ts = blocks
+    .script_ts
+    .as_deref()
+    .filter(|ts| !ts.trim().is_empty());
   let props_types_path = match (client_script_ts, props_types_path) {
     (Some(_), Some(path)) => Some(path),
     (Some(_), None) => {
@@ -224,8 +244,10 @@ pub fn generate_route(
 
   // Compute a deterministic scope ID and apply CSS scoping.
   let scope = thebe_css::scope_id(route_path);
-  let template_scoped =
-    thebe_css::add_scope_attrs(&template::inject_hydration_markers(&blocks.template), &scope);
+  let template_scoped = thebe_css::add_scope_attrs(
+    &template::inject_hydration_markers(&blocks.template),
+    &scope,
+  );
   let style = blocks
     .style
     .as_deref()
@@ -252,9 +274,7 @@ pub fn generate_route(
 
   // Process the optional layout.
   let layout_processed = layout
-    .map(|(layout_blocks, layout_scope_path)| {
-      process_layout(layout_blocks, layout_scope_path)
-    })
+    .map(|(layout_blocks, layout_scope_path)| process_layout(layout_blocks, layout_scope_path))
     .transpose()?;
 
   // Build the final style literal, optional layout template literal, and
@@ -279,18 +299,13 @@ pub fn generate_route(
 
   if merged_head.title_template.is_some() && !app_html.contains(APP_HTML_TITLE_PLACEHOLDER) {
     return Err(CodegenError::InvalidAppHtml(
-      "route or layout `<head>` uses `<title>`, but app.html is missing `%thebe.title%`"
-        .to_owned(),
+      "route or layout `<head>` uses `<title>`, but app.html is missing `%thebe.title%`".to_owned(),
     ));
   }
 
   let head_literal = escape_rust_raw_str(&merged_head.html_template);
-  let title_literal = escape_rust_raw_str(
-    merged_head
-      .title_template
-      .as_deref()
-      .unwrap_or_default(),
-  );
+  let title_literal =
+    escape_rust_raw_str(merged_head.title_template.as_deref().unwrap_or_default());
   let route_path_literal = escape_rust_raw_str(route_path);
 
   let literals = ModuleLiterals {
@@ -345,11 +360,19 @@ fn build_route_module(
 
 fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
   writeln!(source, "const __APP_HTML: &str = {};", literals.app_html).expect("infallible");
-  writeln!(source, "const __HEAD_TEMPLATE: &str = {};", literals.head_template)
-    .expect("infallible");
+  writeln!(
+    source,
+    "const __HEAD_TEMPLATE: &str = {};",
+    literals.head_template
+  )
+  .expect("infallible");
   writeln!(source, "const __TEMPLATE: &str = {};", literals.template).expect("infallible");
-  writeln!(source, "const __TITLE_TEMPLATE: &str = {};", literals.title_template)
-    .expect("infallible");
+  writeln!(
+    source,
+    "const __TITLE_TEMPLATE: &str = {};",
+    literals.title_template
+  )
+  .expect("infallible");
   writeln!(
     source,
     "const __CLIENT_RUNTIME: &str = {};",
@@ -357,7 +380,12 @@ fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
   )
   .expect("infallible");
   writeln!(source, "const __STYLE: &str = {};", literals.style).expect("infallible");
-  writeln!(source, "const __ROUTE_PATH: &str = {};", literals.route_path).expect("infallible");
+  writeln!(
+    source,
+    "const __ROUTE_PATH: &str = {};",
+    literals.route_path
+  )
+  .expect("infallible");
   writeln!(
     source,
     "const __CLIENT_SCRIPT: &str = {};",
@@ -478,7 +506,7 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
 fn write_html_assembly(source: &mut String) {
   source.push_str("    let __props_json = __ctx.to_string();\n");
   source.push_str(
-  r##"    let __head = if __STYLE.is_empty() {
+    r##"    let __head = if __STYLE.is_empty() {
     __head_html
   } else if __head_html.is_empty() {
     format!(r#"<style data-thebe-head="style">{style}</style>"#, style = __STYLE)
@@ -497,7 +525,9 @@ fn write_html_assembly(source: &mut String) {
   source.push_str("        runtime = __CLIENT_RUNTIME,\n");
   source.push_str("        user_script = __CLIENT_SCRIPT,\n");
   source.push_str("    );\n");
-  source.push_str("    let __html = __thebe_render_app_html(&__title, &__head, &__body_with_scripts);\n");
+  source.push_str(
+    "    let __html = __thebe_render_app_html(&__title, &__head, &__body_with_scripts);\n",
+  );
   source.push_str("    Ok(axum::response::Html(__html))\n");
 }
 
@@ -529,9 +559,7 @@ fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<
     "    let __route_body = __thebe_render_fragment(\n        \"__page\",\n        __TEMPLATE,\n        &__ctx,\n        \"compile template\",\n        \"load template\",\n        \"render template\",\n    )?;\n",
   );
   // Wrap the route body inside the layout template.
-  source.push_str(
-    "        let __layout_ctx = serde_json::json!({ \"__slot\": __route_body });\n",
-  );
+  source.push_str("        let __layout_ctx = serde_json::json!({ \"__slot\": __route_body });\n");
   source.push_str(
     "    let __body = __thebe_render_fragment(\n        \"__layout\",\n        __LAYOUT_TEMPLATE,\n        &__layout_ctx,\n        \"compile layout template\",\n        \"load layout template\",\n        \"render layout template\",\n    )?;\n",
   );
@@ -546,13 +574,11 @@ fn write_router_fn(
   type_bridge_enabled: bool,
 ) {
   if let Some(state_type) = handler_state_type(handler) {
-    writeln!(source, "pub fn router() -> axum::Router<{state_type}> {{")
-      .expect("infallible");
+    writeln!(source, "pub fn router() -> axum::Router<{state_type}> {{").expect("infallible");
     if type_bridge_enabled {
       source.push_str("    __thebe_export_types();\n");
     }
-    writeln!(source, "    axum::Router::<{state_type}>::new().route(")
-      .expect("infallible");
+    writeln!(source, "    axum::Router::<{state_type}>::new().route(").expect("infallible");
   } else {
     source.push_str("pub fn router<S>() -> axum::Router<S>\n");
     source.push_str("where\n");
@@ -573,9 +599,6 @@ fn write_router_fn(
   source.push_str("    )\n");
   source.push_str("}\n");
 }
-
-/// Generate `src/__thebe_routes.rs` that declares all route modules and
-/// exposes a `__thebe_router()` helper.  The static `src/main.rs`
 
 fn handler_state_type(handler: &RouteHandler) -> Option<&str> {
   handler
@@ -599,10 +622,17 @@ fn extract_state_type(param_type: &str) -> Option<&str> {
 
   Some(trimmed[open_angle + 1..close_angle].trim())
 }
-/// (scaffolded by `thebe new`, never regenerated) does
-/// `include!("__thebe_routes.rs")` and owns the `main()` entry-point.
-#[must_use]
-pub fn generate_routes_file(routes: &[RouteEntry]) -> String {
+/// Generate the aggregate routes module included by `src/main.rs`.
+///
+/// The generated file declares all route modules and exposes `thebe_routes()`.
+/// Stateful routes must all agree on a single `State<T>` type so the helper can
+/// return one concrete router type.
+///
+/// # Errors
+///
+/// Returns [`CodegenError::MixedRouteStateTypes`] when routes require more than
+/// one concrete state type.
+pub fn generate_routes_file(routes: &[RouteEntry]) -> Result<String, CodegenError> {
   let mut source = String::new();
   source.push_str("// AUTOGENERATED by thebe \u{2014} do not edit\n");
   for route in routes {
@@ -610,17 +640,63 @@ pub fn generate_routes_file(routes: &[RouteEntry]) -> String {
     writeln!(source, "mod {};", route.mod_name).expect("infallible");
   }
   source.push('\n');
-  source.push_str("fn __thebe_router() -> axum::Router {\n");
-  source.push_str("    axum::Router::new()\n");
-  for route in routes {
-    writeln!(source, "        .merge({}::router())", route.mod_name).expect("infallible");
+  match shared_route_state_type(routes)? {
+    Some(state_type) => {
+      writeln!(
+        source,
+        "pub(crate) fn thebe_routes() -> axum::Router<{state_type}> {{"
+      )
+      .expect("infallible");
+      writeln!(source, "    axum::Router::<{state_type}>::new()").expect("infallible");
+      for route in routes {
+        if route.state_type.is_some() {
+          writeln!(source, "        .merge({}::router())", route.mod_name).expect("infallible");
+        } else {
+          writeln!(
+            source,
+            "        .merge({}::router::<{state_type}>())",
+            route.mod_name
+          )
+          .expect("infallible");
+        }
+      }
+    }
+    None => {
+      source.push_str("pub(crate) fn thebe_routes<S>() -> axum::Router<S>\n");
+      source.push_str("where\n");
+      source.push_str("    S: Clone + Send + Sync + 'static,\n");
+      source.push_str("{\n");
+      source.push_str("    axum::Router::<S>::new()\n");
+      for route in routes {
+        writeln!(source, "        .merge({}::router::<S>())", route.mod_name).expect("infallible");
+      }
+    }
   }
-  source.push_str(
-    "        .fallback_service(tower_http::services::ServeDir::new(\"public\"))\n",
-  );
   source.push_str("}\n");
 
-  source
+  Ok(source)
+}
+
+fn shared_route_state_type(routes: &[RouteEntry]) -> Result<Option<&str>, CodegenError> {
+  let mut state_types = routes
+    .iter()
+    .filter_map(|route| route.state_type.as_deref())
+    .collect::<BTreeSet<_>>()
+    .into_iter();
+
+  let Some(first) = state_types.next() else {
+    return Ok(None);
+  };
+
+  let rest = state_types.collect::<Vec<_>>();
+  if rest.is_empty() {
+    return Ok(Some(first));
+  }
+
+  let mut all = Vec::with_capacity(rest.len() + 1);
+  all.push(first);
+  all.extend(rest);
+  Err(CodegenError::MixedRouteStateTypes(all.join(", ")))
 }
 
 /// Replace all `<slot />`, `<slot/>`, and `<slot></slot>` occurrences in a
@@ -687,9 +763,9 @@ fn extract_title_template(head: &str) -> Result<(Option<String>, String), Codege
     ));
   }
 
-  let title_start = lowercase.find("<title").ok_or_else(|| {
-    CodegenError::InvalidHead("failed to find `<title>` tag start".to_owned())
-  })?;
+  let title_start = lowercase
+    .find("<title")
+    .ok_or_else(|| CodegenError::InvalidHead("failed to find `<title>` tag start".to_owned()))?;
   let title_open_end_rel = head[title_start..].find('>').ok_or_else(|| {
     CodegenError::InvalidHead("`<title>` tag is missing a closing `>`".to_owned())
   })?;
@@ -700,7 +776,9 @@ fn extract_title_template(head: &str) -> Result<(Option<String>, String), Codege
   let title_close_start = title_open_end + 1 + title_close_start_rel;
   let title_close_end = title_close_start + "</title>".len();
 
-  let title_template = head[title_open_end + 1..title_close_start].trim().to_owned();
+  let title_template = head[title_open_end + 1..title_close_start]
+    .trim()
+    .to_owned();
   let html_without_title = format!("{}{}", &head[..title_start], &head[title_close_end..]);
 
   Ok((Some(title_template), html_without_title))
@@ -761,7 +839,10 @@ fn collect_type_bridge_targets(code: &str) -> Result<BTreeSet<String>, CodegenEr
   for item in file.items {
     match item {
       Item::Struct(item_struct) => {
-        local_type_fields.insert(item_struct.ident.to_string(), field_types(&item_struct.fields));
+        local_type_fields.insert(
+          item_struct.ident.to_string(),
+          field_types(&item_struct.fields),
+        );
       }
       Item::Enum(item_enum) => {
         let field_types = item_enum
@@ -805,7 +886,11 @@ fn collect_type_bridge_targets(code: &str) -> Result<BTreeSet<String>, CodegenEr
 fn field_types(fields: &Fields) -> Vec<Type> {
   match fields {
     Fields::Named(fields) => fields.named.iter().map(|field| field.ty.clone()).collect(),
-    Fields::Unnamed(fields) => fields.unnamed.iter().map(|field| field.ty.clone()).collect(),
+    Fields::Unnamed(fields) => fields
+      .unnamed
+      .iter()
+      .map(|field| field.ty.clone())
+      .collect(),
     Fields::Unit => Vec::new(),
   }
 }
@@ -847,7 +932,10 @@ fn collect_local_type_refs(ty: &Type, refs: &mut BTreeSet<String>) {
 }
 
 /// Inject `serde` and `ts-rs` derives before route-local type definitions.
-fn inject_props_derives(code: &str, props_types_path: Option<&str>) -> Result<String, CodegenError> {
+fn inject_props_derives(
+  code: &str,
+  props_types_path: Option<&str>,
+) -> Result<String, CodegenError> {
   let type_bridge_targets = props_types_path
     .map(|_| collect_type_bridge_targets(code))
     .transpose()?
@@ -873,9 +961,7 @@ fn inject_props_derives(code: &str, props_types_path: Option<&str>) -> Result<St
 
       if needs_type_bridge && is_props && !attrs.has_ts_export_to {
         let path = props_types_path.ok_or_else(|| {
-          CodegenError::TypeBridge(
-            "missing props type export path for client route".to_owned(),
-          )
+          CodegenError::TypeBridge("missing props type export path for client route".to_owned())
         })?;
         writeln!(out, "#[ts(export_to = {path:?})]").expect("infallible");
       }
@@ -1339,11 +1425,12 @@ mod tests {
 
   #[test]
   fn inject_props_derives_adds_ts_bridge_to_props_dependencies() {
-    let code = "struct Props {\n    state: CounterState,\n}\n\nstruct CounterState {\n    count: i64,\n}";
+    let code =
+      "struct Props {\n    state: CounterState,\n}\n\nstruct CounterState {\n    count: i64,\n}";
     let result = inject_props_derives(code, Some("routes/index.ts")).unwrap();
 
     assert_eq!(result.matches("derive(ts_rs::TS)").count(), 2);
-    assert!(result.contains("#[ts(export_to = \"routes/index.ts\")]") );
+    assert!(result.contains("#[ts(export_to = \"routes/index.ts\")]"));
   }
 
   #[test]
@@ -1422,7 +1509,8 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let app_html = "<html><head><title>%thebe.title%</title>%thebe.head%</head><body>%thebe.body%</body></html>";
+    let app_html =
+      "<html><head><title>%thebe.title%</title>%thebe.head%</head><body>%thebe.body%</body></html>";
     let src = generate_route(&blocks, "/", None, app_html, None).unwrap();
 
     assert!(src.contains("const __HEAD_TEMPLATE"));
@@ -1481,20 +1569,63 @@ mod tests {
       RouteEntry {
         mod_name: "route__index".to_owned(),
         source_path: "routes/index.rs".to_owned(),
+        state_type: None,
       },
       RouteEntry {
         mod_name: "route__blog__dyn_slug".to_owned(),
         source_path: "routes/blog/[slug].rs".to_owned(),
+        state_type: None,
       },
-    ]);
+    ])
+    .unwrap();
 
     assert!(source.contains("#[path = \"routes/index.rs\"]"));
     assert!(source.contains("mod route__index;"));
     assert!(source.contains("#[path = \"routes/blog/[slug].rs\"]"));
     assert!(source.contains("mod route__blog__dyn_slug;"));
-    assert!(source.contains(".merge(route__blog__dyn_slug::router())"));
-    assert!(source.contains("fn __thebe_router()"));
+    assert!(source.contains(".merge(route__blog__dyn_slug::router::<S>())"));
+    assert!(source.contains("pub(crate) fn thebe_routes<S>() -> axum::Router<S>"));
     assert!(!source.contains("async fn main()"));
+  }
+
+  #[test]
+  fn generate_routes_file_specializes_stateless_routes_for_shared_state() {
+    let source = generate_routes_file(&[
+      RouteEntry {
+        mod_name: "route__index".to_owned(),
+        source_path: "routes/index.rs".to_owned(),
+        state_type: None,
+      },
+      RouteEntry {
+        mod_name: "route__profile".to_owned(),
+        source_path: "routes/profile.rs".to_owned(),
+        state_type: Some("AppState".to_owned()),
+      },
+    ])
+    .unwrap();
+
+    assert!(source.contains("pub(crate) fn thebe_routes() -> axum::Router<AppState>"));
+    assert!(source.contains(".merge(route__index::router::<AppState>())"));
+    assert!(source.contains(".merge(route__profile::router())"));
+  }
+
+  #[test]
+  fn generate_routes_file_rejects_mixed_route_state_types() {
+    let err = generate_routes_file(&[
+      RouteEntry {
+        mod_name: "route__index".to_owned(),
+        source_path: "routes/index.rs".to_owned(),
+        state_type: Some("AppState".to_owned()),
+      },
+      RouteEntry {
+        mod_name: "route__admin".to_owned(),
+        source_path: "routes/admin.rs".to_owned(),
+        state_type: Some("AdminState".to_owned()),
+      },
+    ])
+    .unwrap_err();
+
+    assert!(matches!(err, CodegenError::MixedRouteStateTypes(_)));
   }
 
   #[test]

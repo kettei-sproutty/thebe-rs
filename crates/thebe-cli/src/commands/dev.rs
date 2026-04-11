@@ -6,7 +6,9 @@ use std::process::{Child, Command};
 use std::time::Duration;
 use walkdir::WalkDir;
 
-const TYPECHECK_DIR: &str = ".thebe";
+const THEBE_DIR: &str = ".thebe";
+const THEBE_SERVER_ROUTES_DIR: &str = ".thebe/server/routes";
+const THEBE_SERVER_ROUTES_FILE: &str = ".thebe/server/routes.rs";
 const TYPECHECK_CLIENT_DIR: &str = ".thebe/client";
 const TYPECHECK_TYPES_DIR: &str = ".thebe/types";
 const TYPECHECK_ENV_FILE: &str = ".thebe/thebe-env.d.ts";
@@ -31,6 +33,7 @@ struct ParsedRoute {
   blocks: thebe_parser::SfcBlocks,
   route_path: String,
   mod_name: String,
+  state_type: Option<String>,
   types_export_path: Option<String>,
 }
 
@@ -62,7 +65,7 @@ pub fn run(watch: bool) -> anyhow::Result<()> {
   }
 }
 
-/// Re-run codegen for every `.trs` file and write `__thebe_routes.rs`.
+/// Re-run codegen for every `.trs` file and refresh generated `.thebe` artifacts.
 fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow::Result<()> {
   // Parse all `_layout.trs` files first so each route can find its wrapper.
   let layouts = collect_layouts(routes_dir)?;
@@ -82,7 +85,7 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
   if needs_type_bridge {
     ensure_ts_rs_dependency(project_root)?;
   }
-  prepare_typecheck_workspace(project_root, needs_type_bridge)?;
+  prepare_generated_workspace(project_root, needs_type_bridge)?;
 
   let mut route_entries: Vec<thebe_codegen::RouteEntry> = Vec::new();
 
@@ -100,7 +103,18 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
     )
     .with_context(|| format!("codegen error for {}", route.trs_path.display()))?;
 
-    let rs_path = route.trs_path.with_extension("rs");
+    let relative_rs_path = route
+      .trs_path
+      .strip_prefix(routes_dir)
+      .with_context(|| format!("route {} is outside src/routes/", route.trs_path.display()))?
+      .with_extension("rs");
+    let rs_path = project_root
+      .join(THEBE_SERVER_ROUTES_DIR)
+      .join(&relative_rs_path);
+    if let Some(parent) = rs_path.parent() {
+      std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
     std::fs::write(&rs_path, &generated)
       .with_context(|| format!("failed to write {}", rs_path.display()))?;
 
@@ -110,8 +124,12 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
         .script_ts
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("client route is missing `<script lang=\"ts\">`"))?;
-      write_typecheck_mirror(project_root, types_export_path, client_ts)
-        .with_context(|| format!("failed to write type mirror for {}", route.trs_path.display()))?;
+      write_typecheck_mirror(project_root, types_export_path, client_ts).with_context(|| {
+        format!(
+          "failed to write type mirror for {}",
+          route.trs_path.display()
+        )
+      })?;
     }
 
     println!(
@@ -120,27 +138,34 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
       rs_path.display()
     );
 
-    let source_path = rs_path
-      .strip_prefix(src_dir)
-      .with_context(|| format!("generated route {} is outside src/", rs_path.display()))?
+    let source_path = Path::new("routes")
+      .join(&relative_rs_path)
       .to_string_lossy()
       .replace('\\', "/");
 
     route_entries.push(thebe_codegen::RouteEntry {
       mod_name: route.mod_name.clone(),
       source_path,
+      state_type: route.state_type.clone(),
     });
   }
 
-  let routes_file = thebe_codegen::generate_routes_file(&route_entries);
-  let routes_path = project_root.join("src").join("__thebe_routes.rs");
-  std::fs::write(&routes_path, &routes_file).context("failed to write src/__thebe_routes.rs")?;
-  println!("thebe: generated src/__thebe_routes.rs");
+  let routes_file = thebe_codegen::generate_routes_file(&route_entries)
+    .context("failed to generate .thebe/server/routes.rs")?;
+  let routes_path = project_root.join(THEBE_SERVER_ROUTES_FILE);
+  std::fs::write(&routes_path, &routes_file)
+    .with_context(|| format!("failed to write {}", routes_path.display()))?;
+  println!("thebe: generated {}", routes_path.display());
+
+  remove_legacy_generated_sources(src_dir)?;
 
   Ok(())
 }
 
-fn collect_parsed_routes(trs_files: &[PathBuf], routes_dir: &Path) -> anyhow::Result<Vec<ParsedRoute>> {
+fn collect_parsed_routes(
+  trs_files: &[PathBuf],
+  routes_dir: &Path,
+) -> anyhow::Result<Vec<ParsedRoute>> {
   let mut routes = Vec::with_capacity(trs_files.len());
 
   for trs_path in trs_files {
@@ -149,14 +174,17 @@ fn collect_parsed_routes(trs_files: &[PathBuf], routes_dir: &Path) -> anyhow::Re
 
     let blocks = thebe_parser::parse_sfc(&source)
       .with_context(|| format!("parse error in {}", trs_path.display()))?;
+    let state_type = thebe_codegen::route_state_type(&blocks)
+      .with_context(|| format!("failed to inspect handler state in {}", trs_path.display()))?;
 
-    let types_export_path = route_has_client_script(&blocks)
-      .then(|| type_bridge_export_path(trs_path, routes_dir));
+    let types_export_path =
+      route_has_client_script(&blocks).then(|| type_bridge_export_path(trs_path, routes_dir));
 
     routes.push(ParsedRoute {
       trs_path: trs_path.clone(),
       route_path: file_to_route_path(trs_path, routes_dir),
       mod_name: file_to_mod_name(trs_path, routes_dir),
+      state_type,
       blocks,
       types_export_path,
     });
@@ -186,15 +214,22 @@ fn ensure_ts_rs_dependency(project_root: &Path) -> anyhow::Result<()> {
   Ok(())
 }
 
-fn prepare_typecheck_workspace(project_root: &Path, enabled: bool) -> anyhow::Result<()> {
-  let typecheck_dir = project_root.join(TYPECHECK_DIR);
+fn prepare_generated_workspace(project_root: &Path, typecheck_enabled: bool) -> anyhow::Result<()> {
+  let thebe_dir = project_root.join(THEBE_DIR);
 
-  if typecheck_dir.exists() {
-    std::fs::remove_dir_all(&typecheck_dir)
-      .with_context(|| format!("failed to remove {}", typecheck_dir.display()))?;
+  if thebe_dir.exists() {
+    std::fs::remove_dir_all(&thebe_dir)
+      .with_context(|| format!("failed to remove {}", thebe_dir.display()))?;
   }
 
-  if !enabled {
+  std::fs::create_dir_all(project_root.join(THEBE_SERVER_ROUTES_DIR)).with_context(|| {
+    format!(
+      "failed to create {}",
+      project_root.join(THEBE_SERVER_ROUTES_DIR).display()
+    )
+  })?;
+
+  if !typecheck_enabled {
     return Ok(());
   }
 
@@ -210,10 +245,57 @@ fn prepare_typecheck_workspace(project_root: &Path, enabled: bool) -> anyhow::Re
       project_root.join(TYPECHECK_TYPES_DIR).display()
     )
   })?;
-  std::fs::write(project_root.join(TYPECHECK_TSCONFIG_FILE), TYPECHECK_TSCONFIG)
-    .with_context(|| format!("failed to write {}", project_root.join(TYPECHECK_TSCONFIG_FILE).display()))?;
-  std::fs::write(project_root.join(TYPECHECK_ENV_FILE), TYPECHECK_ENV_DECLS)
-    .with_context(|| format!("failed to write {}", project_root.join(TYPECHECK_ENV_FILE).display()))?;
+  std::fs::write(
+    project_root.join(TYPECHECK_TSCONFIG_FILE),
+    TYPECHECK_TSCONFIG,
+  )
+  .with_context(|| {
+    format!(
+      "failed to write {}",
+      project_root.join(TYPECHECK_TSCONFIG_FILE).display()
+    )
+  })?;
+  std::fs::write(project_root.join(TYPECHECK_ENV_FILE), TYPECHECK_ENV_DECLS).with_context(
+    || {
+      format!(
+        "failed to write {}",
+        project_root.join(TYPECHECK_ENV_FILE).display()
+      )
+    },
+  )?;
+
+  Ok(())
+}
+
+fn remove_legacy_generated_sources(src_dir: &Path) -> anyhow::Result<()> {
+  let legacy_routes_file = src_dir.join("__thebe_routes.rs");
+  remove_autogenerated_file(&legacy_routes_file)?;
+
+  let legacy_routes_dir = src_dir.join("routes");
+  if !legacy_routes_dir.exists() {
+    return Ok(());
+  }
+
+  for entry in WalkDir::new(&legacy_routes_dir).min_depth(1) {
+    let entry = entry.context("failed to read directory entry")?;
+    if entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "rs") {
+      remove_autogenerated_file(entry.path())?;
+    }
+  }
+
+  Ok(())
+}
+
+fn remove_autogenerated_file(path: &Path) -> anyhow::Result<()> {
+  if !path.exists() {
+    return Ok(());
+  }
+
+  let contents =
+    std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+  if contents.starts_with("// AUTOGENERATED by thebe") {
+    std::fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
+  }
 
   Ok(())
 }
@@ -254,14 +336,20 @@ fn mirror_props_import_path(types_export_path: &Path) -> String {
     .map_or(0, |parent| parent.components().count());
   let prefix = "../".repeat(depth + 1);
   let target = types_export_path.with_extension("");
-  format!("{prefix}types/{}", target.to_string_lossy().replace('\\', "/"))
+  format!(
+    "{prefix}types/{}",
+    target.to_string_lossy().replace('\\', "/")
+  )
 }
 
 fn build_typecheck_mirror(client_ts: &str, props_import_path: &str) -> String {
   let mut output = String::new();
   output.push_str("// AUTOGENERATED by thebe — do not edit\n");
-  writeln!(output, "import type {{ Props }} from \"{props_import_path}\";")
-    .expect("infallible");
+  writeln!(
+    output,
+    "import type {{ Props }} from \"{props_import_path}\";"
+  )
+  .expect("infallible");
   output.push('\n');
   output.push_str(client_ts.trim());
   output.push('\n');
@@ -316,7 +404,10 @@ fn run_watch(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow::
   use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
   use std::sync::mpsc;
 
-  println!("thebe: watch mode — watching {} for changes\u{2026}", routes_dir.display());
+  println!(
+    "thebe: watch mode — watching {} for changes\u{2026}",
+    routes_dir.display()
+  );
 
   let mut child = spawn_server(project_root)?;
 
@@ -459,19 +550,11 @@ fn collect_layouts(
         .with_context(|| format!("parse error in {}", layout_path.display()))?;
 
       // Derive a stable scope path: relative to routes_dir, no extension.
-      let rel = layout_path
-        .strip_prefix(routes_dir)
-        .unwrap_or(&layout_path);
-      let scope_path = rel
-        .with_extension("")
-        .to_string_lossy()
-        .replace('\\', "/");
+      let rel = layout_path.strip_prefix(routes_dir).unwrap_or(&layout_path);
+      let scope_path = rel.with_extension("").to_string_lossy().replace('\\', "/");
 
       // Key by the directory that contains the layout file.
-      let dir = layout_path
-        .parent()
-        .unwrap_or(routes_dir)
-        .to_path_buf();
+      let dir = layout_path.parent().unwrap_or(routes_dir).to_path_buf();
       map.insert(dir, (blocks, scope_path));
 
       println!("thebe: found layout {}", layout_path.display());
@@ -643,10 +726,8 @@ mod tests {
 
   #[test]
   fn build_typecheck_mirror_imports_props_type() {
-    let source = build_typecheck_mirror(
-      "let props = getProps<Props>();",
-      "../../types/routes/index",
-    );
+    let source =
+      build_typecheck_mirror("let props = getProps<Props>();", "../../types/routes/index");
 
     assert!(source.contains("import type { Props } from \"../../types/routes/index\";"));
     assert!(source.contains("let props = getProps<Props>();"));

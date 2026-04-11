@@ -224,7 +224,7 @@ pub async fn handler(
 
 `<script lang="ts">` runs in the browser. `getProps<Props>()` reads the server-inlined JSON.
 
-Routes that include `<script lang="ts">` should keep `ts-rs = "12"` in the app's `Cargo.toml`. During `thebe dev`, Thebe exports `Props` bindings into `.thebe/types/**` and mirrors each client script into `.thebe/client/**` with a local `Props` import so editors have a concrete TypeScript project to read.
+Routes that include `<script lang="ts">` should keep `ts-rs = "12"` in the app's `Cargo.toml`. During `thebe dev`, Thebe writes all generated artifacts into `.thebe/`: `.thebe/server/routes.rs` exposes `thebe_routes()`, `.thebe/server/routes/**` contains the generated Rust modules, `.thebe/types/**` contains exported `Props` bindings, and `.thebe/client/**` mirrors each client script with a local `Props` import so editors have a concrete TypeScript project to read.
 
 For **v0**, `getProps<Props>()` returns a deeply reactive Proxy object (like Vue 3's `reactive`). This gives deep mutation tracking for free, so you can write normal JavaScript without worrying about assignment rewriting or forced destructuring.
 
@@ -475,7 +475,9 @@ thebe/
 
   To avoid double-typing, Thebe uses [`ts-rs`](https://crates.io/crates/ts-rs) to generate TypeScript definitions from Rust `Props` structs. `getProps<Props>()` should reflect the server type, not a second hand-maintained declaration.
 
-  Today that bridge is emitted into a generated `.thebe/` workspace:
+  Today all generated artifacts are emitted into a generated `.thebe/` workspace:
+  - `.thebe/server/routes.rs` is included by `src/main.rs` and exposes `thebe_routes()` for app composition.
+  - `.thebe/server/routes/**` contains the generated Rust route modules.
   - `.thebe/types/**` contains the exported `ts-rs` bindings for each client route's `Props` type.
   - `.thebe/client/**` contains a typed mirror of each `<script lang="ts">` block that imports its matching `Props` definition.
   - `.thebe/tsconfig.json` gives the editor a dedicated TypeScript project without forcing a root `tsconfig.json` on the app.
