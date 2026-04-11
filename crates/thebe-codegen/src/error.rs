@@ -32,6 +32,9 @@ pub enum CodegenError {
   #[error("invalid <head> block: {0}")]
   InvalidHead(String),
 
+  #[error("typed props bridge error: {0}")]
+  TypeBridge(String),
+
   #[error("CSS error: {0}")]
   CssError(String),
 }

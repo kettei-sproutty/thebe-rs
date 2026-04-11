@@ -14,7 +14,7 @@ pub fn run(name: &str) -> anyhow::Result<()> {
 
   std::fs::write(
     project_dir.join(".gitignore"),
-    "/target\n# thebe-generated files\nsrc/__thebe_routes.rs\nsrc/routes/**/*.rs\n",
+    "/target\n/.thebe\n# thebe-generated files\nsrc/__thebe_routes.rs\nsrc/routes/**/*.rs\n",
   )
   .context("failed to write .gitignore")?;
 
@@ -49,6 +49,7 @@ tower-http = {{ version = "0.6", features = ["fs"] }}
 minijinja = "2"
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
+ts-rs = "12"
 "#
   )
 }

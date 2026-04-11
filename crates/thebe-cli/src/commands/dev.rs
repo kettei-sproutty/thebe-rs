@@ -1,9 +1,38 @@
 use anyhow::Context;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 use walkdir::WalkDir;
+
+const TYPECHECK_DIR: &str = ".thebe";
+const TYPECHECK_CLIENT_DIR: &str = ".thebe/client";
+const TYPECHECK_TYPES_DIR: &str = ".thebe/types";
+const TYPECHECK_ENV_FILE: &str = ".thebe/thebe-env.d.ts";
+const TYPECHECK_TSCONFIG_FILE: &str = ".thebe/tsconfig.json";
+const TYPECHECK_TSCONFIG: &str = r#"{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "noEmit": true,
+    "strict": false,
+    "skipLibCheck": true
+  },
+  "include": ["thebe-env.d.ts", "client/**/*.ts", "types/**/*.ts"]
+}
+"#;
+const TYPECHECK_ENV_DECLS: &str = "declare function getProps<T = unknown>(): T;\n";
+
+struct ParsedRoute {
+  trs_path: PathBuf,
+  blocks: thebe_parser::SfcBlocks,
+  route_path: String,
+  mod_name: String,
+  types_export_path: Option<String>,
+}
 
 /// Run `thebe dev`: parse all `.trs` route files, emit generated Rust sources,
 /// and hand off to `cargo run`. Pass `watch = true` to auto-restart on changes.
@@ -45,32 +74,49 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
     "no `.trs` files found in `src/routes/`"
   );
 
+  let parsed_routes = collect_parsed_routes(&trs_files, routes_dir)?;
+  let needs_type_bridge = parsed_routes
+    .iter()
+    .any(|route| route.types_export_path.is_some());
+
+  if needs_type_bridge {
+    ensure_ts_rs_dependency(project_root)?;
+  }
+  prepare_typecheck_workspace(project_root, needs_type_bridge)?;
+
   let mut route_entries: Vec<thebe_codegen::RouteEntry> = Vec::new();
 
-  for trs_path in &trs_files {
-    let source = std::fs::read_to_string(trs_path)
-      .with_context(|| format!("failed to read {}", trs_path.display()))?;
-
-    let blocks = thebe_parser::parse_sfc(&source)
-      .with_context(|| format!("parse error in {}", trs_path.display()))?;
-
-    let route_path = file_to_route_path(trs_path, routes_dir);
-    let mod_name = file_to_mod_name(trs_path, routes_dir);
-
+  for route in &parsed_routes {
     // Find the nearest `_layout.trs` ancestor for this route.
-    let layout_arg = find_layout(&layouts, trs_path, routes_dir)
+    let layout_arg = find_layout(&layouts, &route.trs_path, routes_dir)
       .map(|(blocks, scope_path)| (blocks, scope_path.as_str()));
 
-    let generated = thebe_codegen::generate_route(&blocks, &route_path, layout_arg, &app_html)
-      .with_context(|| format!("codegen error for {}", trs_path.display()))?;
+    let generated = thebe_codegen::generate_route(
+      &route.blocks,
+      &route.route_path,
+      layout_arg,
+      &app_html,
+      route.types_export_path.as_deref(),
+    )
+    .with_context(|| format!("codegen error for {}", route.trs_path.display()))?;
 
-    let rs_path = trs_path.with_extension("rs");
+    let rs_path = route.trs_path.with_extension("rs");
     std::fs::write(&rs_path, &generated)
       .with_context(|| format!("failed to write {}", rs_path.display()))?;
 
+    if let Some(types_export_path) = &route.types_export_path {
+      let client_ts = route
+        .blocks
+        .script_ts
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("client route is missing `<script lang=\"ts\">`"))?;
+      write_typecheck_mirror(project_root, types_export_path, client_ts)
+        .with_context(|| format!("failed to write type mirror for {}", route.trs_path.display()))?;
+    }
+
     println!(
       "thebe: {} \u{2192} {}",
-      trs_path.display(),
+      route.trs_path.display(),
       rs_path.display()
     );
 
@@ -81,7 +127,7 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
       .replace('\\', "/");
 
     route_entries.push(thebe_codegen::RouteEntry {
-      mod_name,
+      mod_name: route.mod_name.clone(),
       source_path,
     });
   }
@@ -92,6 +138,134 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
   println!("thebe: generated src/__thebe_routes.rs");
 
   Ok(())
+}
+
+fn collect_parsed_routes(trs_files: &[PathBuf], routes_dir: &Path) -> anyhow::Result<Vec<ParsedRoute>> {
+  let mut routes = Vec::with_capacity(trs_files.len());
+
+  for trs_path in trs_files {
+    let source = std::fs::read_to_string(trs_path)
+      .with_context(|| format!("failed to read {}", trs_path.display()))?;
+
+    let blocks = thebe_parser::parse_sfc(&source)
+      .with_context(|| format!("parse error in {}", trs_path.display()))?;
+
+    let types_export_path = route_has_client_script(&blocks)
+      .then(|| type_bridge_export_path(trs_path, routes_dir));
+
+    routes.push(ParsedRoute {
+      trs_path: trs_path.clone(),
+      route_path: file_to_route_path(trs_path, routes_dir),
+      mod_name: file_to_mod_name(trs_path, routes_dir),
+      blocks,
+      types_export_path,
+    });
+  }
+
+  Ok(routes)
+}
+
+fn route_has_client_script(blocks: &thebe_parser::SfcBlocks) -> bool {
+  blocks
+    .script_ts
+    .as_deref()
+    .is_some_and(|script| !script.trim().is_empty())
+}
+
+fn ensure_ts_rs_dependency(project_root: &Path) -> anyhow::Result<()> {
+  let cargo_toml_path = project_root.join("Cargo.toml");
+  let cargo_toml = std::fs::read_to_string(&cargo_toml_path)
+    .with_context(|| format!("failed to read {}", cargo_toml_path.display()))?;
+
+  anyhow::ensure!(
+    cargo_toml.contains("ts-rs"),
+    "typed `<script lang=\"ts\">` routes require `ts-rs` in {} — add `ts-rs = \"12\"` under `[dependencies]`",
+    cargo_toml_path.display()
+  );
+
+  Ok(())
+}
+
+fn prepare_typecheck_workspace(project_root: &Path, enabled: bool) -> anyhow::Result<()> {
+  let typecheck_dir = project_root.join(TYPECHECK_DIR);
+
+  if typecheck_dir.exists() {
+    std::fs::remove_dir_all(&typecheck_dir)
+      .with_context(|| format!("failed to remove {}", typecheck_dir.display()))?;
+  }
+
+  if !enabled {
+    return Ok(());
+  }
+
+  std::fs::create_dir_all(project_root.join(TYPECHECK_CLIENT_DIR)).with_context(|| {
+    format!(
+      "failed to create {}",
+      project_root.join(TYPECHECK_CLIENT_DIR).display()
+    )
+  })?;
+  std::fs::create_dir_all(project_root.join(TYPECHECK_TYPES_DIR)).with_context(|| {
+    format!(
+      "failed to create {}",
+      project_root.join(TYPECHECK_TYPES_DIR).display()
+    )
+  })?;
+  std::fs::write(project_root.join(TYPECHECK_TSCONFIG_FILE), TYPECHECK_TSCONFIG)
+    .with_context(|| format!("failed to write {}", project_root.join(TYPECHECK_TSCONFIG_FILE).display()))?;
+  std::fs::write(project_root.join(TYPECHECK_ENV_FILE), TYPECHECK_ENV_DECLS)
+    .with_context(|| format!("failed to write {}", project_root.join(TYPECHECK_ENV_FILE).display()))?;
+
+  Ok(())
+}
+
+fn type_bridge_export_path(trs_path: &Path, routes_dir: &Path) -> String {
+  let rel = trs_path.strip_prefix(routes_dir).unwrap_or(trs_path);
+  Path::new("routes")
+    .join(rel)
+    .with_extension("ts")
+    .to_string_lossy()
+    .replace('\\', "/")
+}
+
+fn write_typecheck_mirror(
+  project_root: &Path,
+  types_export_path: &str,
+  client_ts: &str,
+) -> anyhow::Result<()> {
+  let rel_path = Path::new(types_export_path);
+  let mirror_path = project_root.join(TYPECHECK_CLIENT_DIR).join(rel_path);
+  let props_import_path = mirror_props_import_path(rel_path);
+  let contents = build_typecheck_mirror(client_ts, &props_import_path);
+
+  if let Some(parent) = mirror_path.parent() {
+    std::fs::create_dir_all(parent)
+      .with_context(|| format!("failed to create {}", parent.display()))?;
+  }
+
+  std::fs::write(&mirror_path, contents)
+    .with_context(|| format!("failed to write {}", mirror_path.display()))?;
+
+  Ok(())
+}
+
+fn mirror_props_import_path(types_export_path: &Path) -> String {
+  let depth = types_export_path
+    .parent()
+    .map_or(0, |parent| parent.components().count());
+  let prefix = "../".repeat(depth + 1);
+  let target = types_export_path.with_extension("");
+  format!("{prefix}types/{}", target.to_string_lossy().replace('\\', "/"))
+}
+
+fn build_typecheck_mirror(client_ts: &str, props_import_path: &str) -> String {
+  let mut output = String::new();
+  output.push_str("// AUTOGENERATED by thebe — do not edit\n");
+  writeln!(output, "import type {{ Props }} from \"{props_import_path}\";")
+    .expect("infallible");
+  output.push('\n');
+  output.push_str(client_ts.trim());
+  output.push('\n');
+  output
 }
 
 fn load_app_html(project_root: &Path) -> anyhow::Result<String> {
@@ -446,5 +620,35 @@ mod tests {
   #[test]
   fn sanitize_module_segment_normalizes_static_segments() {
     assert_eq!(sanitize_module_segment("My-page"), "my_page");
+  }
+
+  #[test]
+  fn type_bridge_export_path_preserves_route_layout() {
+    let routes_dir = Path::new("/tmp/app/src/routes");
+    let path = Path::new("/tmp/app/src/routes/blog/[slug].trs");
+    assert_eq!(
+      type_bridge_export_path(path, routes_dir),
+      "routes/blog/[slug].ts"
+    );
+  }
+
+  #[test]
+  fn mirror_props_import_path_matches_nested_route_depth() {
+    let path = Path::new("routes/blog/[slug].ts");
+    assert_eq!(
+      mirror_props_import_path(path),
+      "../../../types/routes/blog/[slug]"
+    );
+  }
+
+  #[test]
+  fn build_typecheck_mirror_imports_props_type() {
+    let source = build_typecheck_mirror(
+      "let props = getProps<Props>();",
+      "../../types/routes/index",
+    );
+
+    assert!(source.contains("import type { Props } from \"../../types/routes/index\";"));
+    assert!(source.contains("let props = getProps<Props>();"));
   }
 }

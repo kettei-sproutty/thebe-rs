@@ -1095,6 +1095,7 @@ dependencies = [
 name = "thebe-codegen"
 version = "0.1.0"
 dependencies = [
+ "syn 2.0.117",
  "thebe-analyzer",
  "thebe-css",
  "thebe-parser",
