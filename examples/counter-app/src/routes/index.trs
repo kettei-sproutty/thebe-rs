@@ -52,9 +52,6 @@ function reset() {
 
 <main>
     <h1>{{ title }}</h1>
-    <nav>
-        <a href="/about">About</a>
-    </nav>
     <p class="hint">The count lives in Axum state. Buttons post to the server and hydrate the returned value.</p>
      <div class="controls">
       <button onclick="decrement">−</button>
@@ -115,15 +112,5 @@ button {
 button:hover {
     background: #1a1a1a;
     color: white;
-}
-
-nav a {
-    color: #555;
-    text-decoration: none;
-    font-size: 0.9rem;
-}
-
-nav a:hover {
-    text-decoration: underline;
 }
 </style>
