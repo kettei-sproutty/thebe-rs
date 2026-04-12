@@ -1,5 +1,8 @@
 #[derive(Debug, thiserror::Error)]
 pub enum CodegenError {
+  #[error(transparent)]
+  Analyzer(#[from] thebe_analyzer::AnalyzerError),
+
   #[error("parse error: {0}")]
   Parse(#[from] thebe_parser::ParseError),
 

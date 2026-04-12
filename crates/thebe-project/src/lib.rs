@@ -796,6 +796,9 @@ fn codegen_error_diagnostic(
   err: &thebe_codegen::CodegenError,
 ) -> anyhow::Result<ThebeDiagnostic> {
   let (category, code, span) = match err {
+    thebe_codegen::CodegenError::Analyzer(_) => {
+      ("client-script", "analyzer-error", blocks.script_ts_span)
+    }
     thebe_codegen::CodegenError::Parse(_) => ("parser", "parse-error", None),
     thebe_codegen::CodegenError::UnsupportedMethod(_) => {
       ("handler", "unsupported-method", blocks.script_setup_span)

@@ -305,11 +305,8 @@ pub fn generate_route(
 
   // Process the optional `<script lang="ts">` block.
   let client_js = client_script_ts
-    .map(|ts| {
-      thebe_analyzer::analyze(ts)
-        .map(|m| m.js)
-        .unwrap_or_default()
-    })
+    .map(|ts| thebe_analyzer::analyze(ts).map(|module| module.js))
+    .transpose()?
     .unwrap_or_default();
   let runtime_literal = escape_rust_raw_str(THEBE_CLIENT_RUNTIME);
   let client_script_literal = escape_rust_raw_str(&client_js);
@@ -1599,6 +1596,35 @@ mod tests {
 
     // Registration call must be appended.
     assert!(src.contains("__thebe_register(\"inc\", inc)"));
+  }
+
+  #[test]
+  fn generate_route_returns_analyzer_error_for_invalid_client_script() {
+    use thebe_parser::SfcBlocks;
+
+    let blocks = SfcBlocks {
+      script_setup: Some(
+        "struct Props { counter: i32 }\n\n#[thebe::get]\npub fn handler() -> Props { Props { counter: 0 } }"
+          .to_owned(),
+      ),
+      script_ts: Some(
+        "let props = getProps<Props>();\nfunction inc(step: number { props.counter += step; }"
+          .to_owned(),
+      ),
+      template: "<span>{{ counter }}</span>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let err = generate_route(
+      &blocks,
+      "/",
+      None,
+      default_app_html(),
+      Some("routes/index.ts"),
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, CodegenError::Analyzer(_)));
   }
 
   #[test]
