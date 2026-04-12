@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 thiserror = { workspace = true }
+swc_common = { version = "21.0.1", features = ["sourcemap"] }
+swc_ecma_ast = "23.0.0"
+swc_ecma_parser = { version = "38.0.1", default-features = false, features = ["typescript"] }
+swc_ts_fast_strip = "48.0.0"
 
 [lints]
 workspace = true
