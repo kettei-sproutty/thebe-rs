@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 thebe-project = { path = "../thebe-project" }
-tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "time"] }
 tower-lsp = "0.20"
 
 [lints]

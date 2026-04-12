@@ -1,101 +1,411 @@
 use anyhow::Result;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use thebe_project::{
-  EditorRefresh, LayoutMetadata, ProjectArtifacts, RouteMetadata, SourceSpanMetadata,
-  THEBE_DIAGNOSTICS_FILE, THEBE_MANIFEST_FILE, TemplateBindingMetadata, ThebeDiagnostic,
-  ThebeDiagnosticsFile, ThebeManifest,
+  EditorRefresh, LayoutMetadata, ProjectArtifacts, ProjectOverlay, RouteMetadata,
+  SourceSpanMetadata, THEBE_DIAGNOSTICS_FILE, THEBE_MANIFEST_FILE, TemplateBindingMetadata,
+  ThebeDiagnostic, ThebeDiagnosticsFile, ThebeManifest,
 };
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::{
-  Diagnostic, DiagnosticSeverity, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-  DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-  GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-  InitializeParams, InitializeResult, Location, MarkupContent, MarkupKind, MessageType,
-  NumberOrString, OneOf, Position, Range, ReferenceParams, ServerCapabilities, ServerInfo,
-  SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+  Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+  DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
+  DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+  HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, Location,
+  MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, Position, Range, ReferenceParams,
+  ServerCapabilities, ServerInfo, SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind,
+  TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url,
 };
 use tower_lsp::{Client, LanguageServer};
+
+const CHANGE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
+
+#[derive(Debug, Default)]
+struct OpenDocuments {
+  files: HashMap<PathBuf, String>,
+}
+
+impl OpenDocuments {
+  fn set(&mut self, path: PathBuf, text: String) -> bool {
+    if self
+      .files
+      .get(&path)
+      .is_some_and(|existing| existing == &text)
+    {
+      return false;
+    }
+
+    self.files.insert(path, text);
+    true
+  }
+
+  fn remove(&mut self, path: &Path) -> bool {
+    self.files.remove(path).is_some()
+  }
+
+  fn overlay_for_project(&self, project_root: &Path) -> ProjectOverlay {
+    let mut overlay = ProjectOverlay::new();
+
+    for (path, text) in &self.files {
+      if is_project_input_file(project_root, path) {
+        overlay.insert(path.clone(), text.clone());
+      }
+    }
+
+    overlay
+  }
+}
+
+#[derive(Debug, Default)]
+struct BackendState {
+  open_documents: OpenDocuments,
+  projects: HashMap<PathBuf, ProjectState>,
+}
+
+impl BackendState {
+  fn set_document(&mut self, project_root: PathBuf, path: PathBuf, text: String) -> Option<u64> {
+    self
+      .open_documents
+      .set(path, text)
+      .then(|| self.bump_revision(project_root))
+  }
+
+  fn clear_document(&mut self, project_root: PathBuf, path: &Path) -> Option<u64> {
+    self
+      .open_documents
+      .remove(path)
+      .then(|| self.bump_revision(project_root))
+  }
+
+  fn snapshot(&self, project_root: &Path) -> ProjectSnapshot {
+    let project = self.projects.get(project_root);
+
+    ProjectSnapshot {
+      overlay: self.open_documents.overlay_for_project(project_root),
+      revision: project.map_or(0, |project| project.revision),
+      cached_artifacts: project.and_then(ProjectState::cached_artifacts),
+    }
+  }
+
+  fn note_refresh_requested(&mut self, project_root: &Path, revision: u64) {
+    self
+      .projects
+      .entry(project_root.to_path_buf())
+      .or_default()
+      .scheduled_refresh_revision = Some(revision);
+  }
+
+  fn should_run_debounced_refresh(&self, project_root: &Path, revision: u64) -> bool {
+    self
+      .projects
+      .get(project_root)
+      .is_some_and(|project| project.scheduled_refresh_revision == Some(revision))
+  }
+
+  fn remember_generated(
+    &mut self,
+    project_root: &Path,
+    revision: u64,
+    artifacts: &ProjectArtifacts,
+  ) -> bool {
+    self
+      .projects
+      .entry(project_root.to_path_buf())
+      .or_default()
+      .remember_generated(revision, artifacts)
+  }
+
+  fn remember_diagnostics(
+    &mut self,
+    project_root: &Path,
+    revision: u64,
+    diagnostics: &ThebeDiagnosticsFile,
+  ) -> (bool, Option<ProjectArtifacts>) {
+    self
+      .projects
+      .entry(project_root.to_path_buf())
+      .or_default()
+      .remember_diagnostics(revision, diagnostics)
+  }
+
+  fn is_current_revision(&self, project_root: &Path, revision: u64) -> bool {
+    self
+      .projects
+      .get(project_root)
+      .is_some_and(|project| project.revision == revision)
+  }
+
+  fn bump_revision(&mut self, project_root: PathBuf) -> u64 {
+    let project = self.projects.entry(project_root).or_default();
+    project.revision += 1;
+    project.revision
+  }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectSnapshot {
+  overlay: ProjectOverlay,
+  revision: u64,
+  cached_artifacts: Option<ProjectArtifacts>,
+}
+
+#[derive(Debug, Default)]
+struct ProjectState {
+  revision: u64,
+  scheduled_refresh_revision: Option<u64>,
+  cached_artifacts: Option<ProjectArtifacts>,
+  last_good_artifacts: Option<ProjectArtifacts>,
+  last_good_revision: Option<u64>,
+}
+
+impl ProjectState {
+  fn cached_artifacts(&self) -> Option<ProjectArtifacts> {
+    self
+      .cached_artifacts
+      .clone()
+      .or_else(|| self.last_good_artifacts.clone())
+  }
+
+  fn remember_generated(&mut self, revision: u64, artifacts: &ProjectArtifacts) -> bool {
+    if self
+      .last_good_revision
+      .map_or(true, |last_good_revision| revision >= last_good_revision)
+    {
+      self.last_good_revision = Some(revision);
+      self.last_good_artifacts = Some(artifacts.clone());
+    }
+
+    let is_current = self.revision == revision;
+    if is_current {
+      self.cached_artifacts = Some(artifacts.clone());
+    }
+
+    is_current
+  }
+
+  fn remember_diagnostics(
+    &mut self,
+    revision: u64,
+    diagnostics: &ThebeDiagnosticsFile,
+  ) -> (bool, Option<ProjectArtifacts>) {
+    let artifacts = self
+      .last_good_artifacts
+      .as_ref()
+      .or(self.cached_artifacts.as_ref())
+      .map(|artifacts| {
+        let mut artifacts = artifacts.clone();
+        artifacts.diagnostics = diagnostics.clone();
+        artifacts
+      });
+
+    let is_current = self.revision == revision;
+    if is_current {
+      self.cached_artifacts = artifacts.clone();
+    }
+
+    (is_current, artifacts)
+  }
+}
 
 #[derive(Debug)]
 pub struct Backend {
   client: Client,
+  state: Arc<RwLock<BackendState>>,
 }
 
 impl Backend {
   #[must_use]
   pub fn new(client: Client) -> Self {
-    Self { client }
+    Self {
+      client,
+      state: Arc::new(RwLock::new(BackendState::default())),
+    }
   }
 
-  async fn refresh_project_for_uri(&self, uri: &Url) {
-    let Some(project_root) = find_project_root_from_uri(uri) else {
-      return;
-    };
+  fn set_document_overlay(&self, uri: &Url, text: String) -> Option<(PathBuf, u64)> {
+    let (project_root, path) = tracked_project_file_from_uri(uri)?;
+    let revision =
+      write_backend_state(&self.state).set_document(project_root.clone(), path, text)?;
+    Some((project_root, revision))
+  }
 
-    match thebe_project::refresh_project_for_editor(&project_root) {
-      Ok(EditorRefresh::Generated(artifacts)) => {
-        if let Err(err) = publish_project_diagnostics(&self.client, &project_root, &artifacts).await
-        {
-          self
-            .client
-            .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
-            .await;
+  fn clear_document_overlay(&self, uri: &Url) -> Option<(PathBuf, u64)> {
+    let (project_root, path) = tracked_project_file_from_uri(uri)?;
+    let revision = write_backend_state(&self.state).clear_document(project_root.clone(), &path)?;
+    Some((project_root, revision))
+  }
+
+  fn project_snapshot(&self, project_root: &Path) -> ProjectSnapshot {
+    read_backend_state(&self.state).snapshot(project_root)
+  }
+
+  fn note_refresh_requested(&self, project_root: &Path, revision: u64) {
+    write_backend_state(&self.state).note_refresh_requested(project_root, revision);
+  }
+
+  fn schedule_refresh(&self, uri: &Url, project_root: PathBuf, revision: u64) {
+    self.note_refresh_requested(&project_root, revision);
+
+    let client = self.client.clone();
+    let state = Arc::clone(&self.state);
+    let uri = uri.clone();
+
+    tokio::spawn(async move {
+      tokio::time::sleep(CHANGE_REFRESH_DEBOUNCE).await;
+
+      let snapshot = {
+        let state_guard = read_backend_state(&state);
+        if !state_guard.should_run_debounced_refresh(&project_root, revision) {
+          return;
         }
+        state_guard.snapshot(&project_root)
+      };
+
+      if snapshot.revision != revision {
+        return;
       }
-      Ok(EditorRefresh::Diagnostics(diagnostics)) => {
-        if let Ok(mut artifacts) = thebe_project::load_project_artifacts(&project_root) {
-          artifacts.diagnostics = diagnostics.clone();
-          if let Err(err) =
-            publish_project_diagnostics(&self.client, &project_root, &artifacts).await
-          {
-            self
-              .client
-              .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
-              .await;
-          }
-        } else if let Err(err) =
-          publish_diagnostics_without_manifest(&self.client, &project_root, &diagnostics).await
-        {
-          self
-            .client
-            .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
-            .await;
-        }
-      }
-      Err(err) => {
-        self
-          .client
-          .log_message(
-            MessageType::WARNING,
-            format!(
-              "thebe-lsp: failed to refresh {} or {} for {}: {err:#}",
-              THEBE_MANIFEST_FILE,
-              THEBE_DIAGNOSTICS_FILE,
-              project_root.display()
-            ),
-          )
-          .await;
-        self
-          .client
-          .publish_diagnostics(uri.clone(), Vec::new(), None)
-          .await;
-      }
+
+      refresh_project(client, state, project_root, uri, snapshot).await;
+    });
+  }
+
+  async fn refresh_project_for_uri_now(&self, uri: &Url, project_root: PathBuf, revision: u64) {
+    self.note_refresh_requested(&project_root, revision);
+
+    let snapshot = self.project_snapshot(&project_root);
+    if snapshot.revision != revision {
+      return;
     }
+
+    refresh_project(
+      self.client.clone(),
+      Arc::clone(&self.state),
+      project_root,
+      uri.clone(),
+      snapshot,
+    )
+    .await;
   }
 
   fn load_or_refresh_artifacts(&self, uri: &Url) -> Option<(PathBuf, ProjectArtifacts)> {
     let project_root = find_project_root_from_uri(uri)?;
+    let snapshot = self.project_snapshot(&project_root);
+
+    if let Some(artifacts) = snapshot.cached_artifacts {
+      return Some((project_root, artifacts));
+    }
+
     if let Ok(artifacts) = thebe_project::load_project_artifacts(&project_root) {
       return Some((project_root, artifacts));
     }
 
-    match thebe_project::refresh_project_for_editor(&project_root).ok()? {
-      EditorRefresh::Generated(artifacts) => Some((project_root, artifacts)),
-      EditorRefresh::Diagnostics(_) => thebe_project::load_project_artifacts(&project_root)
-        .ok()
-        .map(|artifacts| (project_root, artifacts)),
+    match thebe_project::refresh_project_for_editor_with_overlay(&project_root, &snapshot.overlay)
+      .ok()?
+    {
+      EditorRefresh::Generated(artifacts) => {
+        let _ = write_backend_state(&self.state).remember_generated(
+          &project_root,
+          snapshot.revision,
+          &artifacts,
+        );
+        Some((project_root, artifacts))
+      }
+      EditorRefresh::Diagnostics(diagnostics) => {
+        let (_, cached_artifacts) = write_backend_state(&self.state).remember_diagnostics(
+          &project_root,
+          snapshot.revision,
+          &diagnostics,
+        );
+
+        cached_artifacts
+          .map(|artifacts| (project_root.clone(), artifacts))
+          .or_else(|| {
+            thebe_project::load_project_artifacts(&project_root)
+              .ok()
+              .map(|artifacts| (project_root, artifacts))
+          })
+      }
+    }
+  }
+}
+
+async fn refresh_project(
+  client: Client,
+  state: Arc<RwLock<BackendState>>,
+  project_root: PathBuf,
+  uri: Url,
+  snapshot: ProjectSnapshot,
+) {
+  match thebe_project::refresh_project_for_editor_with_overlay(&project_root, &snapshot.overlay) {
+    Ok(EditorRefresh::Generated(artifacts)) => {
+      let should_publish = write_backend_state(&state).remember_generated(
+        &project_root,
+        snapshot.revision,
+        &artifacts,
+      );
+      if !should_publish {
+        return;
+      }
+
+      if let Err(err) = publish_project_diagnostics(&client, &project_root, &artifacts).await {
+        client
+          .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
+          .await;
+      }
+    }
+    Ok(EditorRefresh::Diagnostics(diagnostics)) => {
+      let (should_publish, cached_artifacts) = write_backend_state(&state).remember_diagnostics(
+        &project_root,
+        snapshot.revision,
+        &diagnostics,
+      );
+      if !should_publish {
+        return;
+      }
+
+      if let Some(artifacts) = cached_artifacts {
+        if let Err(err) = publish_project_diagnostics(&client, &project_root, &artifacts).await {
+          client
+            .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
+            .await;
+        }
+      } else if let Ok(mut artifacts) = thebe_project::load_project_artifacts(&project_root) {
+        artifacts.diagnostics = diagnostics.clone();
+        if let Err(err) = publish_project_diagnostics(&client, &project_root, &artifacts).await {
+          client
+            .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
+            .await;
+        }
+      } else if let Err(err) =
+        publish_diagnostics_without_manifest(&client, &project_root, &diagnostics).await
+      {
+        client
+          .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
+          .await;
+      }
+    }
+    Err(err) => {
+      let should_publish =
+        read_backend_state(&state).is_current_revision(&project_root, snapshot.revision);
+      if !should_publish {
+        return;
+      }
+
+      client
+        .log_message(
+          MessageType::WARNING,
+          format!(
+            "thebe-lsp: failed to refresh {} or {} for {}: {err:#}",
+            THEBE_MANIFEST_FILE,
+            THEBE_DIAGNOSTICS_FILE,
+            project_root.display()
+          ),
+        )
+        .await;
+      client.publish_diagnostics(uri, Vec::new(), None).await;
     }
   }
 }
@@ -113,7 +423,14 @@ impl LanguageServer for Backend {
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+          TextDocumentSyncOptions {
+            open_close: Some(true),
+            change: Some(TextDocumentSyncKind::FULL),
+            save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+            ..TextDocumentSyncOptions::default()
+          },
+        )),
         ..ServerCapabilities::default()
       },
       ..InitializeResult::default()
@@ -135,15 +452,46 @@ impl LanguageServer for Backend {
   }
 
   async fn did_open(&self, params: DidOpenTextDocumentParams) {
-    self
-      .refresh_project_for_uri(&params.text_document.uri)
-      .await;
+    if let Some((project_root, revision)) =
+      self.set_document_overlay(&params.text_document.uri, params.text_document.text)
+    {
+      self
+        .refresh_project_for_uri_now(&params.text_document.uri, project_root, revision)
+        .await;
+    }
+  }
+
+  async fn did_change(&self, params: DidChangeTextDocumentParams) {
+    let Some(text) = params
+      .content_changes
+      .into_iter()
+      .last()
+      .map(|change| change.text)
+    else {
+      return;
+    };
+
+    if let Some((project_root, revision)) =
+      self.set_document_overlay(&params.text_document.uri, text)
+    {
+      self.schedule_refresh(&params.text_document.uri, project_root, revision);
+    }
   }
 
   async fn did_save(&self, params: DidSaveTextDocumentParams) {
-    self
-      .refresh_project_for_uri(&params.text_document.uri)
-      .await;
+    if let Some((project_root, revision)) = self.clear_document_overlay(&params.text_document.uri) {
+      self
+        .refresh_project_for_uri_now(&params.text_document.uri, project_root, revision)
+        .await;
+    }
+  }
+
+  async fn did_close(&self, params: DidCloseTextDocumentParams) {
+    if let Some((project_root, revision)) = self.clear_document_overlay(&params.text_document.uri) {
+      self
+        .refresh_project_for_uri_now(&params.text_document.uri, project_root, revision)
+        .await;
+    }
   }
 
   async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
@@ -224,6 +572,37 @@ impl LanguageServer for Backend {
 fn find_project_root_from_uri(uri: &Url) -> Option<PathBuf> {
   let path = uri.to_file_path().ok()?;
   thebe_project::find_project_root_from(&path).ok()
+}
+
+fn read_backend_state(
+  state: &Arc<RwLock<BackendState>>,
+) -> std::sync::RwLockReadGuard<'_, BackendState> {
+  state
+    .read()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write_backend_state(
+  state: &Arc<RwLock<BackendState>>,
+) -> std::sync::RwLockWriteGuard<'_, BackendState> {
+  state
+    .write()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn tracked_project_file_from_uri(uri: &Url) -> Option<(PathBuf, PathBuf)> {
+  let path = uri.to_file_path().ok()?;
+  let project_root = thebe_project::find_project_root_from(&path).ok()?;
+  is_project_input_file(&project_root, &path).then_some((project_root, path))
+}
+
+fn is_project_input_file(project_root: &Path, path: &Path) -> bool {
+  if path == project_root.join("Cargo.toml") || path == project_root.join("app.html") {
+    return true;
+  }
+
+  let routes_dir = project_root.join("src/routes");
+  path.starts_with(&routes_dir) && path.extension().is_some_and(|ext| ext == "trs")
 }
 
 fn relative_path_from_uri(project_root: &Path, uri: &Url) -> Option<String> {
@@ -860,6 +1239,126 @@ enum RouteDocumentMatch<'a> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn backend_state_only_bumps_revision_when_overlay_changes() {
+    let project_root = PathBuf::from("/tmp/app");
+    let route_path = project_root.join("src/routes/index.trs");
+    let mut state = BackendState::default();
+
+    assert_eq!(
+      state.set_document(project_root.clone(), route_path.clone(), "one".to_owned()),
+      Some(1)
+    );
+    assert_eq!(
+      state.set_document(project_root.clone(), route_path.clone(), "one".to_owned()),
+      None
+    );
+    assert_eq!(
+      state.set_document(project_root.clone(), route_path.clone(), "two".to_owned()),
+      Some(2)
+    );
+    assert_eq!(
+      state.clear_document(project_root.clone(), &route_path),
+      Some(3)
+    );
+    assert_eq!(state.clear_document(project_root, &route_path), None);
+  }
+
+  #[test]
+  fn backend_state_only_runs_latest_debounced_refresh() {
+    let project_root = PathBuf::from("/tmp/app");
+    let mut state = BackendState::default();
+
+    state.note_refresh_requested(&project_root, 1);
+    assert!(state.should_run_debounced_refresh(&project_root, 1));
+
+    state.note_refresh_requested(&project_root, 2);
+    assert!(!state.should_run_debounced_refresh(&project_root, 1));
+    assert!(state.should_run_debounced_refresh(&project_root, 2));
+  }
+
+  #[test]
+  fn project_state_reuses_last_good_artifacts_for_current_diagnostics() {
+    let mut project_state = ProjectState {
+      revision: 2,
+      ..ProjectState::default()
+    };
+    let good_artifacts = ProjectArtifacts {
+      manifest: fixture_manifest(),
+      diagnostics: ThebeDiagnosticsFile {
+        version: 1,
+        diagnostics: Vec::new(),
+      },
+    };
+    let diagnostics = ThebeDiagnosticsFile {
+      version: 1,
+      diagnostics: vec![ThebeDiagnostic {
+        kind: "file".to_owned(),
+        severity: "error".to_owned(),
+        category: "client-script".to_owned(),
+        code: "analyzer-error".to_owned(),
+        message: "parse error".to_owned(),
+        file_path: Some("src/routes/profile.trs".to_owned()),
+        source_span: None,
+      }],
+    };
+
+    assert!(!project_state.remember_generated(1, &good_artifacts));
+
+    let (is_current, cached_artifacts) = project_state.remember_diagnostics(2, &diagnostics);
+    let cached_artifacts = cached_artifacts.expect("expected cached artifacts");
+
+    assert!(is_current);
+    assert_eq!(
+      cached_artifacts.manifest.routes[0].source_path,
+      "src/routes/profile.trs"
+    );
+    assert_eq!(
+      cached_artifacts.diagnostics.diagnostics[0].code,
+      "analyzer-error"
+    );
+  }
+
+  #[test]
+  fn project_input_files_include_routes_and_shared_inputs() {
+    let project_root = Path::new("/tmp/app");
+
+    assert!(is_project_input_file(
+      project_root,
+      &project_root.join("src/routes/index.trs"),
+    ));
+    assert!(is_project_input_file(
+      project_root,
+      &project_root.join("src/routes/blog/_layout.trs"),
+    ));
+    assert!(is_project_input_file(
+      project_root,
+      &project_root.join("Cargo.toml"),
+    ));
+    assert!(is_project_input_file(
+      project_root,
+      &project_root.join("app.html"),
+    ));
+  }
+
+  #[test]
+  fn project_input_files_ignore_generated_and_unrelated_paths() {
+    let project_root = Path::new("/tmp/app");
+
+    assert!(!is_project_input_file(
+      project_root,
+      &project_root.join("src/main.rs"),
+    ));
+    assert!(!is_project_input_file(
+      project_root,
+      &project_root.join(".thebe/server/routes/index.rs"),
+    ));
+    assert!(!is_project_input_file(
+      project_root,
+      &project_root.join("README.md"),
+    ));
+  }
 
   fn fixture_manifest() -> ThebeManifest {
     ThebeManifest {

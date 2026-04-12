@@ -181,6 +181,47 @@ struct LoadedAppHtml {
   source_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ProjectOverlay {
+  files: HashMap<PathBuf, String>,
+}
+
+impl ProjectOverlay {
+  #[must_use]
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  pub fn insert(&mut self, path: PathBuf, contents: String) -> Option<String> {
+    self.files.insert(path, contents)
+  }
+
+  pub fn remove(&mut self, path: &Path) -> Option<String> {
+    self.files.remove(path)
+  }
+
+  #[must_use]
+  pub fn is_empty(&self) -> bool {
+    self.files.is_empty()
+  }
+
+  fn contains_path(&self, path: &Path) -> bool {
+    self.files.contains_key(path)
+  }
+
+  fn read_to_string(&self, path: &Path) -> anyhow::Result<String> {
+    if let Some(source) = self.files.get(path) {
+      return Ok(source.clone());
+    }
+
+    std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
+  }
+
+  fn paths_under<'a>(&'a self, dir: &'a Path) -> impl Iterator<Item = &'a PathBuf> + 'a {
+    self.files.keys().filter(move |path| path.starts_with(dir))
+  }
+}
+
 pub fn find_project_root_from(start: &Path) -> anyhow::Result<PathBuf> {
   let mut dir = if start.is_file() {
     start
@@ -202,28 +243,36 @@ pub fn find_project_root_from(start: &Path) -> anyhow::Result<PathBuf> {
 }
 
 pub fn generate_project(project_root: &Path) -> anyhow::Result<ProjectArtifacts> {
+  let overlay = ProjectOverlay::default();
+  generate_project_with_overlay(project_root, &overlay)
+}
+
+pub fn generate_project_with_overlay(
+  project_root: &Path,
+  overlay: &ProjectOverlay,
+) -> anyhow::Result<ProjectArtifacts> {
   let src_dir = project_root.join("src");
   let routes_dir = src_dir.join("routes");
   anyhow::ensure!(
-    routes_dir.exists(),
+    routes_dir.exists() || overlay.paths_under(&routes_dir).next().is_some(),
     "no `src/routes/` directory found — create your route `.trs` files there"
   );
 
-  let layouts = collect_layouts(&routes_dir)?;
-  let app_html = load_app_html(project_root)?;
-  let trs_files = collect_trs_files(&routes_dir)?;
+  let layouts = collect_layouts(&routes_dir, overlay)?;
+  let app_html = load_app_html(project_root, overlay)?;
+  let trs_files = collect_trs_files(&routes_dir, overlay)?;
   anyhow::ensure!(
     !trs_files.is_empty(),
     "no `.trs` files found in `src/routes/`"
   );
 
-  let parsed_routes = collect_parsed_routes(&trs_files, &routes_dir)?;
+  let parsed_routes = collect_parsed_routes(&trs_files, &routes_dir, overlay)?;
   let needs_type_bridge = parsed_routes
     .iter()
     .any(|route| route.types_export_path.is_some());
 
   if needs_type_bridge {
-    ensure_ts_rs_dependency(project_root)?;
+    ensure_ts_rs_dependency(project_root, overlay)?;
   }
   prepare_generated_workspace(project_root, needs_type_bridge)?;
 
@@ -312,18 +361,37 @@ pub fn generate_project(project_root: &Path) -> anyhow::Result<ProjectArtifacts>
 }
 
 pub fn check_project(project_root: &Path) -> anyhow::Result<ThebeDiagnosticsFile> {
+  let overlay = ProjectOverlay::default();
+  check_project_with_overlay(project_root, &overlay)
+}
+
+pub fn check_project_with_overlay(
+  project_root: &Path,
+  overlay: &ProjectOverlay,
+) -> anyhow::Result<ThebeDiagnosticsFile> {
   let diagnostics = ThebeDiagnosticsFile {
     version: 1,
-    diagnostics: collect_project_diagnostics(project_root)?,
+    diagnostics: collect_project_diagnostics(project_root, overlay)?,
   };
   write_diagnostics_file(project_root, &diagnostics)?;
   Ok(diagnostics)
 }
 
 pub fn refresh_project_for_editor(project_root: &Path) -> anyhow::Result<EditorRefresh> {
-  let diagnostics = check_project(project_root)?;
+  let overlay = ProjectOverlay::default();
+  refresh_project_for_editor_with_overlay(project_root, &overlay)
+}
+
+pub fn refresh_project_for_editor_with_overlay(
+  project_root: &Path,
+  overlay: &ProjectOverlay,
+) -> anyhow::Result<EditorRefresh> {
+  let diagnostics = check_project_with_overlay(project_root, overlay)?;
   if diagnostics.is_empty() {
-    Ok(EditorRefresh::Generated(generate_project(project_root)?))
+    Ok(EditorRefresh::Generated(generate_project_with_overlay(
+      project_root,
+      overlay,
+    )?))
   } else {
     Ok(EditorRefresh::Diagnostics(diagnostics))
   }
@@ -356,12 +424,12 @@ where
 fn collect_parsed_routes(
   trs_files: &[PathBuf],
   routes_dir: &Path,
+  overlay: &ProjectOverlay,
 ) -> anyhow::Result<Vec<ParsedRoute>> {
   let mut routes = Vec::with_capacity(trs_files.len());
 
   for trs_path in trs_files {
-    let source = std::fs::read_to_string(trs_path)
-      .with_context(|| format!("failed to read {}", trs_path.display()))?;
+    let source = overlay.read_to_string(trs_path)?;
 
     let blocks = thebe_parser::parse_sfc(&source)
       .with_context(|| format!("parse error in {}", trs_path.display()))?;
@@ -409,12 +477,15 @@ fn route_has_client_script(blocks: &thebe_parser::SfcBlocks) -> bool {
     .is_some_and(|script| !script.trim().is_empty())
 }
 
-fn collect_project_diagnostics(project_root: &Path) -> anyhow::Result<Vec<ThebeDiagnostic>> {
+fn collect_project_diagnostics(
+  project_root: &Path,
+  overlay: &ProjectOverlay,
+) -> anyhow::Result<Vec<ThebeDiagnostic>> {
   let mut diagnostics = Vec::new();
   let src_dir = project_root.join("src");
   let routes_dir = src_dir.join("routes");
 
-  if !routes_dir.exists() {
+  if !routes_dir.exists() && overlay.paths_under(&routes_dir).next().is_none() {
     diagnostics.push(project_diagnostic(
       "project",
       "missing-routes-dir",
@@ -429,9 +500,9 @@ fn collect_project_diagnostics(project_root: &Path) -> anyhow::Result<Vec<ThebeD
     return Ok(diagnostics);
   }
 
-  let route_files = collect_trs_files(&routes_dir)?;
-  let layout_files = collect_layout_files(&routes_dir)?;
-  let cargo_has_ts_rs = has_ts_rs_dependency(project_root)?;
+  let route_files = collect_trs_files(&routes_dir, overlay)?;
+  let layout_files = collect_layout_files(&routes_dir, overlay)?;
+  let cargo_has_ts_rs = has_ts_rs_dependency(project_root, overlay)?;
 
   if route_files.is_empty() {
     diagnostics.push(project_diagnostic(
@@ -441,7 +512,7 @@ fn collect_project_diagnostics(project_root: &Path) -> anyhow::Result<Vec<ThebeD
     ));
   }
 
-  let app_html = read_app_html_for_diagnostics(project_root)?;
+  let app_html = read_app_html_for_diagnostics(project_root, overlay)?;
   if let Some(diagnostic) = validate_app_html_for_diagnostics(project_root, &app_html)? {
     diagnostics.push(diagnostic);
   }
@@ -455,7 +526,7 @@ fn collect_project_diagnostics(project_root: &Path) -> anyhow::Result<Vec<ThebeD
 
   let mut layouts = HashMap::new();
   for layout_path in layout_files {
-    match parse_layout_for_diagnostics(project_root, &layout_path, &routes_dir)? {
+    match parse_layout_for_diagnostics(project_root, &layout_path, &routes_dir, overlay)? {
       Ok(layout) => {
         let dir = layout_path.parent().unwrap_or(&routes_dir).to_path_buf();
         layouts.insert(dir, layout);
@@ -475,6 +546,7 @@ fn collect_project_diagnostics(project_root: &Path) -> anyhow::Result<Vec<ThebeD
       &app_html_source,
       app_html_valid,
       &route_path,
+      overlay,
       &mut diagnostics,
     )?;
 
@@ -499,8 +571,7 @@ fn collect_project_diagnostics(project_root: &Path) -> anyhow::Result<Vec<ThebeD
 
   if any_client_routes && !cargo_has_ts_rs {
     let cargo_toml_path = project_root.join("Cargo.toml");
-    let cargo_toml = std::fs::read_to_string(&cargo_toml_path)
-      .with_context(|| format!("failed to read {}", cargo_toml_path.display()))?;
+    let cargo_toml = overlay.read_to_string(&cargo_toml_path)?;
     diagnostics.push(file_diagnostic(
       project_root,
       &cargo_toml_path,
@@ -524,25 +595,39 @@ fn collect_project_diagnostics(project_root: &Path) -> anyhow::Result<Vec<ThebeD
   Ok(diagnostics)
 }
 
-fn collect_layout_files(routes_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+fn collect_layout_files(
+  routes_dir: &Path,
+  overlay: &ProjectOverlay,
+) -> anyhow::Result<Vec<PathBuf>> {
   let mut files = Vec::new();
 
-  for entry in WalkDir::new(routes_dir).min_depth(1) {
-    let entry = entry.context("failed to read directory entry")?;
-    if entry.file_type().is_file()
-      && entry.path().extension().is_some_and(|ext| ext == "trs")
-      && entry
-        .path()
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        == "_layout"
-    {
-      files.push(entry.into_path());
+  if routes_dir.exists() {
+    for entry in WalkDir::new(routes_dir).min_depth(1) {
+      let entry = entry.context("failed to read directory entry")?;
+      if entry.file_type().is_file()
+        && entry.path().extension().is_some_and(|ext| ext == "trs")
+        && entry
+          .path()
+          .file_stem()
+          .unwrap_or_default()
+          .to_string_lossy()
+          == "_layout"
+      {
+        files.push(entry.into_path());
+      }
     }
   }
 
+  files.extend(
+    overlay
+      .paths_under(routes_dir)
+      .filter(|path| path.extension().is_some_and(|ext| ext == "trs"))
+      .filter(|path| path.file_stem().unwrap_or_default().to_string_lossy() == "_layout")
+      .cloned(),
+  );
+
   files.sort();
+  files.dedup();
   Ok(files)
 }
 
@@ -553,10 +638,10 @@ fn analyze_route_for_diagnostics(
   app_html: &str,
   app_html_valid: bool,
   route_path: &Path,
+  overlay: &ProjectOverlay,
   diagnostics: &mut Vec<ThebeDiagnostic>,
 ) -> anyhow::Result<Option<ParsedRoute>> {
-  let source = std::fs::read_to_string(route_path)
-    .with_context(|| format!("failed to read {}", route_path.display()))?;
+  let source = overlay.read_to_string(route_path)?;
 
   let blocks = match thebe_parser::parse_sfc(&source) {
     Ok(blocks) => blocks,
@@ -663,9 +748,9 @@ fn parse_layout_for_diagnostics(
   project_root: &Path,
   layout_path: &Path,
   routes_dir: &Path,
+  overlay: &ProjectOverlay,
 ) -> anyhow::Result<Result<ParsedLayout, ThebeDiagnostic>> {
-  let source = std::fs::read_to_string(layout_path)
-    .with_context(|| format!("failed to read {}", layout_path.display()))?;
+  let source = overlay.read_to_string(layout_path)?;
 
   let blocks = match thebe_parser::parse_sfc(&source) {
     Ok(blocks) => blocks,
@@ -870,14 +955,16 @@ fn whole_source_span(source: &str) -> Option<SourceSpan> {
   })
 }
 
-fn read_app_html_for_diagnostics(project_root: &Path) -> anyhow::Result<Option<LoadedAppHtml>> {
+fn read_app_html_for_diagnostics(
+  project_root: &Path,
+  overlay: &ProjectOverlay,
+) -> anyhow::Result<Option<LoadedAppHtml>> {
   let app_html_path = project_root.join("app.html");
-  if !app_html_path.exists() {
+  if !app_html_path.exists() && !overlay.contains_path(&app_html_path) {
     return Ok(None);
   }
 
-  let contents = std::fs::read_to_string(&app_html_path)
-    .with_context(|| format!("failed to read {}", app_html_path.display()))?;
+  let contents = overlay.read_to_string(&app_html_path)?;
 
   Ok(Some(LoadedAppHtml {
     contents,
@@ -916,9 +1003,9 @@ fn validate_app_html_for_diagnostics(
   Ok(None)
 }
 
-fn ensure_ts_rs_dependency(project_root: &Path) -> anyhow::Result<()> {
+fn ensure_ts_rs_dependency(project_root: &Path, overlay: &ProjectOverlay) -> anyhow::Result<()> {
   anyhow::ensure!(
-    has_ts_rs_dependency(project_root)?,
+    has_ts_rs_dependency(project_root, overlay)?,
     "typed `<script lang=\"ts\">` routes require `ts-rs` in {} — add `ts-rs = \"12\"` under `[dependencies]`",
     project_root.join("Cargo.toml").display()
   );
@@ -926,10 +1013,9 @@ fn ensure_ts_rs_dependency(project_root: &Path) -> anyhow::Result<()> {
   Ok(())
 }
 
-fn has_ts_rs_dependency(project_root: &Path) -> anyhow::Result<bool> {
+fn has_ts_rs_dependency(project_root: &Path, overlay: &ProjectOverlay) -> anyhow::Result<bool> {
   let cargo_toml_path = project_root.join("Cargo.toml");
-  let cargo_toml = std::fs::read_to_string(&cargo_toml_path)
-    .with_context(|| format!("failed to read {}", cargo_toml_path.display()))?;
+  let cargo_toml = overlay.read_to_string(&cargo_toml_path)?;
 
   Ok(cargo_toml.contains("ts-rs"))
 }
@@ -1263,12 +1349,11 @@ fn to_project_relative_path(project_root: &Path, path: &Path) -> anyhow::Result<
   )
 }
 
-fn load_app_html(project_root: &Path) -> anyhow::Result<LoadedAppHtml> {
+fn load_app_html(project_root: &Path, overlay: &ProjectOverlay) -> anyhow::Result<LoadedAppHtml> {
   let app_html_path = project_root.join("app.html");
 
-  if app_html_path.exists() {
-    let app_html = std::fs::read_to_string(&app_html_path)
-      .with_context(|| format!("failed to read {}", app_html_path.display()))?;
+  if app_html_path.exists() || overlay.contains_path(&app_html_path) {
+    let app_html = overlay.read_to_string(&app_html_path)?;
     thebe_codegen::validate_app_html(&app_html)
       .with_context(|| format!("invalid {}", app_html_path.display()))?;
     return Ok(LoadedAppHtml {
@@ -1285,76 +1370,76 @@ fn load_app_html(project_root: &Path) -> anyhow::Result<LoadedAppHtml> {
   })
 }
 
-fn collect_trs_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+fn collect_trs_files(dir: &Path, overlay: &ProjectOverlay) -> anyhow::Result<Vec<PathBuf>> {
   let mut files = Vec::new();
-  for entry in WalkDir::new(dir).min_depth(1) {
-    let entry = entry.context("failed to read directory entry")?;
-    if entry.file_type().is_file() && entry.path().extension().is_some_and(|e| e == "trs") {
-      let stem = entry
-        .path()
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-      if stem != "_layout" {
-        files.push(entry.into_path());
+  if dir.exists() {
+    for entry in WalkDir::new(dir).min_depth(1) {
+      let entry = entry.context("failed to read directory entry")?;
+      if entry.file_type().is_file() && entry.path().extension().is_some_and(|e| e == "trs") {
+        let stem = entry
+          .path()
+          .file_stem()
+          .unwrap_or_default()
+          .to_string_lossy();
+        if stem != "_layout" {
+          files.push(entry.into_path());
+        }
       }
     }
   }
+
+  files.extend(
+    overlay
+      .paths_under(dir)
+      .filter(|path| path.extension().is_some_and(|ext| ext == "trs"))
+      .filter(|path| path.file_stem().unwrap_or_default().to_string_lossy() != "_layout")
+      .cloned(),
+  );
+
   files.sort();
+  files.dedup();
   Ok(files)
 }
 
-fn collect_layouts(routes_dir: &Path) -> anyhow::Result<HashMap<PathBuf, ParsedLayout>> {
+fn collect_layouts(
+  routes_dir: &Path,
+  overlay: &ProjectOverlay,
+) -> anyhow::Result<HashMap<PathBuf, ParsedLayout>> {
   let mut map = HashMap::new();
-  for entry in WalkDir::new(routes_dir).min_depth(1) {
-    let entry = entry.context("failed to read directory entry")?;
-    if entry.file_type().is_file()
-      && entry.path().extension().is_some_and(|e| e == "trs")
-      && entry
-        .path()
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        == "_layout"
-    {
-      let layout_path = entry.into_path();
-      let source = std::fs::read_to_string(&layout_path)
-        .with_context(|| format!("failed to read {}", layout_path.display()))?;
-      let blocks = thebe_parser::parse_sfc(&source)
-        .with_context(|| format!("parse error in {}", layout_path.display()))?;
-      let template_bindings = thebe_codegen::list_template_bindings(&blocks.template)
-        .with_context(|| {
-          format!(
-            "failed to inspect template bindings in {}",
-            layout_path.display()
-          )
-        })?;
-      let template_binding_spans =
-        collect_template_binding_occurrences(&source, &blocks.template_spans).with_context(
-          || {
-            format!(
-              "failed to inspect template binding spans in {}",
-              layout_path.display()
-            )
-          },
-        )?;
+  for layout_path in collect_layout_files(routes_dir, overlay)? {
+    let source = overlay.read_to_string(&layout_path)?;
+    let blocks = thebe_parser::parse_sfc(&source)
+      .with_context(|| format!("parse error in {}", layout_path.display()))?;
+    let template_bindings =
+      thebe_codegen::list_template_bindings(&blocks.template).with_context(|| {
+        format!(
+          "failed to inspect template bindings in {}",
+          layout_path.display()
+        )
+      })?;
+    let template_binding_spans =
+      collect_template_binding_occurrences(&source, &blocks.template_spans).with_context(|| {
+        format!(
+          "failed to inspect template binding spans in {}",
+          layout_path.display()
+        )
+      })?;
 
-      let rel = layout_path.strip_prefix(routes_dir).unwrap_or(&layout_path);
-      let scope_path = rel.with_extension("").to_string_lossy().replace('\\', "/");
+    let rel = layout_path.strip_prefix(routes_dir).unwrap_or(&layout_path);
+    let scope_path = rel.with_extension("").to_string_lossy().replace('\\', "/");
 
-      let dir = layout_path.parent().unwrap_or(routes_dir).to_path_buf();
-      map.insert(
-        dir,
-        ParsedLayout {
-          source,
-          blocks,
-          scope_path,
-          trs_path: layout_path.clone(),
-          template_bindings,
-          template_binding_spans,
-        },
-      );
-    }
+    let dir = layout_path.parent().unwrap_or(routes_dir).to_path_buf();
+    map.insert(
+      dir,
+      ParsedLayout {
+        source,
+        blocks,
+        scope_path,
+        trs_path: layout_path.clone(),
+        template_bindings,
+        template_binding_spans,
+      },
+    );
   }
   Ok(map)
 }
@@ -1469,6 +1554,54 @@ fn sanitize_module_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::fs;
+  use std::time::{SystemTime, UNIX_EPOCH};
+
+  struct TestProject {
+    root: PathBuf,
+  }
+
+  impl TestProject {
+    fn new(name: &str) -> Self {
+      let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+      let root = std::env::temp_dir().join(format!("thebe-project-{name}-{suffix}"));
+      fs::create_dir_all(&root).expect("failed to create test project root");
+      Self { root }
+    }
+
+    fn path(&self) -> &Path {
+      &self.root
+    }
+
+    fn write(&self, relative_path: &str, contents: &str) {
+      let path = self.root.join(relative_path);
+      if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("failed to create parent directory");
+      }
+      fs::write(path, contents).expect("failed to write fixture file");
+    }
+  }
+
+  impl Drop for TestProject {
+    fn drop(&mut self) {
+      let _ = fs::remove_dir_all(&self.root);
+    }
+  }
+
+  fn fixture_cargo_toml(include_ts_rs: bool) -> String {
+    let dependencies = if include_ts_rs {
+      "[dependencies]\nts-rs = \"12\"\n"
+    } else {
+      "[dependencies]\n"
+    };
+
+    format!(
+      "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n{dependencies}"
+    )
+  }
 
   #[test]
   fn file_to_route_path_maps_nested_and_dynamic_routes() {
@@ -1578,5 +1711,116 @@ mod tests {
     let json = serde_json::to_value(&diagnostics).unwrap();
     assert_eq!(json["version"], 1);
     assert_eq!(json["diagnostics"][0]["code"], "missing-routes");
+  }
+
+  #[test]
+  fn refresh_project_for_editor_with_overlay_reports_unsaved_analyzer_errors() {
+    let project = TestProject::new("overlay-diagnostics");
+    project.write("Cargo.toml", &fixture_cargo_toml(true));
+    project.write(
+      "src/routes/index.trs",
+      r#"<script setup>
+struct Props {
+  username: String,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {
+    username: String::from("Thebe"),
+  }
+}
+</script>
+
+<script lang="ts">
+let props = getProps<Props>();
+
+function handleChange(event: Event) {
+  const input = event.target;
+  props.username = input.value;
+}
+</script>
+
+<main>{{ username }}</main>
+"#,
+    );
+
+    let mut overlay = ProjectOverlay::new();
+    overlay.insert(
+      project.path().join("src/routes/index.trs"),
+      r#"<script setup>
+struct Props {
+  username: String,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {
+    username: String::from("Thebe"),
+  }
+}
+</script>
+
+<script lang="ts">
+let props = getProps<Props>();
+
+function handleChange(event: Event) {
+  props.username = ;
+}
+</script>
+
+<main>{{ username }}</main>
+"#
+      .to_owned(),
+    );
+
+    let refresh = refresh_project_for_editor_with_overlay(project.path(), &overlay)
+      .expect("overlay refresh should succeed");
+    let EditorRefresh::Diagnostics(diagnostics) = refresh else {
+      panic!("expected diagnostics for invalid unsaved client script");
+    };
+
+    assert!(diagnostics.diagnostics.iter().any(|diagnostic| {
+      diagnostic.category == "client-script"
+        && diagnostic.code == "analyzer-error"
+        && diagnostic.file_path.as_deref() == Some("src/routes/index.trs")
+    }));
+  }
+
+  #[test]
+  fn generate_project_with_overlay_discovers_unsaved_route_files() {
+    let project = TestProject::new("overlay-generation");
+    project.write("Cargo.toml", &fixture_cargo_toml(false));
+
+    let mut overlay = ProjectOverlay::new();
+    overlay.insert(
+      project.path().join("src/routes/index.trs"),
+      r#"<script setup>
+struct Props {
+  title: String,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {
+    title: String::from("Overlay"),
+  }
+}
+</script>
+
+<main>{{ title }}</main>
+"#
+      .to_owned(),
+    );
+
+    let artifacts = generate_project_with_overlay(project.path(), &overlay)
+      .expect("overlay generation should succeed");
+
+    assert_eq!(artifacts.manifest.routes.len(), 1);
+    assert_eq!(
+      artifacts.manifest.routes[0].source_path,
+      "src/routes/index.trs"
+    );
+    assert_eq!(artifacts.manifest.routes[0].handler.name, "handler");
   }
 }
