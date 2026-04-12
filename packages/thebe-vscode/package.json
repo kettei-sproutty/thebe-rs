@@ -5,6 +5,10 @@
   "version": "0.1.0",
   "publisher": "thebe",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kettei-sproutty/thebe-rs.git"
+  },
   "engines": {
     "vscode": "^1.95.0"
   },
@@ -12,9 +16,9 @@
     "Programming Languages"
   ],
   "main": "./extension.js",
-  "activationEvents": [
-    "onLanguage:thebe"
-  ],
+  "scripts": {
+    "package:vsix": "node ./scripts/package-vsix.js"
+  },
   "extensionKind": [
     "workspace"
   ],

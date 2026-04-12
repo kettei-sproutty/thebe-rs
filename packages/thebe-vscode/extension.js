@@ -6,7 +6,7 @@ const { LanguageClient } = require("vscode-languageclient/node");
 let client;
 
 async function activate(context) {
-  const command = resolveServerCommand();
+  const command = resolveServerCommand(context);
   const clientOptions = {
     documentSelector: [{ language: "thebe", scheme: "file" }],
     synchronize: {
@@ -27,10 +27,15 @@ async function activate(context) {
   context.subscriptions.push(client.start());
 }
 
-function resolveServerCommand() {
+function resolveServerCommand(context) {
   const configured = vscode.workspace.getConfiguration("thebe").get("lsp.path");
   if (configured && typeof configured === "string" && configured.length > 0) {
     return configured;
+  }
+
+  const bundled = bundledServerCommand(context.extensionPath);
+  if (bundled) {
+    return bundled;
   }
 
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
@@ -41,6 +46,16 @@ function resolveServerCommand() {
   }
 
   return "thebe-lsp";
+}
+
+function bundledServerCommand(extensionPath) {
+  const executable = process.platform === "win32" ? "thebe-lsp.exe" : "thebe-lsp";
+  const candidate = path.join(extensionPath, "bin", executable);
+  if (fs.existsSync(candidate)) {
+    return candidate;
+  }
+
+  return null;
 }
 
 async function deactivate() {
