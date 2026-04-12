@@ -99,6 +99,8 @@ pub struct RouteMetadata {
   pub state_type: Option<String>,
   pub template_binding_spans: Vec<TemplateBindingMetadata>,
   pub template_bindings: Vec<String>,
+  #[serde(default)]
+  pub template_symbols: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +165,7 @@ struct ParsedRoute {
   handler_info: thebe_codegen::RouteHandlerInfo,
   state_type: Option<String>,
   template_bindings: Vec<String>,
+  template_symbols: Vec<String>,
   template_binding_spans: Vec<thebe_codegen::TemplateBindingOccurrence>,
   types_export_path: Option<String>,
 }
@@ -442,6 +445,12 @@ fn collect_parsed_routes(
           trs_path.display()
         )
       })?;
+    let template_symbols = thebe_codegen::route_template_symbols(&blocks).with_context(|| {
+      format!(
+        "failed to inspect template symbols in {}",
+        trs_path.display()
+      )
+    })?;
     let template_binding_spans =
       collect_template_binding_occurrences(&source, &blocks.template_spans).with_context(|| {
         format!(
@@ -461,6 +470,7 @@ fn collect_parsed_routes(
       state_type: handler_info.state_type.clone(),
       handler_info,
       template_bindings,
+      template_symbols,
       template_binding_spans,
       blocks,
       types_export_path,
@@ -687,6 +697,20 @@ fn analyze_route_for_diagnostics(
     }
   };
 
+  let template_symbols = match thebe_codegen::route_template_symbols(&blocks) {
+    Ok(symbols) => symbols,
+    Err(err) => {
+      diagnostics.push(codegen_error_diagnostic(
+        project_root,
+        route_path,
+        &source,
+        &blocks,
+        &err,
+      )?);
+      return Ok(None);
+    }
+  };
+
   let template_binding_spans =
     match collect_template_binding_occurrences(&source, &blocks.template_spans) {
       Ok(bindings) => bindings,
@@ -715,6 +739,7 @@ fn analyze_route_for_diagnostics(
     state_type: handler_info.state_type.clone(),
     handler_info,
     template_bindings,
+    template_symbols,
     template_binding_spans,
     blocks,
     types_export_path,
@@ -1176,7 +1201,7 @@ fn build_thebe_manifest(
     .collect::<anyhow::Result<Vec<_>>>()?;
 
   Ok(ThebeManifest {
-    version: 3,
+    version: 4,
     server_router_path: THEBE_SERVER_ROUTES_FILE.to_owned(),
     app_html: AppHtmlMetadata {
       source_path: app_html_path
@@ -1242,6 +1267,7 @@ fn build_thebe_manifest_route(
       .map(|binding| template_binding_span_metadata(&route.source, binding))
       .collect(),
     template_bindings: route.template_bindings.clone(),
+    template_symbols: route.template_symbols.clone(),
   })
 }
 
@@ -1629,7 +1655,7 @@ mod tests {
   #[test]
   fn build_manifest_records_generated_paths() {
     let manifest = ThebeManifest {
-      version: 3,
+      version: 4,
       server_router_path: THEBE_SERVER_ROUTES_FILE.to_owned(),
       app_html: AppHtmlMetadata {
         source_path: Some("app.html".to_owned()),
@@ -1682,6 +1708,7 @@ mod tests {
           },
         }],
         template_bindings: vec!["count".to_owned()],
+        template_symbols: vec!["count".to_owned()],
       }],
     };
 
@@ -1695,6 +1722,7 @@ mod tests {
       json["routes"][0]["generatedTypesPath"],
       ".thebe/types/routes/index.ts"
     );
+    assert_eq!(json["routes"][0]["templateSymbols"][0], "count");
   }
 
   #[test]
@@ -1822,5 +1850,6 @@ fn handler() -> Props {
       "src/routes/index.trs"
     );
     assert_eq!(artifacts.manifest.routes[0].handler.name, "handler");
+    assert_eq!(artifacts.manifest.routes[0].template_symbols, vec!["title"]);
   }
 }

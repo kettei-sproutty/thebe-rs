@@ -2135,6 +2135,9 @@ name = "thebe-lsp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "thebe-analyzer",
+ "thebe-codegen",
+ "thebe-parser",
  "thebe-project",
  "tokio",
  "tower-lsp",

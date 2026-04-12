@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use thebe_parser::SfcBlocks;
 use thebe_project::{
   EditorRefresh, LayoutMetadata, ProjectArtifacts, ProjectOverlay, RouteMetadata,
   SourceSpanMetadata, THEBE_DIAGNOSTICS_FILE, THEBE_MANIFEST_FILE, TemplateBindingMetadata,
@@ -11,17 +12,24 @@ use thebe_project::{
 };
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::{
-  Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-  DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
-  DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-  HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, Location,
-  MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, Position, Range, ReferenceParams,
-  ServerCapabilities, ServerInfo, SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind,
-  TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url,
+  CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
+  CompletionTextEdit, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
+  DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbol,
+  DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+  Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+  InsertTextFormat, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
+  Position, Range, ReferenceParams, ServerCapabilities, ServerInfo, SymbolKind,
+  TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+  TextDocumentSyncSaveOptions, TextEdit, Url,
 };
 use tower_lsp::{Client, LanguageServer};
 
 const CHANGE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
+
+type DiagnosticsByFile = BTreeMap<Url, Vec<Diagnostic>>;
+type DiagnosticPublishBatch = Vec<(Url, Vec<Diagnostic>)>;
+
+const COMPLETION_TRIGGER_CHARACTERS: &[&str] = &["<", "{", ".", "\""];
 
 #[derive(Debug, Default)]
 struct OpenDocuments {
@@ -131,6 +139,18 @@ impl BackendState {
       .remember_diagnostics(revision, diagnostics)
   }
 
+  fn coalesce_diagnostic_updates(
+    &mut self,
+    project_root: &Path,
+    next_diagnostics: DiagnosticsByFile,
+  ) -> DiagnosticPublishBatch {
+    self
+      .projects
+      .entry(project_root.to_path_buf())
+      .or_default()
+      .coalesce_diagnostic_updates(next_diagnostics)
+  }
+
   fn is_current_revision(&self, project_root: &Path, revision: u64) -> bool {
     self
       .projects
@@ -152,6 +172,26 @@ struct ProjectSnapshot {
   cached_artifacts: Option<ProjectArtifacts>,
 }
 
+#[derive(Debug, Clone)]
+struct DocumentContext {
+  relative_path: String,
+  source: String,
+  cached_artifacts: Option<ProjectArtifacts>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteRange {
+  start: usize,
+  end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompletionContext {
+  BlockTag { prefix: String, replace: ByteRange },
+  TemplateBinding { prefix: String, replace: ByteRange },
+  EventHandler { prefix: String, replace: ByteRange },
+}
+
 #[derive(Debug, Default)]
 struct ProjectState {
   revision: u64,
@@ -159,6 +199,7 @@ struct ProjectState {
   cached_artifacts: Option<ProjectArtifacts>,
   last_good_artifacts: Option<ProjectArtifacts>,
   last_good_revision: Option<u64>,
+  published_diagnostics: DiagnosticsByFile,
 }
 
 impl ProjectState {
@@ -207,6 +248,36 @@ impl ProjectState {
     }
 
     (is_current, artifacts)
+  }
+
+  fn coalesce_diagnostic_updates(
+    &mut self,
+    mut next_diagnostics: DiagnosticsByFile,
+  ) -> DiagnosticPublishBatch {
+    for (uri, diagnostics) in &self.published_diagnostics {
+      if diagnostics.is_empty() && !next_diagnostics.contains_key(uri) {
+        next_diagnostics.insert(uri.clone(), Vec::new());
+      }
+    }
+
+    let mut updates = Vec::new();
+
+    for (uri, diagnostics) in &next_diagnostics {
+      if self.published_diagnostics.get(uri) != Some(diagnostics) {
+        updates.push((uri.clone(), diagnostics.clone()));
+      }
+    }
+
+    for (uri, diagnostics) in &self.published_diagnostics {
+      if diagnostics.is_empty() || next_diagnostics.contains_key(uri) {
+        continue;
+      }
+
+      updates.push((uri.clone(), Vec::new()));
+    }
+
+    self.published_diagnostics = next_diagnostics;
+    updates
   }
 }
 
@@ -330,6 +401,27 @@ impl Backend {
       }
     }
   }
+
+  fn document_context(&self, uri: &Url) -> Option<DocumentContext> {
+    let path = uri.to_file_path().ok()?;
+    let project_root = thebe_project::find_project_root_from(&path).ok()?;
+    let relative_path = relative_path_from_uri(&project_root, uri)?;
+    let source = read_backend_state(&self.state)
+      .open_documents
+      .files
+      .get(&path)
+      .cloned()
+      .or_else(|| std::fs::read_to_string(&path).ok())?;
+    let cached_artifacts = self
+      .load_or_refresh_artifacts(uri)
+      .map(|(_, artifacts)| artifacts);
+
+    Some(DocumentContext {
+      relative_path,
+      source,
+      cached_artifacts,
+    })
+  }
 }
 
 async fn refresh_project(
@@ -350,7 +442,9 @@ async fn refresh_project(
         return;
       }
 
-      if let Err(err) = publish_project_diagnostics(&client, &project_root, &artifacts).await {
+      if let Err(err) =
+        publish_project_diagnostics(&client, &state, &project_root, &artifacts).await
+      {
         client
           .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
           .await;
@@ -367,20 +461,24 @@ async fn refresh_project(
       }
 
       if let Some(artifacts) = cached_artifacts {
-        if let Err(err) = publish_project_diagnostics(&client, &project_root, &artifacts).await {
+        if let Err(err) =
+          publish_project_diagnostics(&client, &state, &project_root, &artifacts).await
+        {
           client
             .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
             .await;
         }
       } else if let Ok(mut artifacts) = thebe_project::load_project_artifacts(&project_root) {
         artifacts.diagnostics = diagnostics.clone();
-        if let Err(err) = publish_project_diagnostics(&client, &project_root, &artifacts).await {
+        if let Err(err) =
+          publish_project_diagnostics(&client, &state, &project_root, &artifacts).await
+        {
           client
             .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
             .await;
         }
       } else if let Err(err) =
-        publish_diagnostics_without_manifest(&client, &project_root, &diagnostics).await
+        publish_diagnostics_without_manifest(&client, &state, &project_root, &diagnostics).await
       {
         client
           .log_message(MessageType::ERROR, format!("thebe-lsp: {err:#}"))
@@ -423,6 +521,16 @@ impl LanguageServer for Backend {
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+          resolve_provider: Some(false),
+          trigger_characters: Some(
+            COMPLETION_TRIGGER_CHARACTERS
+              .iter()
+              .map(|character| (*character).to_owned())
+              .collect(),
+          ),
+          ..CompletionOptions::default()
+        }),
         text_document_sync: Some(TextDocumentSyncCapability::Options(
           TextDocumentSyncOptions {
             open_close: Some(true),
@@ -491,6 +599,29 @@ impl LanguageServer for Backend {
       self
         .refresh_project_for_uri_now(&params.text_document.uri, project_root, revision)
         .await;
+    }
+  }
+
+  async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
+    let uri = &params.text_document_position.text_document.uri;
+    let position = params.text_document_position.position;
+    let Some(document) = self.document_context(uri) else {
+      return Ok(None);
+    };
+
+    if !document.relative_path.ends_with(".trs") {
+      return Ok(None);
+    }
+
+    let Some(context) = classify_completion_context(&document.source, position) else {
+      return Ok(None);
+    };
+
+    let items = completion_items_for_context(&document, &context);
+    if items.is_empty() {
+      Ok(None)
+    } else {
+      Ok(Some(CompletionResponse::Array(items)))
     }
   }
 
@@ -603,6 +734,418 @@ fn is_project_input_file(project_root: &Path, path: &Path) -> bool {
 
   let routes_dir = project_root.join("src/routes");
   path.starts_with(&routes_dir) && path.extension().is_some_and(|ext| ext == "trs")
+}
+
+fn classify_completion_context(source: &str, position: Position) -> Option<CompletionContext> {
+  let offset = byte_offset_from_position(source, position)?;
+
+  event_handler_context(source, offset)
+    .or_else(|| template_binding_context(source, offset))
+    .or_else(|| block_tag_context(source, offset))
+}
+
+fn completion_items_for_context(
+  document: &DocumentContext,
+  context: &CompletionContext,
+) -> Vec<CompletionItem> {
+  match context {
+    CompletionContext::BlockTag { prefix, replace } => {
+      block_completion_items(&document.source, prefix, *replace)
+    }
+    CompletionContext::TemplateBinding { prefix, replace } => {
+      template_binding_completion_items(document, prefix, *replace)
+    }
+    CompletionContext::EventHandler { prefix, replace } => {
+      event_handler_completion_items(document, prefix, *replace)
+    }
+  }
+}
+
+fn block_completion_items(source: &str, prefix: &str, replace: ByteRange) -> Vec<CompletionItem> {
+  let blocks = parse_source_blocks(source).ok();
+  [
+    (
+      "head",
+      "<head>\n  $0\n</head>",
+      CompletionItemKind::SNIPPET,
+      blocks
+        .as_ref()
+        .is_none_or(|blocks| blocks.head_span.is_none()),
+    ),
+    (
+      "script setup",
+      "<script setup>\n$0\n</script>",
+      CompletionItemKind::SNIPPET,
+      blocks
+        .as_ref()
+        .is_none_or(|blocks| blocks.script_setup_span.is_none()),
+    ),
+    (
+      "script lang=\"ts\"",
+      "<script lang=\"ts\">\n$0\n</script>",
+      CompletionItemKind::SNIPPET,
+      blocks
+        .as_ref()
+        .is_none_or(|blocks| blocks.script_ts_span.is_none()),
+    ),
+    (
+      "style",
+      "<style>\n$0\n</style>",
+      CompletionItemKind::SNIPPET,
+      blocks
+        .as_ref()
+        .is_none_or(|blocks| blocks.style_span.is_none()),
+    ),
+  ]
+  .into_iter()
+  .filter(|(label, _, _, enabled)| *enabled && label.starts_with(prefix))
+  .map(|(label, snippet, kind, _)| snippet_completion_item(source, label, snippet, kind, replace))
+  .collect()
+}
+
+fn template_binding_completion_items(
+  document: &DocumentContext,
+  prefix: &str,
+  replace: ByteRange,
+) -> Vec<CompletionItem> {
+  let mut symbols = current_template_symbols(document);
+  symbols.sort();
+  symbols.dedup();
+
+  symbols
+    .into_iter()
+    .filter(|symbol| symbol.starts_with(prefix))
+    .map(|symbol| {
+      plain_completion_item(
+        &document.source,
+        &symbol,
+        CompletionItemKind::VARIABLE,
+        replace,
+      )
+    })
+    .collect()
+}
+
+fn event_handler_completion_items(
+  document: &DocumentContext,
+  prefix: &str,
+  replace: ByteRange,
+) -> Vec<CompletionItem> {
+  let mut handlers = current_event_handlers(document);
+  handlers.sort();
+  handlers.dedup();
+
+  handlers
+    .into_iter()
+    .filter(|handler| handler.starts_with(prefix))
+    .map(|handler| {
+      plain_completion_item(
+        &document.source,
+        &handler,
+        CompletionItemKind::FUNCTION,
+        replace,
+      )
+    })
+    .collect()
+}
+
+fn current_template_symbols(document: &DocumentContext) -> Vec<String> {
+  let mut symbols = document
+    .cached_artifacts
+    .as_ref()
+    .map(|artifacts| template_symbols_for_path(&artifacts.manifest, &document.relative_path))
+    .unwrap_or_default();
+
+  if let Ok(blocks) = parse_source_blocks(&document.source) {
+    if let Ok(current_symbols) = thebe_codegen::route_template_symbols(&blocks) {
+      symbols.extend(current_symbols);
+    }
+
+    if let Ok(current_bindings) = thebe_codegen::list_template_bindings(&blocks.template) {
+      symbols.extend(current_bindings);
+    }
+  }
+
+  symbols
+}
+
+fn current_event_handlers(document: &DocumentContext) -> Vec<String> {
+  let Ok(blocks) = parse_source_blocks(&document.source) else {
+    return Vec::new();
+  };
+  let Some(script_ts) = blocks.script_ts.as_deref() else {
+    return Vec::new();
+  };
+
+  thebe_analyzer::analyze(script_ts)
+    .map(|module| module.event_fns)
+    .unwrap_or_default()
+}
+
+fn template_symbols_for_path(manifest: &ThebeManifest, relative_path: &str) -> Vec<String> {
+  if let Some(route) = manifest
+    .routes
+    .iter()
+    .find(|route| route.source_path == relative_path)
+  {
+    let mut symbols = route.template_symbols.clone();
+    symbols.extend(route.template_bindings.clone());
+    return symbols;
+  }
+
+  if let Some(layout) = manifest
+    .layouts
+    .iter()
+    .find(|layout| layout.source_path == relative_path)
+  {
+    return layout.template_bindings.clone();
+  }
+
+  Vec::new()
+}
+
+fn parse_source_blocks(source: &str) -> std::result::Result<SfcBlocks, thebe_parser::ParseError> {
+  thebe_parser::parse_sfc(source)
+}
+
+fn template_binding_context(source: &str, offset: usize) -> Option<CompletionContext> {
+  let open = source[..offset].rfind("{{")?;
+  if source[..offset]
+    .rfind("}}")
+    .is_some_and(|close| close > open)
+  {
+    return None;
+  }
+
+  let close = source[offset..]
+    .find("}}")
+    .map_or(source.len(), |relative| offset + relative);
+  let content_start = trim_ascii_whitespace_start(source, open + 2, close);
+  let content_end = trim_ascii_whitespace_end(source, content_start, close);
+  if offset < content_start || offset > close {
+    return None;
+  }
+
+  Some(CompletionContext::TemplateBinding {
+    prefix: source[content_start..offset].trim().to_owned(),
+    replace: ByteRange {
+      start: content_start,
+      end: content_end.max(content_start),
+    },
+  })
+}
+
+fn event_handler_context(source: &str, offset: usize) -> Option<CompletionContext> {
+  let tag_start = source[..offset].rfind('<')?;
+  if source[..offset]
+    .rfind('>')
+    .is_some_and(|end| end > tag_start)
+  {
+    return None;
+  }
+
+  let tag_prefix = &source[tag_start..offset];
+  let (attribute_name, value_start) = open_attribute_value(tag_prefix)?;
+  if !attribute_name.starts_with("on") {
+    return None;
+  }
+
+  let absolute_value_start = tag_start + value_start;
+  Some(CompletionContext::EventHandler {
+    prefix: source[absolute_value_start..offset].trim().to_owned(),
+    replace: ByteRange {
+      start: absolute_value_start,
+      end: offset,
+    },
+  })
+}
+
+fn open_attribute_value(tag_prefix: &str) -> Option<(String, usize)> {
+  let bytes = tag_prefix.as_bytes();
+  let mut idx = 1usize;
+
+  while idx < bytes.len() {
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+      idx += 1;
+    }
+
+    if idx >= bytes.len() || matches!(bytes[idx], b'>' | b'/') {
+      return None;
+    }
+
+    let name_start = idx;
+    while idx < bytes.len()
+      && (bytes[idx].is_ascii_alphanumeric() || matches!(bytes[idx], b':' | b'-' | b'_'))
+    {
+      idx += 1;
+    }
+
+    if name_start == idx {
+      idx += 1;
+      continue;
+    }
+
+    let name = tag_prefix[name_start..idx].to_owned();
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+      idx += 1;
+    }
+
+    if idx >= bytes.len() || bytes[idx] != b'=' {
+      continue;
+    }
+    idx += 1;
+
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+      idx += 1;
+    }
+
+    if idx >= bytes.len() {
+      return None;
+    }
+
+    let quote = bytes[idx];
+    if quote != b'\'' && quote != b'"' {
+      while idx < bytes.len() && !bytes[idx].is_ascii_whitespace() && bytes[idx] != b'>' {
+        idx += 1;
+      }
+      continue;
+    }
+
+    let value_start = idx + 1;
+    idx += 1;
+    if tag_prefix[idx..].contains(quote as char) {
+      let next = tag_prefix[idx..]
+        .find(quote as char)
+        .expect("quoted value close exists");
+      idx += next + 1;
+      continue;
+    }
+
+    return Some((name, value_start));
+  }
+
+  None
+}
+
+fn block_tag_context(source: &str, offset: usize) -> Option<CompletionContext> {
+  let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
+  let prefix = &source[line_start..offset];
+  let trimmed_prefix = prefix.trim_start();
+  let trimmed_start = line_start + prefix.len() - trimmed_prefix.len();
+  if !trimmed_prefix.starts_with('<') || trimmed_prefix.contains('>') {
+    return None;
+  }
+
+  let tag_prefix = trimmed_prefix[1..].trim_start_matches('/');
+  if tag_prefix.contains(char::is_whitespace) {
+    return None;
+  }
+
+  Some(CompletionContext::BlockTag {
+    prefix: tag_prefix.to_owned(),
+    replace: ByteRange {
+      start: trimmed_start,
+      end: offset,
+    },
+  })
+}
+
+fn snippet_completion_item(
+  source: &str,
+  label: &str,
+  snippet: &str,
+  kind: CompletionItemKind,
+  replace: ByteRange,
+) -> CompletionItem {
+  CompletionItem {
+    label: label.to_owned(),
+    kind: Some(kind),
+    insert_text_format: Some(InsertTextFormat::SNIPPET),
+    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+      range: range_from_offsets(source, replace.start, replace.end),
+      new_text: snippet.to_owned(),
+    })),
+    ..CompletionItem::default()
+  }
+}
+
+fn plain_completion_item(
+  source: &str,
+  label: &str,
+  kind: CompletionItemKind,
+  replace: ByteRange,
+) -> CompletionItem {
+  CompletionItem {
+    label: label.to_owned(),
+    kind: Some(kind),
+    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+      range: range_from_offsets(source, replace.start, replace.end),
+      new_text: label.to_owned(),
+    })),
+    ..CompletionItem::default()
+  }
+}
+
+fn range_from_offsets(source: &str, start: usize, end: usize) -> Range {
+  Range::new(
+    position_from_byte_offset(source, start),
+    position_from_byte_offset(source, end),
+  )
+}
+
+fn position_from_byte_offset(source: &str, offset: usize) -> Position {
+  let mut line = 0u32;
+  let mut column = 0u32;
+
+  for (index, ch) in source.char_indices() {
+    if index >= offset {
+      break;
+    }
+    if ch == '\n' {
+      line += 1;
+      column = 0;
+    } else {
+      column += 1;
+    }
+  }
+
+  Position::new(line, column)
+}
+
+fn byte_offset_from_position(source: &str, position: Position) -> Option<usize> {
+  let mut current_line = 0u32;
+  let mut line_start = 0usize;
+
+  for line in source.split_inclusive('\n') {
+    let line_end = line_start + line.len();
+    if current_line == position.line {
+      let column = position.character as usize;
+      if column > line.len() {
+        return None;
+      }
+      return Some(line_start + column.min(line.trim_end_matches(['\r', '\n']).len()));
+    }
+    line_start = line_end;
+    current_line += 1;
+  }
+
+  (current_line == position.line && position.character == 0).then_some(source.len())
+}
+
+fn trim_ascii_whitespace_start(source: &str, start: usize, end: usize) -> usize {
+  let mut index = start;
+  while index < end && source.as_bytes()[index].is_ascii_whitespace() {
+    index += 1;
+  }
+  index
+}
+
+fn trim_ascii_whitespace_end(source: &str, start: usize, end: usize) -> usize {
+  let mut index = end;
+  while index > start && source.as_bytes()[index - 1].is_ascii_whitespace() {
+    index -= 1;
+  }
+  index
 }
 
 fn relative_path_from_uri(project_root: &Path, uri: &Url) -> Option<String> {
@@ -896,40 +1439,61 @@ fn references_for_manifest_file(
 
 async fn publish_project_diagnostics(
   client: &Client,
+  state: &Arc<RwLock<BackendState>>,
   project_root: &Path,
   artifacts: &ProjectArtifacts,
 ) -> Result<()> {
-  let mut diagnostics_by_file = BTreeMap::<Url, Vec<Diagnostic>>::new();
-
-  for diagnostic in &artifacts.diagnostics.diagnostics {
-    let Some(relative_path) = diagnostic.file_path.as_deref() else {
-      continue;
-    };
-    let file_url = file_url(project_root, relative_path)?;
-    diagnostics_by_file
-      .entry(file_url)
-      .or_default()
-      .push(to_lsp_diagnostic(diagnostic));
-  }
-
-  for relative_path in known_source_paths(&artifacts.manifest) {
-    let file_url = file_url(project_root, &relative_path)?;
-    diagnostics_by_file.entry(file_url).or_default();
-  }
-
-  for (uri, diagnostics) in diagnostics_by_file {
-    client.publish_diagnostics(uri, diagnostics, None).await;
-  }
+  let diagnostics_by_file = artifact_diagnostics_by_file(project_root, artifacts)?;
+  publish_diagnostic_batch(client, state, project_root, diagnostics_by_file).await;
 
   Ok(())
 }
 
 async fn publish_diagnostics_without_manifest(
   client: &Client,
+  state: &Arc<RwLock<BackendState>>,
   project_root: &Path,
   diagnostics: &ThebeDiagnosticsFile,
 ) -> Result<()> {
-  let mut diagnostics_by_file = BTreeMap::<Url, Vec<Diagnostic>>::new();
+  let diagnostics_by_file = diagnostics_by_file(project_root, diagnostics)?;
+  publish_diagnostic_batch(client, state, project_root, diagnostics_by_file).await;
+
+  Ok(())
+}
+
+async fn publish_diagnostic_batch(
+  client: &Client,
+  state: &Arc<RwLock<BackendState>>,
+  project_root: &Path,
+  diagnostics_by_file: DiagnosticsByFile,
+) {
+  let updates =
+    write_backend_state(state).coalesce_diagnostic_updates(project_root, diagnostics_by_file);
+
+  for (uri, diagnostics) in updates {
+    client.publish_diagnostics(uri, diagnostics, None).await;
+  }
+}
+
+fn artifact_diagnostics_by_file(
+  project_root: &Path,
+  artifacts: &ProjectArtifacts,
+) -> Result<DiagnosticsByFile> {
+  let mut diagnostics_by_file = diagnostics_by_file(project_root, &artifacts.diagnostics)?;
+
+  for relative_path in known_source_paths(&artifacts.manifest) {
+    let file_url = file_url(project_root, &relative_path)?;
+    diagnostics_by_file.entry(file_url).or_default();
+  }
+
+  Ok(diagnostics_by_file)
+}
+
+fn diagnostics_by_file(
+  project_root: &Path,
+  diagnostics: &ThebeDiagnosticsFile,
+) -> Result<DiagnosticsByFile> {
+  let mut diagnostics_by_file = DiagnosticsByFile::new();
 
   for diagnostic in &diagnostics.diagnostics {
     let Some(relative_path) = diagnostic.file_path.as_deref() else {
@@ -942,11 +1506,7 @@ async fn publish_diagnostics_without_manifest(
       .push(to_lsp_diagnostic(diagnostic));
   }
 
-  for (uri, diagnostics) in diagnostics_by_file {
-    client.publish_diagnostics(uri, diagnostics, None).await;
-  }
-
-  Ok(())
+  Ok(diagnostics_by_file)
 }
 
 fn known_source_paths(manifest: &ThebeManifest) -> Vec<String> {
@@ -1321,6 +1881,210 @@ mod tests {
   }
 
   #[test]
+  fn project_state_only_publishes_changed_diagnostics() {
+    let mut project_state = ProjectState::default();
+    let route_uri = Url::parse("file:///tmp/app/src/routes/index.trs").expect("valid route url");
+    let layout_uri =
+      Url::parse("file:///tmp/app/src/routes/_layout.trs").expect("valid layout url");
+    let diagnostic = Diagnostic {
+      range: full_document_range(),
+      severity: Some(DiagnosticSeverity::ERROR),
+      code: Some(NumberOrString::String("parse-error".to_owned())),
+      code_description: None,
+      source: Some("thebe/parser".to_owned()),
+      message: "parse error".to_owned(),
+      related_information: None,
+      tags: None,
+      data: None,
+    };
+
+    let first_updates = project_state.coalesce_diagnostic_updates(BTreeMap::from([
+      (route_uri.clone(), vec![diagnostic.clone()]),
+      (layout_uri.clone(), Vec::new()),
+    ]));
+    assert_eq!(first_updates.len(), 2);
+
+    let second_updates = project_state.coalesce_diagnostic_updates(BTreeMap::from([
+      (route_uri.clone(), vec![diagnostic.clone()]),
+      (layout_uri.clone(), Vec::new()),
+    ]));
+    assert!(second_updates.is_empty());
+
+    let third_updates =
+      project_state.coalesce_diagnostic_updates(BTreeMap::from([(layout_uri, Vec::new())]));
+    assert_eq!(third_updates.len(), 1);
+    assert_eq!(third_updates[0].0, route_uri);
+    assert!(third_updates[0].1.is_empty());
+  }
+
+  #[test]
+  fn template_binding_context_detects_binding_prefix() {
+    let source = "<main>{{ user.na }}</main>";
+    let offset = source.find("na").expect("binding prefix exists") + 2;
+
+    let context = template_binding_context(source, offset).expect("binding context");
+
+    assert_eq!(
+      context,
+      CompletionContext::TemplateBinding {
+        prefix: "user.na".to_owned(),
+        replace: ByteRange { start: 9, end: 16 },
+      }
+    );
+  }
+
+  #[test]
+  fn event_handler_context_detects_open_event_attribute() {
+    let source = r#"<button onclick="inc"></button>"#;
+    let offset = source.find("inc").expect("handler prefix exists") + 3;
+
+    let context = event_handler_context(source, offset).expect("event handler context");
+
+    assert_eq!(
+      context,
+      CompletionContext::EventHandler {
+        prefix: "inc".to_owned(),
+        replace: ByteRange { start: 17, end: 20 },
+      }
+    );
+  }
+
+  #[test]
+  fn block_tag_context_detects_top_level_block_prefix() {
+    let source = "<sc";
+    let offset = source.len();
+
+    let context = block_tag_context(source, offset).expect("block tag context");
+
+    assert_eq!(
+      context,
+      CompletionContext::BlockTag {
+        prefix: "sc".to_owned(),
+        replace: ByteRange { start: 0, end: 3 },
+      }
+    );
+  }
+
+  #[test]
+  fn event_handler_completion_items_use_current_script_functions() {
+    let document = DocumentContext {
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: r#"<script setup>
+struct Props {
+  count: i64,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props { count: 0 }
+}
+</script>
+
+<script lang="ts">
+function increment() {
+  return 1;
+}
+
+function decrement() {
+  return 0;
+}
+</script>
+
+<button onclick="inc"></button>
+"#
+      .to_owned(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: fixture_manifest(),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+
+    let items = event_handler_completion_items(&document, "inc", ByteRange { start: 0, end: 3 });
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].label, "increment");
+  }
+
+  #[test]
+  fn template_binding_completion_items_merge_cached_and_current_bindings() {
+    let document = DocumentContext {
+      relative_path: "src/routes/profile.trs".to_owned(),
+      source: "<main>{{ user }}</main>".to_owned(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: fixture_manifest(),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+
+    let items = template_binding_completion_items(&document, "u", ByteRange { start: 0, end: 1 });
+
+    assert!(items.iter().any(|item| item.label == "user"));
+    assert!(items.iter().any(|item| item.label == "username"));
+  }
+
+  #[test]
+  fn template_binding_completion_items_use_cached_template_symbols() {
+    let document = DocumentContext {
+      relative_path: "src/routes/profile.trs".to_owned(),
+      source: "<main>{{ profile.d }}</main>".to_owned(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: fixture_manifest(),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+
+    let items =
+      template_binding_completion_items(&document, "profile.d", ByteRange { start: 0, end: 9 });
+
+    assert!(
+      items
+        .iter()
+        .any(|item| item.label == "profile.display_name")
+    );
+  }
+
+  #[test]
+  fn template_binding_completion_items_use_current_props_fields() {
+    let document = DocumentContext {
+      relative_path: "src/routes/profile.trs".to_owned(),
+      source: r#"<script setup>
+struct Props {
+  user: User,
+  posts: Vec<Post>,
+}
+
+struct User {
+  name: String,
+}
+
+struct Post {
+  title: String,
+}
+</script>
+
+<main>{{ user.n }}</main>
+"#
+      .to_owned(),
+      cached_artifacts: None,
+    };
+
+    let items =
+      template_binding_completion_items(&document, "user.n", ByteRange { start: 0, end: 6 });
+
+    assert!(items.iter().any(|item| item.label == "user.name"));
+    assert!(!items.iter().any(|item| item.label == "posts.title"));
+  }
+
+  #[test]
   fn project_input_files_include_routes_and_shared_inputs() {
     let project_root = Path::new("/tmp/app");
 
@@ -1362,7 +2126,7 @@ mod tests {
 
   fn fixture_manifest() -> ThebeManifest {
     ThebeManifest {
-      version: 3,
+      version: 4,
       server_router_path: ".thebe/server/routes.rs".to_owned(),
       app_html: thebe_project::AppHtmlMetadata {
         source_path: Some("app.html".to_owned()),
@@ -1414,6 +2178,11 @@ mod tests {
         source_path: "src/routes/profile.trs".to_owned(),
         state_type: Some("crate::AppState".to_owned()),
         template_bindings: vec!["username".to_owned()],
+        template_symbols: vec![
+          "username".to_owned(),
+          "profile".to_owned(),
+          "profile.display_name".to_owned(),
+        ],
         template_binding_spans: vec![
           TemplateBindingMetadata {
             name: "username".to_owned(),

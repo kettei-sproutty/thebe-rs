@@ -9,6 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+thebe-analyzer = { path = "../thebe-analyzer" }
+thebe-codegen = { path = "../thebe-codegen" }
+thebe-parser = { path = "../thebe-parser" }
 thebe-project = { path = "../thebe-project" }
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "time"] }
 tower-lsp = "0.20"

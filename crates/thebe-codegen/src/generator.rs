@@ -85,6 +85,18 @@ pub struct RouteHandlerInfo {
   pub source_span: Option<SourceSpan>,
 }
 
+#[derive(Clone)]
+struct LocalNamedField {
+  name: String,
+  ty: Type,
+}
+
+#[derive(Default, Clone)]
+struct LocalTypeInfo {
+  field_types: Vec<Type>,
+  named_fields: Vec<LocalNamedField>,
+}
+
 #[derive(Clone, Copy)]
 struct ModuleLiterals<'a> {
   app_html: &'a str,
@@ -168,6 +180,40 @@ pub fn route_handler_info(blocks: &SfcBlocks) -> Result<RouteHandlerInfo, Codege
   })
 }
 
+/// Return completion-visible template symbols derived from route `Props`.
+///
+/// The returned paths are rooted at the template context itself, so a route
+/// with `struct Props { title: String, profile: Profile }` produces
+/// `title`, `profile`, and any nested dotted paths from local named structs
+/// such as `profile.display_name`.
+///
+/// # Errors
+///
+/// Returns [`CodegenError::TypeBridge`] when `<script setup>` Rust cannot be
+/// parsed for local type analysis.
+pub fn route_template_symbols(blocks: &SfcBlocks) -> Result<Vec<String>, CodegenError> {
+  let Some(setup) = blocks.script_setup.as_deref() else {
+    return Ok(Vec::new());
+  };
+
+  let local_type_infos = collect_local_type_infos(setup)?;
+  let Some(props) = local_type_infos.get("Props") else {
+    return Ok(Vec::new());
+  };
+
+  let mut symbols = Vec::new();
+  for field in &props.named_fields {
+    collect_template_visible_paths(
+      &field.name,
+      &field.ty,
+      &local_type_infos,
+      &mut symbols,
+      &mut BTreeSet::new(),
+    );
+  }
+
+  Ok(symbols)
+}
 /// Validate that `app.html` contains the required Thebe placeholders.
 ///
 /// A valid shell must contain exactly one `%thebe.head%` placeholder and
@@ -868,41 +914,19 @@ struct ExistingTypeAttrs {
 }
 
 fn collect_type_bridge_targets(code: &str) -> Result<BTreeSet<String>, CodegenError> {
-  let file = syn::parse_file(code).map_err(|err| {
-    CodegenError::TypeBridge(format!(
-      "failed to parse `<script setup>` for typed props export: {err}"
-    ))
-  })?;
+  let local_type_infos = collect_local_type_infos(code)?;
 
-  let mut local_type_fields: BTreeMap<String, Vec<Type>> = BTreeMap::new();
-  for item in file.items {
-    match item {
-      Item::Struct(item_struct) => {
-        local_type_fields.insert(
-          item_struct.ident.to_string(),
-          field_types(&item_struct.fields),
-        );
-      }
-      Item::Enum(item_enum) => {
-        let field_types = item_enum
-          .variants
-          .iter()
-          .flat_map(|variant| field_types(&variant.fields))
-          .collect();
-        local_type_fields.insert(item_enum.ident.to_string(), field_types);
-      }
-      _ => {}
-    }
-  }
-
-  if !local_type_fields.contains_key("Props") {
+  if !local_type_infos.contains_key("Props") {
     return Err(CodegenError::TypeBridge(
       "client routes must define `Props` in `<script setup>`".to_owned(),
     ));
   }
 
   let mut targets = BTreeSet::from([String::from("Props")]);
-  let mut pending = local_type_fields.get("Props").cloned().unwrap_or_default();
+  let mut pending = local_type_infos
+    .get("Props")
+    .map(|info| info.field_types.clone())
+    .unwrap_or_default();
 
   while let Some(ty) = pending.pop() {
     let mut references = BTreeSet::new();
@@ -912,7 +936,10 @@ fn collect_type_bridge_targets(code: &str) -> Result<BTreeSet<String>, CodegenEr
       if targets.contains(&reference) {
         continue;
       }
-      if let Some(field_types) = local_type_fields.get(&reference) {
+      if let Some(field_types) = local_type_infos
+        .get(&reference)
+        .map(|info| &info.field_types)
+      {
         targets.insert(reference.clone());
         pending.extend(field_types.iter().cloned());
       }
@@ -920,6 +947,46 @@ fn collect_type_bridge_targets(code: &str) -> Result<BTreeSet<String>, CodegenEr
   }
 
   Ok(targets)
+}
+
+fn collect_local_type_infos(code: &str) -> Result<BTreeMap<String, LocalTypeInfo>, CodegenError> {
+  let file = syn::parse_file(code).map_err(|err| {
+    CodegenError::TypeBridge(format!(
+      "failed to parse `<script setup>` for Props analysis: {err}"
+    ))
+  })?;
+
+  let mut local_type_infos = BTreeMap::new();
+  for item in file.items {
+    match item {
+      Item::Struct(item_struct) => {
+        local_type_infos.insert(
+          item_struct.ident.to_string(),
+          LocalTypeInfo {
+            field_types: field_types(&item_struct.fields),
+            named_fields: named_field_types(&item_struct.fields),
+          },
+        );
+      }
+      Item::Enum(item_enum) => {
+        let field_types = item_enum
+          .variants
+          .iter()
+          .flat_map(|variant| field_types(&variant.fields))
+          .collect();
+        local_type_infos.insert(
+          item_enum.ident.to_string(),
+          LocalTypeInfo {
+            field_types,
+            named_fields: Vec::new(),
+          },
+        );
+      }
+      _ => {}
+    }
+  }
+
+  Ok(local_type_infos)
 }
 
 fn field_types(fields: &Fields) -> Vec<Type> {
@@ -931,6 +998,89 @@ fn field_types(fields: &Fields) -> Vec<Type> {
       .map(|field| field.ty.clone())
       .collect(),
     Fields::Unit => Vec::new(),
+  }
+}
+
+fn named_field_types(fields: &Fields) -> Vec<LocalNamedField> {
+  match fields {
+    Fields::Named(fields) => fields
+      .named
+      .iter()
+      .filter_map(|field| {
+        Some(LocalNamedField {
+          name: field.ident.as_ref()?.to_string(),
+          ty: field.ty.clone(),
+        })
+      })
+      .collect(),
+    Fields::Unnamed(_) | Fields::Unit => Vec::new(),
+  }
+}
+
+fn collect_template_visible_paths(
+  prefix: &str,
+  ty: &Type,
+  local_type_infos: &BTreeMap<String, LocalTypeInfo>,
+  symbols: &mut Vec<String>,
+  active_types: &mut BTreeSet<String>,
+) {
+  if !symbols.iter().any(|symbol| symbol == prefix) {
+    symbols.push(prefix.to_owned());
+  }
+
+  let Some(local_type_name) = transparent_local_type_name(ty) else {
+    return;
+  };
+  let Some(type_info) = local_type_infos.get(&local_type_name) else {
+    return;
+  };
+  if !active_types.insert(local_type_name.clone()) {
+    return;
+  }
+
+  for field in &type_info.named_fields {
+    collect_template_visible_paths(
+      &format!("{prefix}.{}", field.name),
+      &field.ty,
+      local_type_infos,
+      symbols,
+      active_types,
+    );
+  }
+
+  active_types.remove(&local_type_name);
+}
+
+fn transparent_local_type_name(ty: &Type) -> Option<String> {
+  match ty {
+    Type::Group(group) => transparent_local_type_name(&group.elem),
+    Type::Paren(paren) => transparent_local_type_name(&paren.elem),
+    Type::Path(type_path) => {
+      if let Some(qself) = &type_path.qself {
+        return transparent_local_type_name(&qself.ty);
+      }
+
+      let last = type_path.path.segments.last()?;
+      match &last.arguments {
+        PathArguments::None => Some(last.ident.to_string()),
+        PathArguments::AngleBracketed(arguments)
+          if matches!(last.ident.to_string().as_str(), "Box" | "Option") =>
+        {
+          let mut nested_types = arguments.args.iter().filter_map(|argument| match argument {
+            GenericArgument::Type(inner) => Some(inner),
+            _ => None,
+          });
+          let inner = nested_types.next()?;
+          if nested_types.next().is_some() {
+            return None;
+          }
+          transparent_local_type_name(inner)
+        }
+        _ => None,
+      }
+    }
+    Type::Reference(reference) => transparent_local_type_name(&reference.elem),
+    _ => None,
   }
 }
 
@@ -1505,6 +1655,31 @@ mod tests {
     );
     assert_eq!(info.state_type.as_deref(), Some("crate::AppState"));
     assert!(info.source_span.is_none());
+  }
+
+  #[test]
+  fn route_template_symbols_expand_nested_local_props_fields() {
+    let blocks = SfcBlocks {
+      script_setup: Some(
+        "struct Props {\n    title: String,\n    profile: Profile,\n    maybe_profile: Option<Profile>,\n    posts: Vec<Post>,\n}\n\nstruct Profile {\n    display_name: String,\n}\n\nstruct Post {\n    title: String,\n}"
+          .to_owned(),
+      ),
+      ..SfcBlocks::default()
+    };
+
+    let symbols = route_template_symbols(&blocks).unwrap();
+
+    assert_eq!(
+      symbols,
+      vec![
+        "title",
+        "profile",
+        "profile.display_name",
+        "maybe_profile",
+        "maybe_profile.display_name",
+        "posts",
+      ]
+    );
   }
 
   #[test]
