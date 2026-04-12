@@ -14,8 +14,7 @@ pub fn handler() -> Props {
 <script lang="ts">
 function handleLogin(event: Event) {
     event.preventDefault();
-    console.log("Login form submitted");
-    const form = event.target;
+    const form = event.target as HTMLFormElement;
     const formData = new FormData(form);
     const username = formData.get("username");
     alert(`Welcome, ${username}! This is a placeholder login action.`);
