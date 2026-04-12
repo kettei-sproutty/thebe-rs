@@ -10,7 +10,11 @@ The goal is not to replace Axum with a separate platform. The goal is to keep Ru
 
 ## Status
 
-The project is in early design phase. The current target is Milestone 1: server-only SSR. The first proof point is intentionally small: compile a `.trs` route, run `thebe dev`, and serve static HTML from Rust.
+Thebe is past the server-only proof-of-concept stage. The repository already ships the core route pipeline: `.trs` parsing, SSR, scoped CSS, client hydration, generated `.thebe/` tooling artifacts, and a compiler-backed LSP.
+
+What is still missing is the rest of the editor and product surface: a tree-sitter grammar, a syntax highlighter, a packaged editor extension, richer LSP semantics, dynamic attribute bindings, and general component compilation.
+
+For a repo-accurate view of shipped versus planned work, see [docs/status.md](docs/status.md) and [docs/editor-tooling.md](docs/editor-tooling.md).
 
 ## Design Priorities
 
@@ -52,8 +56,6 @@ The Thebe compiler transforms each section independently and wires them together
 <script setup>
 use anyhow::Result;
 use reqwest::Client;
-// Explicit imports keep scope clear and IDEs happy
-use crate::components::Button;
 
 async fn fetch_title() -> Result<String> {
     let client = Client::new();
@@ -81,14 +83,14 @@ pub async fn handler() -> Props {
   }
 </script>
 
-<h1>{{ props.title }}</h1>
-<Button :onclick="increment">Increment</Button>
-<span>Counter: {{ props.counter }}</span>
+<h1>{{ title }}</h1>
+<button onclick="increment">Increment</button>
+<span>Counter: {{ counter }}</span>
 
 <form method="post" action="/submit">
   <!-- Standard forms are the canonical way to mutate server state -->
   <input type="text" name="update" />
-  <Button type="submit">Save</Button>
+  <button type="submit">Save</button>
 </form>
 
 <style>
@@ -114,11 +116,13 @@ async fn main() {
 Thebe's design strictly bounds complexity by keeping server code, client updates, and routing explicitly separated. Dive into the core concepts:
 
 - [Architecture & Parsing Strategy](docs/architecture.md)
+- [Current Status](docs/status.md)
+- [Editor Tooling & LSP](docs/editor-tooling.md)
 - [Syntax & File Semantics](docs/syntax-and-semantics.md)
 - [Routing & Axum Handlers](docs/routing-and-handlers.md)
 - [State & Reactivity](docs/state-and-reactivity.md)
 - [Forms & Server Mutations](docs/forms-and-mutations.md)
-- [Components & Slots](docs/components.md)
+- [Components & Slots (planned)](docs/components.md)
 - [Context-Aware Hydration](docs/hydration.md)
 
 ---
@@ -137,7 +141,7 @@ my-app/
 │   │   └── blog/
 │   │       ├── index.trs        →  GET /blog
 │   │       └── [slug].trs       →  GET /blog/:slug
-│   └── components/      # reusable components (no handlers)
+│   └── components/      # planned reusable components (not implemented yet)
 │       ├── Button.trs
 │       ├── Card.trs
 │       └── layout/
@@ -224,7 +228,7 @@ pub async fn handler(
 
 `<script lang="ts">` runs in the browser. `getProps<Props>()` reads the server-inlined JSON.
 
-Routes that include `<script lang="ts">` should keep `ts-rs = "12"` in the app's `Cargo.toml`. During `thebe dev`, Thebe writes all generated artifacts into `.thebe/`: `.thebe/server/routes.rs` exposes `thebe_routes()`, `.thebe/server/routes/**` contains the generated Rust modules, `.thebe/manifest.json` describes route/layout/generated-path metadata plus semantic facts like handler signatures, template bindings, and source spans, `.thebe/types/**` contains exported `Props` bindings, and `.thebe/client/**` mirrors each client script with a local `Props` import so editors have a concrete TypeScript project to read. `thebe check` complements that output with `.thebe/diagnostics.json`, a versioned diagnostics file that records project-level and file-level validation errors with relative paths and source spans.
+Routes that include `<script lang="ts">` should keep `ts-rs = "12"` in the app's `Cargo.toml`. During `thebe dev`, Thebe writes all generated artifacts into `.thebe/`: `.thebe/server/routes.rs` exposes `thebe_routes()`, `.thebe/server/routes/**` contains the generated Rust modules, `.thebe/manifest.json` describes route/layout/generated-path metadata plus semantic facts like handler signatures, template bindings, template symbols, and source spans, `.thebe/types/**` contains exported `Props` bindings, and `.thebe/client/**` mirrors each client script with a local `Props` import so editors have a concrete TypeScript project to read. `thebe check` complements that output with `.thebe/diagnostics.json`, a versioned diagnostics file that records project-level and file-level validation errors with relative paths and source spans.
 
 For **v0**, `getProps<Props>()` returns a deeply reactive Proxy object (like Vue 3's `reactive`). This gives deep mutation tracking for free, so you can write normal JavaScript without worrying about assignment rewriting or forced destructuring.
 
@@ -267,10 +271,10 @@ const label = derived(() => `Page ${props.counter} of 10`);
 
 The template section is plain HTML with `{{ expr }}` bindings. The compiler classifies each binding:
 
-- **Static** (`{{ props.title }}`): rendered server-side only, emitted as plain text
-- **Reactive** (`{{ props.counter }}`): rendered server-side with comment markers for fine-grained client hydration
+- **Static** (`{{ title }}`): rendered server-side only, emitted as plain text
+- **Reactive** (`{{ counter }}`): rendered server-side with comment markers for fine-grained client hydration
 
-*Note on Expression Boundaries:* For v0, `{{ expr }}` only supports **simple identifiers** and **property access** (e.g. `{{ props.user.name }}`). Complex logic (arithmetic, ternaries, function calls) must be pushed into `<script lang="ts">` using `derived()`.
+*Note on Expression Boundaries:* For v0, `{{ expr }}` only supports **simple identifiers** and **property access** (e.g. `{{ user.name }}`). Complex logic (arithmetic, ternaries, function calls) must be pushed into `<script lang="ts">` using `derived()`.
 
 ```html
 <!-- SSR output for reactive binding -->
@@ -300,9 +304,11 @@ Use a colon `:` prefix to bind an attribute to a JavaScript expression. Do not u
 
 ---
 
-## Components
+## Components (Planned)
 
-Files in `src/components/` have no `<script setup>` and no handlers. Instead, they use a strict `<script>` block to define server-side helpers and `Props`.
+General `src/components/**/*.trs` compilation is part of the intended Thebe model, but it is not implemented in the current compiler yet. Today the shipped composition primitive is route layouts via `_layout.trs`.
+
+The syntax below describes the target component model rather than a feature you can rely on today.
 
 ### Component Props (The `Props` trait)
 To define what a component accepts, declare a generic `Props` struct in a standard `<script>` block. This code is compiled into the server-side module for the component.
@@ -421,21 +427,16 @@ Because the router is a plain `axum::Router`, Tower middleware, WebSockets, stre
 thebe/
 ├── crates/
 │   ├── thebe-parser/       # .trs → SFC AST (block splitter)
-│   ├── thebe-analyzer/     # reactive var analysis from <script lang="ts">
-│   ├── thebe-template/     # template compiler → SSR string + hydration map
-│   ├── thebe-codegen/      # Rust handler + Axum route generation
+│   ├── thebe-analyzer/     # SWC-based client script analysis and event discovery
+│   ├── thebe-codegen/      # Rust handler generation, template metadata, typed props export glue
 │   ├── thebe-css/          # LightningCSS transform + style scoping
 │   ├── thebe-project/      # shared manifest/diagnostics generation + .thebe workspace refresh
-│   ├── thebe-macros/       # proc-macro: #[thebe::get], #[thebe::post], etc.
-│   ├── thebe-runtime/      # SSR render, Props injection, Axum re-export
-│   ├── thebe-cli/          # `thebe dev`, `thebe build`, FS scanner
+│   ├── thebe-runtime/      # SSR render and app shell assembly
+│   ├── thebe-cli/          # `thebe new`, `thebe dev`, `thebe check`
 │   └── thebe-lsp/          # `tower-lsp` server over `.thebe` manifest + diagnostics artifacts
 └── packages/
-    └── thebe-client/       # npm package: signals, hydration runtime, getProps
-        └── src/
-            ├── signals.ts  # signal / effect / computed (~50 lines, zero deps)
-            ├── hydrate.ts  # marker traversal + event wiring
-            └── runtime.ts  # getProps<T>(), derived()
+  └── thebe-client/       # browser runtime bundle embedded by codegen
+    └── runtime.js
 ```
 
 ---
@@ -443,24 +444,18 @@ thebe/
 ## Build Pipeline
 
 ```
-.trs file
+.trs route/layout
   │
-  ├── thebe-parser      →  SFC { script_setup, script_client, style, template }
-  │
-  ├── thebe-analyzer    →  ReactiveVars { reactive: Set, static: Set }
-  │       │
-  │  ┌────┴──────────────────────┐
-  │  ▼                           ▼
-  │  thebe-template          thebe-codegen (client)
-  │  SSR template string      signals + assignment rewrites → .js
-  │  + hydration map
-  │
-  ├── thebe-codegen (server)  →  async axum handler + register_routes()
-  │
-  └── thebe-css               →  scoped CSS output
+  ├── thebe-parser    →  SfcBlocks { head, script_setup, script_ts, style, template }
+  ├── thebe-codegen   →  handler metadata, Rust route modules, template metadata
+  ├── thebe-analyzer  →  client script analysis, TS stripping, event discovery
+  ├── thebe-css       →  scoped CSS and HTML scope attributes
+  ├── thebe-runtime   →  SSR template rendering and app shell assembly at request time
+  ├── thebe-project   →  `.thebe/manifest.json`, `.thebe/diagnostics.json`, `.thebe/client/**`, `.thebe/types/**`
+  └── thebe-lsp       →  diagnostics, navigation, and completions over those artifacts plus unsaved overlays
 ```
 
-  Not every stage is needed for Milestone 1. The first milestone only requires block extraction and server code generation.
+Current compilation support is route- and layout-focused. General component compilation and editor grammar tooling are still pending.
 
   ## Key Compiler Constraints
 
@@ -480,7 +475,7 @@ thebe/
   Today all generated artifacts are emitted into a generated `.thebe/` workspace:
   - `.thebe/server/routes.rs` is included by `src/main.rs` and exposes `thebe_routes()` for app composition.
   - `.thebe/server/routes/**` contains the generated Rust route modules.
-  - `.thebe/manifest.json` records route and layout metadata for tooling, including source files, generated artifact paths, handler signatures, template bindings, and source spans for direct editor navigation.
+  - `.thebe/manifest.json` records route and layout metadata for tooling, including source files, generated artifact paths, handler signatures, template bindings, template symbols, and source spans for direct editor navigation.
   - `.thebe/diagnostics.json` is written by `thebe check` and captures structured project/file diagnostics with relative source paths and source spans.
   - `.thebe/types/**` contains the exported `ts-rs` bindings for each client route's `Props` type.
   - `.thebe/client/**` contains a typed mirror of each `<script lang="ts">` block that imports its matching `Props` definition.
@@ -503,26 +498,24 @@ thebe/
 
 ---
 
-## MVP Implementation Plan
+## Current Status Snapshot
 
-**Milestone 1: The Basic Slice (Server Only)**
-- `thebe-parser`: Basic block extraction.
-- `thebe-codegen`: Wrap `<script setup>` into an async Axum handler.
-- *Goal*: Run `thebe dev` and see a static, Rust-generated HTML string in the browser.
+Shipped today:
 
-**Milestone 2: The Props Bridge**
-- Wire up minijinja for SSR templates.
-- Compile rust structs into `<script id="__thebe_props">` JSON in the response.
-- Inject `ts-rs` definition files for LSP autocomplete.
+- `.trs` parsing, SSR rendering, scoped CSS, layouts, app shells, and hydration markers.
+- Client `Props` bridging and generated TypeScript mirrors under `.thebe/`.
+- CLI flows for `thebe new`, `thebe dev`, `thebe dev --watch`, and `thebe check`.
+- `thebe-lsp` diagnostics, hover, document symbols, definition, references, and initial completions.
 
-**Milestone 3: JS Reactivity & Event Wiring**
-- `thebe-analyzer` pass to inject proxy behaviors.
-- Bundle `thebe-client` (alien-signals + recursive Proxy wrapping + basic event attacher).
+Still missing:
 
-**Milestone 4: Fine-grained Hydration**
-- Teach the template compiler to emit `<!--thebe:id-->` markers dynamically (accounting for table hoist behaviors).
-- `hydrate.ts` wires the `TextNode` UI references to the parsed proxies.
-- *Goal*: `onclick` events hydrate correctly and update `props.counter` without DOM repaints.
+- Tree-sitter and syntax-highlighting support for `.trs`.
+- A packaged editor extension and autostart story for `thebe-lsp`.
+- Richer LSP features such as attribute completions, component-aware completions, rename, code actions, formatting, and semantic tokens.
+- Dynamic `:class` and generic `:attr` bindings.
+- General standalone component compilation in `src/components/**`.
+
+The detailed breakdown lives in [docs/status.md](docs/status.md) and [docs/editor-tooling.md](docs/editor-tooling.md).
 
 ---
 

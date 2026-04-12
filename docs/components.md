@@ -1,5 +1,7 @@
 # Components
 
+> Status: general `src/components/**/*.trs` compilation is still planned. The shipped compiler path currently covers routes and `_layout.trs`. This page describes the intended component model, not a fully implemented feature.
+
 Components are reusable `.trs` files that live in the `src/components/` directory. They possess similar capabilities to route files but operate with stricter constraints to maintain application hygiene.
 
 ## The `<script>` Block

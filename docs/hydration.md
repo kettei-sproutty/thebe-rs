@@ -10,7 +10,7 @@ To prevent this, Thebe generates a **Hydration Anchor Matrix** based on the spec
 
 1. **Safe Contexts (Phrasing Content, Divs, Spans):**
    The compiler uses paired comment markers bounding a specific text node.
-   *Template:* `<span>{{ props.counter }}</span>`
+   *Template:* `<span>{{ counter }}</span>`
    *SSR Emit:* `<span><!--thebe:counter-->0<!--/thebe:counter--></span>`
 
 2. **Unsafe Contexts (Tables, Selects, Lists with strict whitespace):**
