@@ -21,30 +21,26 @@ This page tracks what is actually implemented in the repository today versus wha
   - `thebe dev`
   - `thebe dev --watch`
   - `thebe check`
-- `thebe-lsp` language server with diagnostics, hover, document symbols, definition, references, and initial completions.
+- `thebe-lsp` language server with diagnostics, semantic tokens, hover, document symbols, definition, references, rename, code actions, formatting, and richer completions.
+- Packaged editor assets under `packages/thebe-vscode/` and `packages/tree-sitter-thebe/`.
 
 ## Implemented, But Still Narrow
 
 - Template expressions are intentionally limited to simple identifiers and dotted field access.
-- Completion support currently focuses on route templates, not the full language surface.
-- Hover and definition for template bindings still operate at the binding-occurrence level rather than exact field definitions inside nested `Props` types.
-- Editor TypeScript support relies on generated `.thebe/client/**` mirrors instead of a dedicated editor extension.
+- The shipped formatter is structural and does not run embedded Rust, TypeScript, or CSS formatters.
+- Rename support is currently limited to route handlers and client event handlers.
+- The tree-sitter grammar is still an initial grammar rather than a full HTML-aware parser.
 
 ## Planned Or Missing
 
 - General `src/components/**/*.trs` compilation is still planned. The shipped compiler path currently covers routes and `_layout.trs`, not standalone components.
 - Named slot composition outside route layouts is still planned.
-- Tree-sitter grammar for `.trs`.
-- Syntax highlighting grammar for editors.
-- Packaged editor extension and auto-launch story for `thebe-lsp`.
 - Template attribute support for dynamic `:class` and generic `:attr` bindings.
-- Richer completions for attributes, directives, component tags, and component props.
-- Rename, code actions, formatting, and semantic tokens in the LSP.
 - A dedicated `thebe build` production build flow.
 
 ## Reading The Docs Safely
 
 Some pages in this doc set describe the intended Thebe model, not only the shipped implementation. When in doubt:
 
-- routes, layouts, SSR, hydration, scoped CSS, `.thebe` artifacts, and the current LSP are real
-- generic components, polished syntax highlighting, and a full editor extension are not shipped yet
+- routes, layouts, SSR, hydration, scoped CSS, `.thebe` artifacts, the current LSP, and the initial editor extension assets are real
+- generic standalone component compilation and runtime dynamic attribute support are not shipped yet

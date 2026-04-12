@@ -10,9 +10,9 @@ The goal is not to replace Axum with a separate platform. The goal is to keep Ru
 
 ## Status
 
-Thebe is past the server-only proof-of-concept stage. The repository already ships the core route pipeline: `.trs` parsing, SSR, scoped CSS, client hydration, generated `.thebe/` tooling artifacts, and a compiler-backed LSP.
+Thebe is past the server-only proof-of-concept stage. The repository already ships the core route pipeline: `.trs` parsing, SSR, scoped CSS, client hydration, generated `.thebe/` tooling artifacts, a compiler-backed LSP, and initial editor packages for VS Code and tree-sitter.
 
-What is still missing is the rest of the editor and product surface: a tree-sitter grammar, a syntax highlighter, a packaged editor extension, richer LSP semantics, dynamic attribute bindings, and general component compilation.
+What is still missing is the rest of the runtime and product surface: dynamic attribute bindings, general component compilation, and deeper polish on the initial editor packages.
 
 For a repo-accurate view of shipped versus planned work, see [docs/status.md](docs/status.md) and [docs/editor-tooling.md](docs/editor-tooling.md).
 
@@ -505,15 +505,14 @@ Shipped today:
 - `.trs` parsing, SSR rendering, scoped CSS, layouts, app shells, and hydration markers.
 - Client `Props` bridging and generated TypeScript mirrors under `.thebe/`.
 - CLI flows for `thebe new`, `thebe dev`, `thebe dev --watch`, and `thebe check`.
-- `thebe-lsp` diagnostics, hover, document symbols, definition, references, and initial completions.
+- `thebe-lsp` diagnostics, semantic tokens, hover, document symbols, definition, references, rename, code actions, formatting, and richer completions.
+- Packaged editor assets under `packages/thebe-vscode/` and `packages/tree-sitter-thebe/`.
 
 Still missing:
 
-- Tree-sitter and syntax-highlighting support for `.trs`.
-- A packaged editor extension and autostart story for `thebe-lsp`.
-- Richer LSP features such as attribute completions, component-aware completions, rename, code actions, formatting, and semantic tokens.
 - Dynamic `:class` and generic `:attr` bindings.
 - General standalone component compilation in `src/components/**`.
+- Deeper polish on the initial formatter, rename surface, and tree-sitter grammar.
 
 The detailed breakdown lives in [docs/status.md](docs/status.md) and [docs/editor-tooling.md](docs/editor-tooling.md).
 

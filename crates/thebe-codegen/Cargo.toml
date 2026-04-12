@@ -7,6 +7,8 @@ edition = "2024"
 thebe-parser = { path = "../thebe-parser" }
 thebe-analyzer = { path = "../thebe-analyzer" }
 thebe-css = { path = "../thebe-css" }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
 syn = { version = "2", features = ["full"] }
 thiserror = { workspace = true }
 

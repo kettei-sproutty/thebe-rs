@@ -6,21 +6,28 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use thebe_parser::SfcBlocks;
 use thebe_project::{
-  EditorRefresh, LayoutMetadata, ProjectArtifacts, ProjectOverlay, RouteMetadata,
-  SourceSpanMetadata, THEBE_DIAGNOSTICS_FILE, THEBE_MANIFEST_FILE, TemplateBindingMetadata,
-  ThebeDiagnostic, ThebeDiagnosticsFile, ThebeManifest,
+  ComponentMetadata, ComponentPropMetadata, EditorRefresh, LayoutMetadata, ProjectArtifacts,
+  ProjectOverlay, RouteMetadata, SourceSpanMetadata, THEBE_DIAGNOSTICS_FILE,
+  THEBE_MANIFEST_FILE, TemplateBindingMetadata, TemplateSymbolMetadata, ThebeDiagnostic,
+  ThebeDiagnosticsFile, ThebeManifest,
 };
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::{
-  CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-  CompletionTextEdit, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
-  DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbol,
-  DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-  Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+  CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+  CodeActionProviderCapability, CompletionItem, CompletionItemKind, CompletionOptions,
+  CompletionParams, CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
+  DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+  DidSaveTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
+  DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+  HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
   InsertTextFormat, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
-  Position, Range, ReferenceParams, ServerCapabilities, ServerInfo, SymbolKind,
-  TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-  TextDocumentSyncSaveOptions, TextEdit, Url,
+  Position, PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams,
+  SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
+  SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+  SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+  ServerCapabilities, ServerInfo, SymbolKind, TextDocumentSyncCapability,
+  TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
+  WorkspaceEdit,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -29,7 +36,30 @@ const CHANGE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
 type DiagnosticsByFile = BTreeMap<Url, Vec<Diagnostic>>;
 type DiagnosticPublishBatch = Vec<(Url, Vec<Diagnostic>)>;
 
-const COMPLETION_TRIGGER_CHARACTERS: &[&str] = &["<", "{", ".", "\""];
+const COMPLETION_TRIGGER_CHARACTERS: &[&str] = &["<", "{", ".", "\"", ":", "/"];
+const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
+  SemanticTokenType::CLASS,
+  SemanticTokenType::FUNCTION,
+  SemanticTokenType::KEYWORD,
+  SemanticTokenType::PROPERTY,
+  SemanticTokenType::VARIABLE,
+];
+const SEMANTIC_TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[];
+const TOKEN_TYPE_CLASS: u32 = 0;
+const TOKEN_TYPE_FUNCTION: u32 = 1;
+const TOKEN_TYPE_KEYWORD: u32 = 2;
+const TOKEN_TYPE_PROPERTY: u32 = 3;
+const TOKEN_TYPE_VARIABLE: u32 = 4;
+const EVENT_ATTRIBUTE_COMPLETIONS: &[&str] = &[
+  "onclick",
+  "onchange",
+  "oninput",
+  "onsubmit",
+  "onkeydown",
+  "onkeyup",
+  "onfocus",
+  "onblur",
+];
 
 #[derive(Debug, Default)]
 struct OpenDocuments {
@@ -174,6 +204,7 @@ struct ProjectSnapshot {
 
 #[derive(Debug, Clone)]
 struct DocumentContext {
+  project_root: PathBuf,
   relative_path: String,
   source: String,
   cached_artifacts: Option<ProjectArtifacts>,
@@ -188,8 +219,27 @@ struct ByteRange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CompletionContext {
   BlockTag { prefix: String, replace: ByteRange },
+  ComponentTag { prefix: String, replace: ByteRange },
+  AttributeName {
+    tag_name: String,
+    prefix: String,
+    replace: ByteRange,
+  },
   TemplateBinding { prefix: String, replace: ByteRange },
   EventHandler { prefix: String, replace: ByteRange },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComponentImport {
+  module_path: String,
+  tag_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticTokenSpan {
+  end: usize,
+  start: usize,
+  token_type: u32,
 }
 
 #[derive(Debug, Default)]
@@ -417,6 +467,7 @@ impl Backend {
       .map(|(_, artifacts)| artifacts);
 
     Some(DocumentContext {
+      project_root,
       relative_path,
       source,
       cached_artifacts,
@@ -521,6 +572,12 @@ impl LanguageServer for Backend {
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+          prepare_provider: Some(true),
+          work_done_progress_options: Default::default(),
+        })),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+        document_formatting_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
           resolve_provider: Some(false),
           trigger_characters: Some(
@@ -531,6 +588,17 @@ impl LanguageServer for Backend {
           ),
           ..CompletionOptions::default()
         }),
+        semantic_tokens_provider: Some(
+          SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+            legend: SemanticTokensLegend {
+              token_types: SEMANTIC_TOKEN_TYPES.to_vec(),
+              token_modifiers: SEMANTIC_TOKEN_MODIFIERS.to_vec(),
+            },
+            full: Some(SemanticTokensFullOptions::Bool(true)),
+            range: None,
+            work_done_progress_options: Default::default(),
+          }),
+        ),
         text_document_sync: Some(TextDocumentSyncCapability::Options(
           TextDocumentSyncOptions {
             open_close: Some(true),
@@ -627,16 +695,17 @@ impl LanguageServer for Backend {
 
   async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
     let uri = &params.text_document_position_params.text_document.uri;
-    let Some((project_root, artifacts)) = self.load_or_refresh_artifacts(uri) else {
+    let Some(document) = self.document_context(uri) else {
       return Ok(None);
     };
-    let Some(relative_path) = relative_path_from_uri(&project_root, uri) else {
+    let Some(artifacts) = document.cached_artifacts.as_ref() else {
       return Ok(None);
     };
 
-    Ok(hover_for_manifest_file(
+    Ok(hover_for_document(
+      &document.source,
       &artifacts.manifest,
-      &relative_path,
+      &document.relative_path,
       params.text_document_position_params.position,
     ))
   }
@@ -646,16 +715,17 @@ impl LanguageServer for Backend {
     params: DocumentSymbolParams,
   ) -> LspResult<Option<DocumentSymbolResponse>> {
     let uri = &params.text_document.uri;
-    let Some((project_root, artifacts)) = self.load_or_refresh_artifacts(uri) else {
+    let Some(document) = self.document_context(uri) else {
       return Ok(None);
     };
-    let Some(relative_path) = relative_path_from_uri(&project_root, uri) else {
+    let Some(artifacts) = document.cached_artifacts.as_ref() else {
       return Ok(None);
     };
 
-    Ok(document_symbols_for_manifest_file(
+    Ok(document_symbols_for_document(
+      &document.source,
       &artifacts.manifest,
-      &relative_path,
+      &document.relative_path,
     ))
   }
 
@@ -664,17 +734,18 @@ impl LanguageServer for Backend {
     params: GotoDefinitionParams,
   ) -> LspResult<Option<GotoDefinitionResponse>> {
     let uri = &params.text_document_position_params.text_document.uri;
-    let Some((project_root, artifacts)) = self.load_or_refresh_artifacts(uri) else {
+    let Some(document) = self.document_context(uri) else {
       return Ok(None);
     };
-    let Some(relative_path) = relative_path_from_uri(&project_root, uri) else {
+    let Some(artifacts) = document.cached_artifacts.as_ref() else {
       return Ok(None);
     };
 
-    definition_for_manifest_file(
-      &project_root,
+    definition_for_document(
+      &document.project_root,
+      &document.source,
       &artifacts.manifest,
-      &relative_path,
+      &document.relative_path,
       params.text_document_position_params.position,
     )
     .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())
@@ -682,21 +753,80 @@ impl LanguageServer for Backend {
 
   async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
     let uri = &params.text_document_position.text_document.uri;
-    let Some((project_root, artifacts)) = self.load_or_refresh_artifacts(uri) else {
+    let Some(document) = self.document_context(uri) else {
       return Ok(None);
     };
-    let Some(relative_path) = relative_path_from_uri(&project_root, uri) else {
+    let Some(artifacts) = document.cached_artifacts.as_ref() else {
       return Ok(None);
     };
 
-    references_for_manifest_file(
-      &project_root,
+    references_for_document(
+      &document.project_root,
+      &document.source,
       &artifacts.manifest,
-      &relative_path,
+      &document.relative_path,
       params.text_document_position.position,
       params.context.include_declaration,
     )
     .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())
+  }
+
+  async fn prepare_rename(
+    &self,
+    params: tower_lsp::lsp_types::TextDocumentPositionParams,
+  ) -> LspResult<Option<PrepareRenameResponse>> {
+    let uri = &params.text_document.uri;
+    let Some(document) = self.document_context(uri) else {
+      return Ok(None);
+    };
+
+    Ok(prepare_rename_for_document(&document, params.position))
+  }
+
+  async fn rename(&self, params: RenameParams) -> LspResult<Option<WorkspaceEdit>> {
+    let uri = &params.text_document_position.text_document.uri;
+    let Some(document) = self.document_context(uri) else {
+      return Ok(None);
+    };
+
+    Ok(rename_for_document(
+      &document,
+      params.text_document_position.position,
+      &params.new_name,
+    ))
+  }
+
+  async fn code_action(
+    &self,
+    params: CodeActionParams,
+  ) -> LspResult<Option<Vec<CodeActionOrCommand>>> {
+    let uri = &params.text_document.uri;
+    let Some(document) = self.document_context(uri) else {
+      return Ok(None);
+    };
+
+    Ok(code_actions_for_document(&document, &params))
+  }
+
+  async fn formatting(&self, params: DocumentFormattingParams) -> LspResult<Option<Vec<TextEdit>>> {
+    let uri = &params.text_document.uri;
+    let Some(document) = self.document_context(uri) else {
+      return Ok(None);
+    };
+
+    Ok(format_document(&document))
+  }
+
+  async fn semantic_tokens_full(
+    &self,
+    params: SemanticTokensParams,
+  ) -> LspResult<Option<SemanticTokensResult>> {
+    let uri = &params.text_document.uri;
+    let Some(document) = self.document_context(uri) else {
+      return Ok(None);
+    };
+
+    Ok(semantic_tokens_for_document(&document).map(SemanticTokensResult::Tokens))
   }
 }
 
@@ -733,7 +863,9 @@ fn is_project_input_file(project_root: &Path, path: &Path) -> bool {
   }
 
   let routes_dir = project_root.join("src/routes");
-  path.starts_with(&routes_dir) && path.extension().is_some_and(|ext| ext == "trs")
+  let components_dir = project_root.join("src/components");
+  (path.starts_with(&routes_dir) || path.starts_with(&components_dir))
+    && path.extension().is_some_and(|ext| ext == "trs")
 }
 
 fn classify_completion_context(source: &str, position: Position) -> Option<CompletionContext> {
@@ -741,6 +873,8 @@ fn classify_completion_context(source: &str, position: Position) -> Option<Compl
 
   event_handler_context(source, offset)
     .or_else(|| template_binding_context(source, offset))
+    .or_else(|| attribute_name_context(source, offset))
+    .or_else(|| component_tag_context(source, offset))
     .or_else(|| block_tag_context(source, offset))
 }
 
@@ -750,8 +884,16 @@ fn completion_items_for_context(
 ) -> Vec<CompletionItem> {
   match context {
     CompletionContext::BlockTag { prefix, replace } => {
-      block_completion_items(&document.source, prefix, *replace)
+      block_completion_items(document, prefix, *replace)
     }
+    CompletionContext::ComponentTag { prefix, replace } => {
+      component_tag_completion_items(document, prefix, *replace)
+    }
+    CompletionContext::AttributeName {
+      tag_name,
+      prefix,
+      replace,
+    } => attribute_completion_items(document, tag_name, prefix, *replace),
     CompletionContext::TemplateBinding { prefix, replace } => {
       template_binding_completion_items(document, prefix, *replace)
     }
@@ -761,25 +903,40 @@ fn completion_items_for_context(
   }
 }
 
-fn block_completion_items(source: &str, prefix: &str, replace: ByteRange) -> Vec<CompletionItem> {
-  let blocks = parse_source_blocks(source).ok();
-  [
-    (
-      "head",
-      "<head>\n  $0\n</head>",
+fn block_completion_items(
+  document: &DocumentContext,
+  prefix: &str,
+  replace: ByteRange,
+) -> Vec<CompletionItem> {
+  let blocks = parse_document_blocks(document).ok();
+  let mut items = vec![(
+    "head",
+    "<head>\n  $0\n</head>",
+    CompletionItemKind::SNIPPET,
+    blocks
+      .as_ref()
+      .is_none_or(|blocks| blocks.head_span.is_none()),
+  )];
+
+  if is_component_path(&document.relative_path) {
+    items.push((
+      "script",
+      "<script>\n$0\n</script>",
       CompletionItemKind::SNIPPET,
-      blocks
-        .as_ref()
-        .is_none_or(|blocks| blocks.head_span.is_none()),
-    ),
-    (
+      blocks.as_ref().is_none_or(|blocks| blocks.script_span.is_none()),
+    ));
+  } else {
+    items.push((
       "script setup",
       "<script setup>\n$0\n</script>",
       CompletionItemKind::SNIPPET,
       blocks
         .as_ref()
         .is_none_or(|blocks| blocks.script_setup_span.is_none()),
-    ),
+    ));
+  }
+
+  items.extend([
     (
       "script lang=\"ts\"",
       "<script lang=\"ts\">\n$0\n</script>",
@@ -796,11 +953,100 @@ fn block_completion_items(source: &str, prefix: &str, replace: ByteRange) -> Vec
         .as_ref()
         .is_none_or(|blocks| blocks.style_span.is_none()),
     ),
-  ]
+  ]);
+
+  items
   .into_iter()
   .filter(|(label, _, _, enabled)| *enabled && label.starts_with(prefix))
-  .map(|(label, snippet, kind, _)| snippet_completion_item(source, label, snippet, kind, replace))
+  .map(|(label, snippet, kind, _)| {
+    snippet_completion_item(&document.source, label, snippet, kind, replace)
+  })
   .collect()
+}
+
+fn component_tag_completion_items(
+  document: &DocumentContext,
+  prefix: &str,
+  replace: ByteRange,
+) -> Vec<CompletionItem> {
+  let mut imports = current_component_imports(document);
+  imports.sort_by(|left, right| left.tag_name.cmp(&right.tag_name));
+  imports.dedup_by(|left, right| left.tag_name == right.tag_name);
+
+  imports
+    .into_iter()
+    .filter(|component| component.tag_name.starts_with(prefix))
+    .map(|component| CompletionItem {
+      label: component.tag_name.clone(),
+      kind: Some(CompletionItemKind::CLASS),
+      detail: Some(component.module_path),
+      text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+        range: range_from_offsets(&document.source, replace.start, replace.end),
+        new_text: component.tag_name,
+      })),
+      ..CompletionItem::default()
+    })
+    .collect()
+}
+
+fn attribute_completion_items(
+  document: &DocumentContext,
+  tag_name: &str,
+  prefix: &str,
+  replace: ByteRange,
+) -> Vec<CompletionItem> {
+  let mut items = vec![
+    snippet_completion_item(
+      &document.source,
+      ":if",
+      ":if=\"$1\"",
+      CompletionItemKind::KEYWORD,
+      replace,
+    ),
+    snippet_completion_item(
+      &document.source,
+      ":class",
+      ":class=\"$1\"",
+      CompletionItemKind::KEYWORD,
+      replace,
+    ),
+    snippet_completion_item(
+      &document.source,
+      ":attr",
+      ":${1:attr}=\"$2\"",
+      CompletionItemKind::SNIPPET,
+      replace,
+    ),
+  ];
+
+  items.extend(EVENT_ATTRIBUTE_COMPLETIONS.iter().map(|attribute| {
+    snippet_completion_item(
+      &document.source,
+      attribute,
+      &format!("{attribute}=\"$1\""),
+      CompletionItemKind::EVENT,
+      replace,
+    )
+  }));
+
+  if let Some(component) = component_metadata_for_tag(document, tag_name) {
+    items.extend(component.props.iter().map(|prop| CompletionItem {
+      label: format!(":{}", prop.name),
+      kind: Some(CompletionItemKind::PROPERTY),
+      detail: Some(prop.type_name.clone()),
+      insert_text_format: Some(InsertTextFormat::SNIPPET),
+      text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+        range: range_from_offsets(&document.source, replace.start, replace.end),
+        new_text: format!(":{}=\"$1\"", prop.name),
+      })),
+      ..CompletionItem::default()
+    }));
+  }
+
+  items
+    .into_iter()
+    .filter(|item| item.label.starts_with(prefix))
+    .collect()
 }
 
 fn template_binding_completion_items(
@@ -856,7 +1102,23 @@ fn current_template_symbols(document: &DocumentContext) -> Vec<String> {
     .map(|artifacts| template_symbols_for_path(&artifacts.manifest, &document.relative_path))
     .unwrap_or_default();
 
-  if let Ok(blocks) = parse_source_blocks(&document.source) {
+  if is_component_path(&document.relative_path) {
+    if let Ok(blocks) = parse_component_source_blocks(&document.source) {
+      if let Some(script) = blocks.script.as_deref()
+        && let Ok(current_symbols) = thebe_codegen::props_symbol_definitions(script)
+      {
+        symbols.extend(
+          current_symbols
+            .into_iter()
+            .map(|definition| format!("props.{}", definition.path)),
+        );
+      }
+
+      if let Ok(current_bindings) = thebe_codegen::list_template_bindings(&blocks.template) {
+        symbols.extend(current_bindings);
+      }
+    }
+  } else if let Ok(blocks) = parse_source_blocks(&document.source) {
     if let Ok(current_symbols) = thebe_codegen::route_template_symbols(&blocks) {
       symbols.extend(current_symbols);
     }
@@ -870,7 +1132,7 @@ fn current_template_symbols(document: &DocumentContext) -> Vec<String> {
 }
 
 fn current_event_handlers(document: &DocumentContext) -> Vec<String> {
-  let Ok(blocks) = parse_source_blocks(&document.source) else {
+  let Ok(blocks) = parse_document_blocks(document) else {
     return Vec::new();
   };
   let Some(script_ts) = blocks.script_ts.as_deref() else {
@@ -901,11 +1163,39 @@ fn template_symbols_for_path(manifest: &ThebeManifest, relative_path: &str) -> V
     return layout.template_bindings.clone();
   }
 
+  if let Some(component) = manifest
+    .components
+    .iter()
+    .find(|component| component.source_path == relative_path)
+  {
+    return component
+      .prop_names
+      .iter()
+      .map(|name| format!("props.{name}"))
+      .collect();
+  }
+
   Vec::new()
 }
 
 fn parse_source_blocks(source: &str) -> std::result::Result<SfcBlocks, thebe_parser::ParseError> {
   thebe_parser::parse_sfc(source)
+}
+
+fn parse_component_source_blocks(
+  source: &str,
+) -> std::result::Result<SfcBlocks, thebe_parser::ParseError> {
+  thebe_parser::parse_component_sfc(source)
+}
+
+fn parse_document_blocks(
+  document: &DocumentContext,
+) -> std::result::Result<SfcBlocks, thebe_parser::ParseError> {
+  if is_component_path(&document.relative_path) {
+    parse_component_source_blocks(&document.source)
+  } else {
+    parse_source_blocks(&document.source)
+  }
 }
 
 fn template_binding_context(source: &str, offset: usize) -> Option<CompletionContext> {
@@ -1027,6 +1317,113 @@ fn open_attribute_value(tag_prefix: &str) -> Option<(String, usize)> {
   None
 }
 
+fn attribute_name_context(source: &str, offset: usize) -> Option<CompletionContext> {
+  let tag_start = source[..offset].rfind('<')?;
+  if source[..offset]
+    .rfind('>')
+    .is_some_and(|end| end > tag_start)
+  {
+    return None;
+  }
+
+  let tag_prefix = &source[tag_start..offset];
+  if open_attribute_value(tag_prefix).is_some() {
+    return None;
+  }
+
+  let (tag_name, tag_name_end) = open_tag_name(tag_prefix)?;
+  let after_tag_name = &tag_prefix[tag_name_end..];
+  if !after_tag_name.contains(char::is_whitespace) && !after_tag_name.is_empty() {
+    return None;
+  }
+
+  let (prefix, start) = current_attribute_name_prefix(tag_prefix, tag_name_end)?;
+  Some(CompletionContext::AttributeName {
+    tag_name,
+    prefix,
+    replace: ByteRange {
+      start: tag_start + start,
+      end: offset,
+    },
+  })
+}
+
+fn component_tag_context(source: &str, offset: usize) -> Option<CompletionContext> {
+  let tag_start = source[..offset].rfind('<')?;
+  if source[..offset]
+    .rfind('>')
+    .is_some_and(|end| end > tag_start)
+  {
+    return None;
+  }
+
+  let tag_prefix = &source[tag_start..offset];
+  let trimmed = tag_prefix[1..].trim_start_matches('/');
+  if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+    return None;
+  }
+  if !trimmed.chars().next()?.is_ascii_uppercase() {
+    return None;
+  }
+
+  Some(CompletionContext::ComponentTag {
+    prefix: trimmed.to_owned(),
+    replace: ByteRange {
+      start: offset - trimmed.len(),
+      end: offset,
+    },
+  })
+}
+
+fn open_tag_name(tag_prefix: &str) -> Option<(String, usize)> {
+  let bytes = tag_prefix.as_bytes();
+  let mut idx = 1usize;
+
+  if bytes.get(idx).is_some_and(|byte| *byte == b'/') {
+    idx += 1;
+  }
+  while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+    idx += 1;
+  }
+
+  let start = idx;
+  while idx < bytes.len()
+    && (bytes[idx].is_ascii_alphanumeric() || matches!(bytes[idx], b':' | b'-' | b'_'))
+  {
+    idx += 1;
+  }
+
+  (start < idx).then(|| (tag_prefix[start..idx].to_owned(), idx))
+}
+
+fn current_attribute_name_prefix(tag_prefix: &str, tag_name_end: usize) -> Option<(String, usize)> {
+  let bytes = tag_prefix.as_bytes();
+  let mut idx = bytes.len();
+
+  while idx > tag_name_end && bytes[idx - 1].is_ascii_whitespace() {
+    idx -= 1;
+  }
+
+  if idx == tag_name_end {
+    return Some((String::new(), bytes.len()));
+  }
+
+  let mut start = idx;
+  while start > tag_name_end
+    && !bytes[start - 1].is_ascii_whitespace()
+    && bytes[start - 1] != b'<'
+  {
+    start -= 1;
+  }
+
+  let token = &tag_prefix[start..idx];
+  if token.contains('=') || token.ends_with('"') || token.ends_with('\'') {
+    return Some((String::new(), bytes.len()));
+  }
+
+  Some((token.to_owned(), start))
+}
+
 fn block_tag_context(source: &str, offset: usize) -> Option<CompletionContext> {
   let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
   let prefix = &source[line_start..offset];
@@ -1048,6 +1445,77 @@ fn block_tag_context(source: &str, offset: usize) -> Option<CompletionContext> {
       end: offset,
     },
   })
+}
+
+fn is_component_path(relative_path: &str) -> bool {
+  relative_path.starts_with("src/components/") && relative_path.ends_with(".trs")
+}
+
+fn current_component_imports(document: &DocumentContext) -> Vec<ComponentImport> {
+  let mut imports = Vec::new();
+
+  if !is_component_path(&document.relative_path)
+    && let Ok(blocks) = parse_source_blocks(&document.source)
+    && let Some(script_setup) = blocks.script_setup.as_deref()
+  {
+    for line in script_setup.lines() {
+      let line = line.trim();
+      if !line.starts_with("use ") || !line.ends_with(';') || !line.contains("crate::components::")
+      {
+        continue;
+      }
+
+      let import = line.trim_start_matches("use ").trim_end_matches(';').trim();
+      if import.contains('{') {
+        continue;
+      }
+
+      let (module_path, tag_name) = if let Some((path, alias)) = import.split_once(" as ") {
+        (path.trim().to_owned(), alias.trim().to_owned())
+      } else {
+        let Some(tag_name) = import.rsplit("::").next() else {
+          continue;
+        };
+        (import.to_owned(), tag_name.to_owned())
+      };
+
+      imports.push(ComponentImport {
+        module_path,
+        tag_name,
+      });
+    }
+  }
+
+  if imports.is_empty()
+    && let Some(artifacts) = document.cached_artifacts.as_ref()
+  {
+    imports.extend(artifacts.manifest.components.iter().map(|component| ComponentImport {
+      module_path: component.module_path.clone(),
+      tag_name: component.tag_name.clone(),
+    }));
+  }
+
+  imports
+}
+
+fn component_metadata_for_tag<'a>(
+  document: &'a DocumentContext,
+  tag_name: &str,
+) -> Option<&'a ComponentMetadata> {
+  let manifest = &document.cached_artifacts.as_ref()?.manifest;
+  let imports = current_component_imports(document);
+
+  if let Some(imported) = imports.iter().find(|component| component.tag_name == tag_name) {
+    return manifest
+      .components
+      .iter()
+      .find(|component| component.module_path == imported.module_path);
+  }
+
+  manifest
+    .components
+    .iter()
+    .find(|component| component.tag_name == tag_name)
 }
 
 fn snippet_completion_item(
@@ -1159,7 +1627,8 @@ fn relative_path_from_uri(project_root: &Path, uri: &Url) -> Option<String> {
   )
 }
 
-fn hover_for_manifest_file(
+fn hover_for_document(
+  source: &str,
   manifest: &ThebeManifest,
   relative_path: &str,
   position: Position,
@@ -1180,6 +1649,12 @@ fn hover_for_manifest_file(
       .iter()
       .find(|binding| position_in_span(position, &binding.source_span))
     {
+      if let Some(path_match) = binding_path_match_at_position(source, binding, position)
+        && let Some(definition) = template_symbol_definition(route, &path_match.path)
+      {
+        return Some(template_symbol_hover(definition, path_match.range(source)));
+      }
+
       return Some(binding_hover(
         binding,
         &format!("Route `{}`", route.route_path),
@@ -1202,10 +1677,23 @@ fn hover_for_manifest_file(
     ));
   }
 
+  if let Some(component) = manifest
+    .components
+    .iter()
+    .find(|component| component.source_path == relative_path)
+    && let Some(prop) = component
+      .props
+      .iter()
+      .find(|prop| position_in_span(position, &prop.source_span))
+  {
+    return Some(component_prop_hover(component, prop));
+  }
+
   None
 }
 
-fn document_symbols_for_manifest_file(
+fn document_symbols_for_document(
+  _source: &str,
   manifest: &ThebeManifest,
   relative_path: &str,
 ) -> Option<DocumentSymbolResponse> {
@@ -1229,6 +1717,16 @@ fn document_symbols_for_manifest_file(
     )));
   }
 
+  if let Some(component) = manifest
+    .components
+    .iter()
+    .find(|component| component.source_path == relative_path)
+  {
+    return Some(DocumentSymbolResponse::Nested(document_symbols_for_component(
+      component,
+    )));
+  }
+
   if manifest.app_html.source_path.as_deref() == Some(relative_path) {
     return Some(DocumentSymbolResponse::Nested(Vec::new()));
   }
@@ -1236,8 +1734,9 @@ fn document_symbols_for_manifest_file(
   None
 }
 
-fn definition_for_manifest_file(
+fn definition_for_document(
   project_root: &Path,
+  source: &str,
   manifest: &ThebeManifest,
   relative_path: &str,
   position: Position,
@@ -1255,6 +1754,17 @@ fn definition_for_manifest_file(
         .iter()
         .find(|binding| position_in_span(position, &binding.source_span))
       {
+        if let Some(path_match) = binding_path_match_at_position(source, binding, position)
+          && let Some(definition) = template_symbol_definition(route, &path_match.path)
+        {
+          let location = location_for_relative_path(
+            project_root,
+            &route.source_path,
+            definition.source_span,
+          )?;
+          return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+        }
+
         if let Some(generated_types_path) = route.generated_types_path.as_deref() {
           return file_start_definition(project_root, generated_types_path).map(Some);
         }
@@ -1303,11 +1813,22 @@ fn definition_for_manifest_file(
     return Ok(Some(GotoDefinitionResponse::Scalar(location)));
   }
 
+  if let Some((component, prop)) = component_prop_at_position(source, manifest, position) {
+    let location = location_for_relative_path(project_root, &component.source_path, prop.source_span)?;
+    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+  }
+
+  if let Some(component) = component_tag_at_position(source, manifest, position) {
+    let location = file_start_location(project_root, &component.source_path)?;
+    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+  }
+
   Ok(None)
 }
 
-fn references_for_manifest_file(
+fn references_for_document(
   project_root: &Path,
+  source: &str,
   manifest: &ThebeManifest,
   relative_path: &str,
   position: Position,
@@ -1339,6 +1860,34 @@ fn references_for_manifest_file(
         .iter()
         .find(|binding| position_in_span(position, &binding.source_span))
       {
+        if let Some(path_match) = binding_path_match_at_position(source, binding, position) {
+          if let Some(definition) = template_symbol_definition(route, &path_match.path)
+            && include_declaration
+          {
+            locations.push(location_for_relative_path(
+              project_root,
+              &route.source_path,
+              definition.source_span,
+            )?);
+          }
+
+          locations.extend(binding_symbol_reference_locations(
+            project_root,
+            &route.source_path,
+            &route.template_binding_spans,
+            &path_match.path,
+            Some((binding.source_span, path_match.path.as_str())),
+          )?);
+          if let Some(generated_client_path) = route.generated_client_path.as_deref() {
+            locations.push(file_start_location(project_root, generated_client_path)?);
+          }
+          if let Some(generated_types_path) = route.generated_types_path.as_deref() {
+            locations.push(file_start_location(project_root, generated_types_path)?);
+          }
+          dedup_locations(&mut locations);
+          return Ok((!locations.is_empty()).then_some(locations));
+        }
+
         locations.extend(binding_reference_locations(
           project_root,
           &route.source_path,
@@ -1437,6 +1986,808 @@ fn references_for_manifest_file(
   Ok((!locations.is_empty()).then_some(locations))
 }
 
+fn template_symbol_definition<'a>(
+  route: &'a RouteMetadata,
+  path: &str,
+) -> Option<&'a TemplateSymbolMetadata> {
+  route
+    .template_symbol_definitions
+    .iter()
+    .find(|definition| definition.path == path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TemplatePathMatch {
+  end: usize,
+  path: String,
+  start: usize,
+}
+
+impl TemplatePathMatch {
+  fn range(&self, source: &str) -> Range {
+    range_from_offsets(source, self.start, self.end)
+  }
+}
+
+fn binding_path_match_at_position(
+  source: &str,
+  binding: &TemplateBindingMetadata,
+  position: Position,
+) -> Option<TemplatePathMatch> {
+  let offset = byte_offset_from_position(source, position)?;
+  binding_path_match_at_offset(source, binding, offset)
+}
+
+fn binding_path_match_at_offset(
+  source: &str,
+  binding: &TemplateBindingMetadata,
+  offset: usize,
+) -> Option<TemplatePathMatch> {
+  if offset < binding.source_span.start_byte || offset > binding.source_span.end_byte {
+    return None;
+  }
+
+  let token = &source[binding.source_span.start_byte..binding.source_span.end_byte];
+  let name_start = token.find(&binding.name)? + binding.source_span.start_byte;
+
+  let mut current_start = name_start;
+  let mut current_path = String::new();
+  for segment in binding.name.split('.') {
+    let current_end = current_start + segment.len();
+    if !current_path.is_empty() {
+      current_path.push('.');
+    }
+    current_path.push_str(segment);
+
+    if offset >= current_start && offset <= current_end {
+      return Some(TemplatePathMatch {
+        end: current_end,
+        path: current_path,
+        start: current_start,
+      });
+    }
+
+    current_start = current_end + 1;
+  }
+
+  None
+}
+
+fn binding_symbol_reference_locations(
+  project_root: &Path,
+  relative_path: &str,
+  binding_spans: &[TemplateBindingMetadata],
+  symbol_path: &str,
+  current: Option<(SourceSpanMetadata, &str)>,
+) -> Result<Vec<Location>> {
+  binding_spans
+    .iter()
+    .filter(|binding| {
+      binding.name == symbol_path || binding.name.starts_with(&format!("{symbol_path}."))
+    })
+    .filter(|binding| {
+      current.is_none_or(|(current_span, current_path)| {
+        !(binding.source_span == current_span && binding.name == current_path)
+      })
+    })
+    .map(|binding| location_for_relative_path(project_root, relative_path, binding.source_span))
+    .collect()
+}
+
+fn component_tag_at_position<'a>(
+  source: &str,
+  manifest: &'a ThebeManifest,
+  position: Position,
+) -> Option<&'a ComponentMetadata> {
+  let offset = byte_offset_from_position(source, position)?;
+  let (tag_name, start, end) = tag_name_at_offset(source, offset)?;
+  if offset < start || offset > end {
+    return None;
+  }
+  manifest
+    .components
+    .iter()
+    .find(|component| component.tag_name == tag_name)
+}
+
+fn component_prop_at_position<'a>(
+  source: &str,
+  manifest: &'a ThebeManifest,
+  position: Position,
+) -> Option<(&'a ComponentMetadata, &'a ComponentPropMetadata)> {
+  let offset = byte_offset_from_position(source, position)?;
+  let (tag_name, _, _) = tag_name_at_offset(source, offset)?;
+  let component = manifest
+    .components
+    .iter()
+    .find(|component| component.tag_name == tag_name)?;
+  let (attribute_name, _, _) = attribute_name_at_offset(source, offset)?;
+  let prop_name = attribute_name.trim_start_matches(':');
+  let prop = component.props.iter().find(|prop| prop.name == prop_name)?;
+  Some((component, prop))
+}
+
+fn tag_name_at_offset(source: &str, offset: usize) -> Option<(String, usize, usize)> {
+  let tag_start = source[..offset].rfind('<')?;
+  if source[..offset]
+    .rfind('>')
+    .is_some_and(|end| end > tag_start)
+  {
+    return None;
+  }
+
+  let tag_prefix = &source[tag_start..];
+  let (tag_name, end_rel) = open_tag_name(tag_prefix)?;
+  Some((tag_name, tag_start + 1, tag_start + end_rel))
+}
+
+fn attribute_name_at_offset(source: &str, offset: usize) -> Option<(String, usize, usize)> {
+  let tag_start = source[..offset].rfind('<')?;
+  if source[..offset]
+    .rfind('>')
+    .is_some_and(|end| end > tag_start)
+  {
+    return None;
+  }
+
+  let tag_end = source[offset..]
+    .find('>')
+    .map_or(source.len(), |relative| offset + relative);
+  let tag = &source[tag_start..tag_end];
+  let bytes = tag.as_bytes();
+  let mut idx = open_tag_name(tag)?.1;
+
+  while idx < bytes.len() {
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+      idx += 1;
+    }
+
+    let start = idx;
+    while idx < bytes.len()
+      && (bytes[idx].is_ascii_alphanumeric() || matches!(bytes[idx], b':' | b'-' | b'_'))
+    {
+      idx += 1;
+    }
+    if start == idx {
+      idx += 1;
+      continue;
+    }
+
+    let end = idx;
+    let absolute_start = tag_start + start;
+    let absolute_end = tag_start + end;
+    if offset >= absolute_start && offset <= absolute_end {
+      return Some((tag[start..end].to_owned(), absolute_start, absolute_end));
+    }
+
+    while idx < bytes.len() && bytes[idx] != b'>' && !bytes[idx].is_ascii_whitespace() {
+      idx += 1;
+    }
+  }
+
+  None
+}
+
+fn prepare_rename_for_document(
+  document: &DocumentContext,
+  position: Position,
+) -> Option<PrepareRenameResponse> {
+  let target = rename_target(document, position)?;
+  Some(PrepareRenameResponse::RangeWithPlaceholder {
+    placeholder: target.current_name,
+    range: target.range,
+  })
+}
+
+fn rename_for_document(
+  document: &DocumentContext,
+  position: Position,
+  new_name: &str,
+) -> Option<WorkspaceEdit> {
+  if !is_valid_identifier(new_name) {
+    return None;
+  }
+
+  let target = rename_target(document, position)?;
+  let uri = file_url(&document.project_root, &document.relative_path).ok()?;
+
+  Some(WorkspaceEdit {
+    changes: Some(HashMap::from([(
+      uri,
+      target
+        .edits
+        .into_iter()
+        .map(|edit| TextEdit {
+          range: edit.range,
+          new_text: new_name.to_owned(),
+        })
+        .collect(),
+    )])),
+    document_changes: None,
+    change_annotations: None,
+  })
+}
+
+fn code_actions_for_document(
+  document: &DocumentContext,
+  params: &CodeActionParams,
+) -> Option<Vec<CodeActionOrCommand>> {
+  let uri = file_url(&document.project_root, &document.relative_path).ok()?;
+  let mut actions = Vec::new();
+
+  if document.relative_path == "Cargo.toml"
+    && params.context.diagnostics.iter().any(|diagnostic| {
+      matches!(
+        diagnostic.code.as_ref(),
+        Some(NumberOrString::String(code)) if code == "missing-ts-rs"
+      )
+    })
+    && let Some(edit) = ts_rs_dependency_edit(&document.source)
+  {
+    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+      title: "Add ts-rs dependency".to_owned(),
+      kind: Some(CodeActionKind::QUICKFIX),
+      diagnostics: Some(params.context.diagnostics.clone()),
+      edit: Some(WorkspaceEdit {
+        changes: Some(HashMap::from([(uri.clone(), vec![edit])])),
+        document_changes: None,
+        change_annotations: None,
+      }),
+      command: None,
+      is_preferred: Some(true),
+      disabled: None,
+      data: None,
+    }));
+  }
+
+  if document.relative_path.ends_with(".trs") {
+    let blocks = parse_document_blocks(document).ok();
+    let insert_range = Range::new(Position::new(0, 0), Position::new(0, 0));
+    let mut missing_blocks = Vec::new();
+
+    if blocks.as_ref().is_none_or(|blocks| blocks.head_span.is_none()) {
+      missing_blocks.push(("Add <head>", "<head>\n  \n</head>\n\n"));
+    }
+    if is_component_path(&document.relative_path) {
+      if blocks.as_ref().is_none_or(|blocks| blocks.script_span.is_none()) {
+        missing_blocks.push(("Add <script>", "<script>\n\n</script>\n\n"));
+      }
+    } else if blocks
+      .as_ref()
+      .is_none_or(|blocks| blocks.script_setup_span.is_none())
+    {
+      missing_blocks.push(("Add <script setup>", "<script setup>\n\n</script>\n\n"));
+    }
+    if blocks
+      .as_ref()
+      .is_none_or(|blocks| blocks.script_ts_span.is_none())
+    {
+      missing_blocks.push((
+        "Add <script lang=\"ts\">",
+        "<script lang=\"ts\">\n\n</script>\n\n",
+      ));
+    }
+    if blocks.as_ref().is_none_or(|blocks| blocks.style_span.is_none()) {
+      missing_blocks.push(("Add <style>", "<style>\n\n</style>\n\n"));
+    }
+
+    actions.extend(missing_blocks.into_iter().map(|(title, snippet)| {
+      CodeActionOrCommand::CodeAction(CodeAction {
+        title: title.to_owned(),
+        kind: Some(CodeActionKind::SOURCE),
+        diagnostics: None,
+        edit: Some(WorkspaceEdit {
+          changes: Some(HashMap::from([(
+            uri.clone(),
+            vec![TextEdit {
+              range: insert_range,
+              new_text: snippet.to_owned(),
+            }],
+          )])),
+          document_changes: None,
+          change_annotations: None,
+        }),
+        command: None,
+        is_preferred: None,
+        disabled: None,
+        data: None,
+      })
+    }));
+  }
+
+  (!actions.is_empty()).then_some(actions)
+}
+
+fn format_document(document: &DocumentContext) -> Option<Vec<TextEdit>> {
+  if !document.relative_path.ends_with(".trs") {
+    return None;
+  }
+
+  let blocks = parse_document_blocks(document).ok()?;
+  let formatted = format_trs_document(document, &blocks);
+  if formatted == document.source {
+    return None;
+  }
+
+  Some(vec![TextEdit {
+    range: range_from_offsets(&document.source, 0, document.source.len()),
+    new_text: formatted,
+  }])
+}
+
+fn semantic_tokens_for_document(document: &DocumentContext) -> Option<SemanticTokens> {
+  if !document.relative_path.ends_with(".trs") {
+    return None;
+  }
+
+  let blocks = parse_document_blocks(document).ok()?;
+  let mut spans = Vec::new();
+
+  if !is_component_path(&document.relative_path)
+    && let Ok(handler_info) = thebe_codegen::route_handler_info(&blocks)
+    && let Some(source_span) = handler_info.source_span
+    && let Some(name_range) =
+      identifier_range_within_source_span(&document.source, &handler_info.name, source_span)
+  {
+    spans.push(SemanticTokenSpan {
+      start: name_range.start,
+      end: name_range.end,
+      token_type: TOKEN_TYPE_FUNCTION,
+    });
+  }
+
+  spans.extend(template_binding_token_spans(&document.source, &blocks.template_spans));
+  spans.extend(template_tag_token_spans(&document.source, &blocks.template_spans));
+  spans.sort_by_key(|span| (span.start, span.end));
+  spans.dedup_by(|left, right| {
+    left.start == right.start && left.end == right.end && left.token_type == right.token_type
+  });
+
+  let mut data = Vec::new();
+  let mut previous_line = 0u32;
+  let mut previous_start = 0u32;
+  for span in spans {
+    let start = position_from_byte_offset(&document.source, span.start);
+    let length = document.source[span.start..span.end].chars().count() as u32;
+    let delta_line = start.line.saturating_sub(previous_line);
+    let delta_start = if delta_line == 0 {
+      start.character.saturating_sub(previous_start)
+    } else {
+      start.character
+    };
+    data.push(SemanticToken {
+      delta_line,
+      delta_start,
+      length,
+      token_type: span.token_type,
+      token_modifiers_bitset: 0,
+    });
+    previous_line = start.line;
+    previous_start = start.character;
+  }
+
+  Some(SemanticTokens {
+    result_id: None,
+    data,
+  })
+}
+
+#[derive(Debug, Clone)]
+struct RenameTarget {
+  current_name: String,
+  edits: Vec<TextEdit>,
+  range: Range,
+}
+
+fn rename_target(document: &DocumentContext, position: Position) -> Option<RenameTarget> {
+  route_handler_rename_target(document, position)
+    .or_else(|| event_handler_rename_target(document, position))
+}
+
+fn route_handler_rename_target(
+  document: &DocumentContext,
+  position: Position,
+) -> Option<RenameTarget> {
+  if is_component_path(&document.relative_path) {
+    return None;
+  }
+
+  let blocks = parse_source_blocks(&document.source).ok()?;
+  let handler_info = thebe_codegen::route_handler_info(&blocks).ok()?;
+  let source_span = handler_info.source_span?;
+  let name_range =
+    identifier_range_within_source_span(&document.source, &handler_info.name, source_span)?;
+  let range = range_from_offsets(&document.source, name_range.start, name_range.end);
+  if !position_in_range(position, range) {
+    return None;
+  }
+
+  Some(RenameTarget {
+    current_name: handler_info.name,
+    edits: vec![TextEdit {
+      range,
+      new_text: String::new(),
+    }],
+    range,
+  })
+}
+
+fn event_handler_rename_target(
+  document: &DocumentContext,
+  position: Position,
+) -> Option<RenameTarget> {
+  let handlers = current_event_handlers(document);
+  if handlers.is_empty() {
+    return None;
+  }
+
+  let definition_ranges = event_handler_definition_ranges(document);
+  for name in handlers {
+    let definition = definition_ranges.get(&name)?;
+    let usage_ranges = event_handler_reference_ranges(&document.source, &name);
+    let all_ranges = std::iter::once(*definition).chain(usage_ranges.iter().copied());
+    if all_ranges.clone().any(|range| position_in_range(position, range_from_offsets(&document.source, range.start, range.end))) {
+      let mut edits = Vec::new();
+      edits.push(TextEdit {
+        range: range_from_offsets(&document.source, definition.start, definition.end),
+        new_text: String::new(),
+      });
+      edits.extend(usage_ranges.into_iter().map(|range| TextEdit {
+        range: range_from_offsets(&document.source, range.start, range.end),
+        new_text: String::new(),
+      }));
+      let range = range_from_offsets(&document.source, definition.start, definition.end);
+      return Some(RenameTarget {
+        current_name: name,
+        edits,
+        range,
+      });
+    }
+  }
+
+  None
+}
+
+fn event_handler_definition_ranges(document: &DocumentContext) -> HashMap<String, ByteRange> {
+  let Ok(blocks) = parse_document_blocks(document) else {
+    return HashMap::new();
+  };
+  let Some(script_ts) = blocks.script_ts.as_deref() else {
+    return HashMap::new();
+  };
+  let Some(script_span) = blocks.script_ts_span else {
+    return HashMap::new();
+  };
+
+  current_event_handlers(document)
+    .into_iter()
+    .filter_map(|handler| {
+      let needle = format!("function {handler}");
+      let start = script_ts.find(&needle)? + script_span.start + "function ".len();
+      Some((
+        handler.clone(),
+        ByteRange {
+          start,
+          end: start + handler.len(),
+        },
+      ))
+    })
+    .collect()
+}
+
+fn event_handler_reference_ranges(source: &str, handler_name: &str) -> Vec<ByteRange> {
+  let bytes = source.as_bytes();
+  let mut ranges = Vec::new();
+  let mut idx = 0usize;
+
+  while idx < bytes.len() {
+    if bytes[idx] != b'<' {
+      idx += 1;
+      continue;
+    }
+
+    let tag_start = idx;
+    let Some(tag_end) = source[idx..].find('>').map(|relative| idx + relative) else {
+      break;
+    };
+    let tag = &source[tag_start..=tag_end];
+    let tag_bytes = tag.as_bytes();
+    let mut cursor = open_tag_name(tag).map_or(1, |(_, end)| end);
+
+    while cursor < tag_bytes.len() {
+      while cursor < tag_bytes.len() && tag_bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+      }
+      let name_start = cursor;
+      while cursor < tag_bytes.len()
+        && (tag_bytes[cursor].is_ascii_alphanumeric()
+          || matches!(tag_bytes[cursor], b':' | b'-' | b'_'))
+      {
+        cursor += 1;
+      }
+      if name_start == cursor {
+        cursor += 1;
+        continue;
+      }
+
+      let attribute_name = &tag[name_start..cursor];
+      while cursor < tag_bytes.len() && tag_bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+      }
+      if !attribute_name.starts_with("on") || cursor >= tag_bytes.len() || tag_bytes[cursor] != b'=' {
+        continue;
+      }
+      cursor += 1;
+      while cursor < tag_bytes.len() && tag_bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+      }
+      if cursor >= tag_bytes.len() || !matches!(tag_bytes[cursor], b'\'' | b'"') {
+        continue;
+      }
+
+      let quote = tag_bytes[cursor];
+      let value_start = cursor + 1;
+      cursor += 1;
+      while cursor < tag_bytes.len() && tag_bytes[cursor] != quote {
+        cursor += 1;
+      }
+      let value_end = cursor.min(tag_bytes.len());
+      let value = &tag[value_start..value_end];
+      if let Some(rest) = value.strip_prefix(handler_name)
+        && (rest.is_empty() || rest.starts_with('('))
+      {
+        let absolute_start = tag_start + value_start;
+        ranges.push(ByteRange {
+          start: absolute_start,
+          end: absolute_start + handler_name.len(),
+        });
+      }
+    }
+
+    idx = tag_end + 1;
+  }
+
+  ranges
+}
+
+fn ts_rs_dependency_edit(source: &str) -> Option<TextEdit> {
+  if source.contains("ts-rs") {
+    return None;
+  }
+
+  if let Some(index) = source.find("[dependencies]") {
+    let insert = source[index..]
+      .find('\n')
+      .map_or(source.len(), |relative| index + relative + 1);
+    return Some(TextEdit {
+      range: range_from_offsets(source, insert, insert),
+      new_text: "ts-rs = \"12\"\n".to_owned(),
+    });
+  }
+
+  Some(TextEdit {
+    range: range_from_offsets(source, source.len(), source.len()),
+    new_text: "\n[dependencies]\nts-rs = \"12\"\n".to_owned(),
+  })
+}
+
+fn format_trs_document(document: &DocumentContext, blocks: &SfcBlocks) -> String {
+  let mut sections = Vec::new();
+
+  if let Some(head) = blocks.head.as_deref() {
+    sections.push(render_block("head", head));
+  }
+  if is_component_path(&document.relative_path) {
+    if let Some(script) = blocks.script.as_deref() {
+      sections.push(render_block("script", script));
+    }
+  } else if let Some(script_setup) = blocks.script_setup.as_deref() {
+    sections.push(render_block("script setup", script_setup));
+  }
+  if let Some(script_ts) = blocks.script_ts.as_deref() {
+    sections.push(render_block("script lang=\"ts\"", script_ts));
+  }
+  if !blocks.template.trim().is_empty() {
+    sections.push(dedent_block(&blocks.template, 0));
+  }
+  if let Some(style) = blocks.style.as_deref() {
+    sections.push(render_block("style", style));
+  }
+
+  let mut output = sections.join("\n\n");
+  output.push('\n');
+  output
+}
+
+fn render_block(tag: &str, contents: &str) -> String {
+  let close = if tag.starts_with("script") {
+    "script"
+  } else {
+    tag
+  };
+  format!("<{tag}>\n{}\n</{close}>", dedent_block(contents, 2))
+}
+
+fn dedent_block(contents: &str, indent: usize) -> String {
+  let lines = contents.trim().lines().collect::<Vec<_>>();
+  let min_indent = lines
+    .iter()
+    .filter(|line| !line.trim().is_empty())
+    .map(|line| line.chars().take_while(|ch| ch.is_whitespace()).count())
+    .min()
+    .unwrap_or(0);
+  let prefix = " ".repeat(indent);
+
+  lines
+    .into_iter()
+    .map(|line| {
+      if line.trim().is_empty() {
+        String::new()
+      } else {
+        format!("{prefix}{}", &line[min_indent..])
+      }
+    })
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn template_binding_token_spans(source: &str, template_spans: &[thebe_parser::SourceSpan]) -> Vec<SemanticTokenSpan> {
+  let mut spans = Vec::new();
+
+  for span in template_spans {
+    let segment = &source[span.start..span.end];
+    let Ok(bindings) = thebe_codegen::list_template_binding_occurrences(segment) else {
+      continue;
+    };
+    for binding in bindings {
+      let absolute = TemplateBindingMetadata {
+        name: binding.name,
+        source_span: SourceSpanMetadata {
+          start_byte: span.start + binding.span.start,
+          end_byte: span.start + binding.span.end,
+          start_line: 0,
+          start_column: 0,
+          end_line: 0,
+          end_column: 0,
+        },
+      };
+      let token = &source[absolute.source_span.start_byte..absolute.source_span.end_byte];
+      if let Some(name_offset) = token.find(&absolute.name) {
+        let mut current_start = absolute.source_span.start_byte + name_offset;
+        for (index, segment) in absolute.name.split('.').enumerate() {
+          let current_end = current_start + segment.len();
+          spans.push(SemanticTokenSpan {
+            start: current_start,
+            end: current_end,
+            token_type: if index == 0 {
+              TOKEN_TYPE_VARIABLE
+            } else {
+              TOKEN_TYPE_PROPERTY
+            },
+          });
+          current_start = current_end + 1;
+        }
+      }
+    }
+  }
+
+  spans
+}
+
+fn template_tag_token_spans(source: &str, template_spans: &[thebe_parser::SourceSpan]) -> Vec<SemanticTokenSpan> {
+  let mut spans = Vec::new();
+
+  for span in template_spans {
+    let bytes = source.as_bytes();
+    let mut idx = span.start;
+    while idx < span.end {
+      if bytes[idx] != b'<' {
+        idx += 1;
+        continue;
+      }
+
+      let Some(tag_end) = source[idx..span.end].find('>').map(|relative| idx + relative) else {
+        break;
+      };
+      let tag = &source[idx..=tag_end];
+      if let Some((tag_name, _)) = open_tag_name(tag)
+        && let Some(name_start) = tag.find(&tag_name)
+      {
+        let absolute_start = idx + name_start;
+        let absolute_end = absolute_start + tag_name.len();
+        if tag_name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase()) {
+          spans.push(SemanticTokenSpan {
+            start: absolute_start,
+            end: absolute_end,
+            token_type: TOKEN_TYPE_CLASS,
+          });
+        } else if matches!(tag_name.as_str(), "head" | "script" | "style") {
+          spans.push(SemanticTokenSpan {
+            start: absolute_start,
+            end: absolute_end,
+            token_type: TOKEN_TYPE_KEYWORD,
+          });
+        }
+
+        let tag_bytes = tag.as_bytes();
+        let mut cursor = open_tag_name(tag).map_or(1, |(_, end)| end);
+        while cursor < tag_bytes.len() {
+          while cursor < tag_bytes.len() && tag_bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+          }
+          let attr_start = cursor;
+          while cursor < tag_bytes.len()
+            && (tag_bytes[cursor].is_ascii_alphanumeric()
+              || matches!(tag_bytes[cursor], b':' | b'-' | b'_'))
+          {
+            cursor += 1;
+          }
+          if attr_start == cursor {
+            cursor += 1;
+            continue;
+          }
+
+          let attr = &tag[attr_start..cursor];
+          let token_type = if attr.starts_with(':') {
+            Some(TOKEN_TYPE_KEYWORD)
+          } else if attr.starts_with("on") {
+            Some(TOKEN_TYPE_FUNCTION)
+          } else if tag_name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase()) {
+            Some(TOKEN_TYPE_PROPERTY)
+          } else {
+            None
+          };
+
+          if let Some(token_type) = token_type {
+            spans.push(SemanticTokenSpan {
+              start: idx + attr_start,
+              end: idx + cursor,
+              token_type,
+            });
+          }
+
+          while cursor < tag_bytes.len() && tag_bytes[cursor] != b'>' && !tag_bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+          }
+        }
+      }
+
+      idx = tag_end + 1;
+    }
+  }
+
+  spans
+}
+
+fn identifier_range_within_source_span(
+  source: &str,
+  name: &str,
+  span: thebe_parser::SourceSpan,
+) -> Option<ByteRange> {
+  let slice = &source[span.start..span.end];
+  let start = slice.find(name)? + span.start;
+  Some(ByteRange {
+    start,
+    end: start + name.len(),
+  })
+}
+
+fn position_in_range(position: Position, range: Range) -> bool {
+  compare_positions(position, range.start) != Ordering::Less
+    && compare_positions(position, range.end) != Ordering::Greater
+}
+
+fn is_valid_identifier(name: &str) -> bool {
+  let mut chars = name.chars();
+  let Some(first) = chars.next() else {
+    return false;
+  };
+  if !first.is_alphabetic() && first != '_' {
+    return false;
+  }
+  chars.all(|ch| ch.is_alphanumeric() || ch == '_')
+}
+
 async fn publish_project_diagnostics(
   client: &Client,
   state: &Arc<RwLock<BackendState>>,
@@ -1527,6 +2878,12 @@ fn known_source_paths(manifest: &ThebeManifest) -> Vec<String> {
       .routes
       .iter()
       .map(|route| route.source_path.clone()),
+  );
+  paths.extend(
+    manifest
+      .components
+      .iter()
+      .map(|component| component.source_path.clone()),
   );
 
   paths.sort();
@@ -1678,6 +3035,32 @@ fn handler_hover(route: &RouteMetadata) -> Hover {
   }
 }
 
+fn template_symbol_hover(definition: &TemplateSymbolMetadata, range: Range) -> Hover {
+  Hover {
+    contents: HoverContents::Markup(MarkupContent {
+      kind: MarkupKind::Markdown,
+      value: format!(
+        "**Template symbol** `{}`\n\n- Field: `{}`\n- Owner: `{}`\n- Type: `{}`",
+        definition.path, definition.field_name, definition.owner_type, definition.type_name,
+      ),
+    }),
+    range: Some(range),
+  }
+}
+
+fn component_prop_hover(component: &ComponentMetadata, prop: &ComponentPropMetadata) -> Hover {
+  Hover {
+    contents: HoverContents::Markup(MarkupContent {
+      kind: MarkupKind::Markdown,
+      value: format!(
+        "**Component prop** `{}`\n\n- Component: `{}`\n- Type: `{}`",
+        prop.name, component.tag_name, prop.type_name,
+      ),
+    }),
+    range: Some(range_from_span(&prop.source_span)),
+  }
+}
+
 fn binding_hover(binding: &TemplateBindingMetadata, owner: &str) -> Hover {
   Hover {
     contents: HoverContents::Markup(MarkupContent {
@@ -1724,6 +3107,10 @@ fn document_symbols_for_layout(layout: &LayoutMetadata) -> Vec<DocumentSymbol> {
   binding_symbols(&layout.template_bindings, &layout.template_binding_spans)
 }
 
+fn document_symbols_for_component(component: &ComponentMetadata) -> Vec<DocumentSymbol> {
+  component_prop_symbols(&component.props)
+}
+
 #[expect(
   deprecated,
   reason = "lsp-types 0.94 still requires populating DocumentSymbol::deprecated"
@@ -1751,6 +3138,29 @@ fn binding_symbols(
         selection_range: range,
         children: None,
       })
+    })
+    .collect()
+}
+
+#[expect(
+  deprecated,
+  reason = "lsp-types 0.94 still requires populating DocumentSymbol::deprecated"
+)]
+fn component_prop_symbols(props: &[ComponentPropMetadata]) -> Vec<DocumentSymbol> {
+  props
+    .iter()
+    .map(|prop| {
+      let range = range_from_span(&prop.source_span);
+      DocumentSymbol {
+        name: prop.name.clone(),
+        detail: Some(format!("component prop: {}", prop.type_name)),
+        kind: SymbolKind::PROPERTY,
+        tags: None,
+        deprecated: None,
+        range,
+        selection_range: range,
+        children: None,
+      }
     })
     .collect()
 }
@@ -1968,6 +3378,7 @@ mod tests {
   #[test]
   fn event_handler_completion_items_use_current_script_functions() {
     let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
       relative_path: "src/routes/index.trs".to_owned(),
       source: r#"<script setup>
 struct Props {
@@ -2011,6 +3422,7 @@ function decrement() {
   #[test]
   fn template_binding_completion_items_merge_cached_and_current_bindings() {
     let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
       relative_path: "src/routes/profile.trs".to_owned(),
       source: "<main>{{ user }}</main>".to_owned(),
       cached_artifacts: Some(ProjectArtifacts {
@@ -2031,6 +3443,7 @@ function decrement() {
   #[test]
   fn template_binding_completion_items_use_cached_template_symbols() {
     let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
       relative_path: "src/routes/profile.trs".to_owned(),
       source: "<main>{{ profile.d }}</main>".to_owned(),
       cached_artifacts: Some(ProjectArtifacts {
@@ -2055,6 +3468,7 @@ function decrement() {
   #[test]
   fn template_binding_completion_items_use_current_props_fields() {
     let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
       relative_path: "src/routes/profile.trs".to_owned(),
       source: r#"<script setup>
 struct Props {
@@ -2104,6 +3518,10 @@ struct Post {
       project_root,
       &project_root.join("app.html"),
     ));
+    assert!(is_project_input_file(
+      project_root,
+      &project_root.join("src/components/Card.trs"),
+    ));
   }
 
   #[test]
@@ -2125,8 +3543,29 @@ struct Post {
   }
 
   fn fixture_manifest() -> ThebeManifest {
+    let source = fixture_route_source();
+    let username_field = source.find("username: String").expect("username field");
+    let profile_field = source.find("profile: Profile").expect("profile field");
+    let display_name_field = source
+      .find("display_name: String")
+      .expect("display name field");
+    let handler_start = source.find("fn handler").expect("handler start");
+    let handler_end = handler_start
+      + source[handler_start..]
+        .find("{\n")
+        .expect("handler signature end")
+        + 1;
+    let username_binding_1 = source.find("{{ username }}").expect("first username binding");
+    let username_binding_2 = source[username_binding_1 + 1..]
+      .find("{{ username }}")
+      .map(|offset| username_binding_1 + 1 + offset)
+      .expect("second username binding");
+    let profile_binding = source
+      .find("{{ profile.display_name }}")
+      .expect("profile binding");
+
     ThebeManifest {
-      version: 4,
+      version: 5,
       server_router_path: ".thebe/server/routes.rs".to_owned(),
       app_html: thebe_project::AppHtmlMetadata {
         source_path: Some("app.html".to_owned()),
@@ -2159,14 +3598,7 @@ struct Post {
           method: "get".to_owned(),
           name: "handler".to_owned(),
           param_types: vec!["State<crate::AppState>".to_owned()],
-          source_span: Some(SourceSpanMetadata {
-            start_byte: 67,
-            end_byte: 94,
-            start_line: 7,
-            start_column: 1,
-            end_line: 7,
-            end_column: 28,
-          }),
+          source_span: Some(span_from_offsets(source, handler_start, handler_end)),
         },
         has_client_script: true,
         has_head: false,
@@ -2177,7 +3609,7 @@ struct Post {
         route_path: "/profile".to_owned(),
         source_path: "src/routes/profile.trs".to_owned(),
         state_type: Some("crate::AppState".to_owned()),
-        template_bindings: vec!["username".to_owned()],
+        template_bindings: vec!["username".to_owned(), "profile.display_name".to_owned()],
         template_symbols: vec![
           "username".to_owned(),
           "profile".to_owned(),
@@ -2186,29 +3618,115 @@ struct Post {
         template_binding_spans: vec![
           TemplateBindingMetadata {
             name: "username".to_owned(),
-            source_span: SourceSpanMetadata {
-              start_byte: 367,
-              end_byte: 381,
-              start_line: 25,
-              start_column: 17,
-              end_line: 25,
-              end_column: 31,
-            },
+            source_span: span_from_offsets(source, username_binding_1, username_binding_1 + 14),
           },
           TemplateBindingMetadata {
             name: "username".to_owned(),
-            source_span: SourceSpanMetadata {
-              start_byte: 403,
-              end_byte: 417,
-              start_line: 26,
-              start_column: 17,
-              end_line: 26,
-              end_column: 31,
-            },
+            source_span: span_from_offsets(source, username_binding_2, username_binding_2 + 14),
+          },
+          TemplateBindingMetadata {
+            name: "profile.display_name".to_owned(),
+            source_span: span_from_offsets(
+              source,
+              profile_binding,
+              profile_binding + 26,
+            ),
+          },
+        ],
+        template_symbol_definitions: vec![
+          TemplateSymbolMetadata {
+            field_name: "username".to_owned(),
+            owner_type: "Props".to_owned(),
+            path: "username".to_owned(),
+            source_span: span_from_offsets(source, username_field, username_field + 8),
+            type_name: "String".to_owned(),
+          },
+          TemplateSymbolMetadata {
+            field_name: "profile".to_owned(),
+            owner_type: "Props".to_owned(),
+            path: "profile".to_owned(),
+            source_span: span_from_offsets(source, profile_field, profile_field + 7),
+            type_name: "Profile".to_owned(),
+          },
+          TemplateSymbolMetadata {
+            field_name: "display_name".to_owned(),
+            owner_type: "Profile".to_owned(),
+            path: "profile.display_name".to_owned(),
+            source_span: span_from_offsets(source, display_name_field, display_name_field + 12),
+            type_name: "String".to_owned(),
           },
         ],
       }],
+      components: vec![ComponentMetadata {
+        has_client_script: false,
+        has_style: false,
+        module_path: "crate::components::Card".to_owned(),
+        prop_names: vec!["title".to_owned()],
+        props: vec![ComponentPropMetadata {
+          name: "title".to_owned(),
+          source_span: SourceSpanMetadata {
+            start_byte: 1,
+            end_byte: 6,
+            start_line: 1,
+            start_column: 2,
+            end_line: 1,
+            end_column: 7,
+          },
+          type_name: "String".to_owned(),
+        }],
+        source_path: "src/components/Card.trs".to_owned(),
+        tag_name: "Card".to_owned(),
+      }],
     }
+  }
+
+  fn fixture_route_source() -> &'static str {
+    r#"<script setup>
+struct Props {
+  username: String,
+  profile: Profile,
+}
+
+struct Profile {
+  display_name: String,
+}
+
+#[thebe::get]
+fn handler(State(state): State<crate::AppState>) -> Props {
+  let _ = state;
+  Props {
+    username: String::from("Ada"),
+    profile: Profile {
+      display_name: String::from("Ada Lovelace"),
+    },
+  }
+}
+</script>
+
+<main>
+  <h1>{{ username }}</h1>
+  <p>{{ username }}</p>
+  <span>{{ profile.display_name }}</span>
+</main>
+"#
+  }
+
+  fn span_from_offsets(source: &str, start: usize, end: usize) -> SourceSpanMetadata {
+    let start = position_from_byte_offset(source, start);
+    let end = position_from_byte_offset(source, end);
+
+    SourceSpanMetadata {
+      start_byte: start_byte_from_position(source, start),
+      end_byte: start_byte_from_position(source, end),
+      start_line: start.line as usize + 1,
+      start_column: start.character as usize + 1,
+      end_line: end.line as usize + 1,
+      end_column: end.character as usize + 1,
+    }
+  }
+
+  fn start_byte_from_position(source: &str, position: Position) -> usize {
+    byte_offset_from_position(source, position).expect("valid fixture position")
   }
 
   #[test]
@@ -2227,10 +3745,16 @@ struct Post {
   }
 
   #[test]
-  fn hover_for_manifest_file_returns_handler_hover() {
+  fn hover_for_document_returns_handler_hover() {
     let manifest = fixture_manifest();
-    let hover =
-      hover_for_manifest_file(&manifest, "src/routes/profile.trs", Position::new(6, 4)).unwrap();
+    let source = fixture_route_source();
+    let hover = hover_for_document(
+      source,
+      &manifest,
+      "src/routes/profile.trs",
+      position_from_byte_offset(source, source.find("handler").expect("handler name") + 2),
+    )
+    .unwrap();
     let HoverContents::Markup(contents) = hover.contents else {
       panic!("expected markdown hover");
     };
@@ -2243,25 +3767,27 @@ struct Post {
   fn document_symbols_for_route_use_first_binding_span() {
     let manifest = fixture_manifest();
     let Some(DocumentSymbolResponse::Nested(symbols)) =
-      document_symbols_for_manifest_file(&manifest, "src/routes/profile.trs")
+      document_symbols_for_document(fixture_route_source(), &manifest, "src/routes/profile.trs")
     else {
       panic!("expected nested document symbols");
     };
 
-    assert_eq!(symbols.len(), 2);
+    assert_eq!(symbols.len(), 3);
     assert_eq!(symbols[0].name, "handler");
     assert_eq!(symbols[1].name, "username");
-    assert_eq!(symbols[1].range.start, Position::new(24, 16));
+    assert_eq!(symbols[2].name, "profile.display_name");
   }
 
   #[test]
   fn definition_for_handler_points_to_generated_server_file() {
     let manifest = fixture_manifest();
-    let response = definition_for_manifest_file(
+    let source = fixture_route_source();
+    let response = definition_for_document(
       Path::new("/tmp/app"),
+      source,
       &manifest,
       "src/routes/profile.trs",
-      Position::new(6, 3),
+      position_from_byte_offset(source, source.find("handler").expect("handler name") + 1),
     )
     .unwrap()
     .unwrap();
@@ -2280,8 +3806,9 @@ struct Post {
   #[test]
   fn definition_for_generated_server_points_back_to_source_handler() {
     let manifest = fixture_manifest();
-    let response = definition_for_manifest_file(
+    let response = definition_for_document(
       Path::new("/tmp/app"),
+      fixture_route_source(),
       &manifest,
       ".thebe/server/routes/profile.rs",
       Position::new(0, 0),
@@ -2293,17 +3820,23 @@ struct Post {
     };
 
     assert!(location.uri.path().ends_with("/src/routes/profile.trs"));
-    assert_eq!(location.range.start, Position::new(6, 0));
+    assert_eq!(location.range.start, Position::new(11, 0));
   }
 
   #[test]
   fn references_for_binding_include_all_occurrences_and_generated_files() {
     let manifest = fixture_manifest();
-    let locations = references_for_manifest_file(
+    let source = fixture_route_source();
+    let binding_position = position_from_byte_offset(
+      source,
+      source.find("{{ username }}").expect("username binding") + 4,
+    );
+    let locations = references_for_document(
       Path::new("/tmp/app"),
+      source,
       &manifest,
       "src/routes/profile.trs",
-      Position::new(24, 18),
+      binding_position,
       true,
     )
     .unwrap()
@@ -2327,5 +3860,34 @@ struct Post {
         .path()
         .ends_with("/.thebe/types/routes/profile.ts")
     }));
+  }
+
+  #[test]
+  fn nested_template_definition_points_to_exact_field() {
+    let manifest = fixture_manifest();
+    let source = fixture_route_source();
+    let position = position_from_byte_offset(
+      source,
+      source
+        .find("profile.display_name")
+        .expect("profile path in binding")
+        + "profile.".len()
+        + 2,
+    );
+    let response = definition_for_document(
+      Path::new("/tmp/app"),
+      source,
+      &manifest,
+      "src/routes/profile.trs",
+      position,
+    )
+    .unwrap()
+    .unwrap();
+    let GotoDefinitionResponse::Scalar(location) = response else {
+      panic!("expected scalar definition");
+    };
+
+    assert!(location.uri.path().ends_with("/src/routes/profile.trs"));
+    assert_eq!(location.range.start, Position::new(7, 2));
   }
 }

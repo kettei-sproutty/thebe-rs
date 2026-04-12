@@ -1,0 +1,163 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Thebe",
+  "scopeName": "text.html.thebe",
+  "patterns": [
+    {
+      "include": "#script-setup-block"
+    },
+    {
+      "include": "#component-script-block"
+    },
+    {
+      "include": "#script-ts-block"
+    },
+    {
+      "include": "#style-block"
+    },
+    {
+      "include": "#head-block"
+    },
+    {
+      "include": "#template-binding"
+    },
+    {
+      "include": "#component-tag"
+    },
+    {
+      "include": "#directive-attribute"
+    },
+    {
+      "include": "#event-attribute"
+    },
+    {
+      "include": "text.html.basic"
+    }
+  ],
+  "repository": {
+    "head-block": {
+      "begin": "(<)(head)(>)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.thebe" },
+        "2": { "name": "keyword.control.block.thebe" },
+        "3": { "name": "punctuation.definition.tag.end.thebe" }
+      },
+      "end": "(</)(head)(>)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.thebe" },
+        "2": { "name": "keyword.control.block.thebe" },
+        "3": { "name": "punctuation.definition.tag.end.thebe" }
+      },
+      "patterns": [
+        { "include": "#template-binding" },
+        { "include": "text.html.basic" }
+      ]
+    },
+    "script-setup-block": {
+      "begin": "(<)(script)(\\s+setup)(>)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.thebe" },
+        "2": { "name": "keyword.control.block.thebe" },
+        "3": { "name": "storage.modifier.thebe" },
+        "4": { "name": "punctuation.definition.tag.end.thebe" }
+      },
+      "end": "(</)(script)(>)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.thebe" },
+        "2": { "name": "keyword.control.block.thebe" },
+        "3": { "name": "punctuation.definition.tag.end.thebe" }
+      },
+      "contentName": "meta.embedded.block.rust.thebe",
+      "patterns": [
+        { "include": "source.rust" }
+      ]
+    },
+    "component-script-block": {
+      "begin": "(<)(script)(>)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.thebe" },
+        "2": { "name": "keyword.control.block.thebe" },
+        "3": { "name": "punctuation.definition.tag.end.thebe" }
+      },
+      "end": "(</)(script)(>)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.thebe" },
+        "2": { "name": "keyword.control.block.thebe" },
+        "3": { "name": "punctuation.definition.tag.end.thebe" }
+      },
+      "contentName": "meta.embedded.block.rust.thebe",
+      "patterns": [
+        { "include": "source.rust" }
+      ]
+    },
+    "script-ts-block": {
+      "begin": "(<)(script)(\\s+lang=(?:\"ts\"|'ts'))(>)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.thebe" },
+        "2": { "name": "keyword.control.block.thebe" },
+        "3": { "name": "storage.type.thebe" },
+        "4": { "name": "punctuation.definition.tag.end.thebe" }
+      },
+      "end": "(</)(script)(>)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.thebe" },
+        "2": { "name": "keyword.control.block.thebe" },
+        "3": { "name": "punctuation.definition.tag.end.thebe" }
+      },
+      "contentName": "meta.embedded.block.ts.thebe",
+      "patterns": [
+        { "include": "source.ts" }
+      ]
+    },
+    "style-block": {
+      "begin": "(<)(style)(>)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.thebe" },
+        "2": { "name": "keyword.control.block.thebe" },
+        "3": { "name": "punctuation.definition.tag.end.thebe" }
+      },
+      "end": "(</)(style)(>)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.thebe" },
+        "2": { "name": "keyword.control.block.thebe" },
+        "3": { "name": "punctuation.definition.tag.end.thebe" }
+      },
+      "contentName": "meta.embedded.block.css.thebe",
+      "patterns": [
+        { "include": "source.css" }
+      ]
+    },
+    "template-binding": {
+      "begin": "\\{\\{",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.embedded.begin.thebe" }
+      },
+      "end": "\\}\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.embedded.end.thebe" }
+      },
+      "patterns": [
+        {
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b",
+          "name": "variable.other.thebe"
+        },
+        {
+          "match": "\\.",
+          "name": "punctuation.accessor.thebe"
+        }
+      ]
+    },
+    "component-tag": {
+      "match": "(?<=</?)([A-Z][A-Za-z0-9_]*)",
+      "name": "entity.name.type.component.thebe"
+    },
+    "directive-attribute": {
+      "match": "(?<=\\s)(:[A-Za-z_][A-Za-z0-9_:-]*)(?=\\s*=)",
+      "name": "keyword.control.directive.thebe"
+    },
+    "event-attribute": {
+      "match": "(?<=\\s)(on[A-Za-z]+)(?=\\s*=)",
+      "name": "entity.name.function.event.thebe"
+    }
+  }
+}

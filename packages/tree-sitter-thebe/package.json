@@ -1,0 +1,15 @@
+{
+  "name": "tree-sitter-thebe",
+  "version": "0.1.0",
+  "description": "Initial tree-sitter grammar for Thebe .trs files.",
+  "license": "MIT",
+  "main": "grammar.js",
+  "keywords": [
+    "tree-sitter",
+    "thebe",
+    "trs"
+  ],
+  "devDependencies": {
+    "tree-sitter-cli": "^0.24.7"
+  }
+}

@@ -1,6 +1,7 @@
 use crate::{error::CodegenError, template};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use quote::ToTokens;
 use syn::{Fields, GenericArgument, Item, PathArguments, Type};
 use thebe_parser::{SfcBlocks, SourceSpan};
 
@@ -85,10 +86,27 @@ pub struct RouteHandlerInfo {
   pub source_span: Option<SourceSpan>,
 }
 
+/// A `Props` field exposed to template navigation and completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateSymbolDefinition {
+  /// Full template-visible path, such as `profile.display_name`.
+  pub path: String,
+  /// Rust type that owns the field.
+  pub owner_type: String,
+  /// Rust field name at the end of `path`.
+  pub field_name: String,
+  /// Rust type rendered for the field.
+  pub type_name: String,
+  /// Span of the field identifier inside the source script block.
+  pub span: SourceSpan,
+}
+
 #[derive(Clone)]
 struct LocalNamedField {
   name: String,
   ty: Type,
+  type_name: String,
+  span: Option<SourceSpan>,
 }
 
 #[derive(Default, Clone)]
@@ -191,28 +209,53 @@ pub fn route_handler_info(blocks: &SfcBlocks) -> Result<RouteHandlerInfo, Codege
 ///
 /// Returns [`CodegenError::TypeBridge`] when `<script setup>` Rust cannot be
 /// parsed for local type analysis.
-pub fn route_template_symbols(blocks: &SfcBlocks) -> Result<Vec<String>, CodegenError> {
+pub fn route_template_symbol_definitions(
+  blocks: &SfcBlocks,
+) -> Result<Vec<TemplateSymbolDefinition>, CodegenError> {
   let Some(setup) = blocks.script_setup.as_deref() else {
     return Ok(Vec::new());
   };
 
-  let local_type_infos = collect_local_type_infos(setup)?;
+  props_symbol_definitions(setup)
+}
+
+/// Return template-visible `Props` field definitions from a Rust script block.
+///
+/// Top-level `Props` fields are returned along with nested dotted paths that
+/// resolve through locally defined named structs.
+///
+/// # Errors
+///
+/// Returns [`CodegenError::TypeBridge`] when the Rust source cannot be parsed
+/// for local type analysis.
+pub fn props_symbol_definitions(code: &str) -> Result<Vec<TemplateSymbolDefinition>, CodegenError> {
+  let local_type_infos = collect_local_type_infos(code)?;
   let Some(props) = local_type_infos.get("Props") else {
     return Ok(Vec::new());
   };
 
-  let mut symbols = Vec::new();
+  let mut definitions = Vec::new();
   for field in &props.named_fields {
-    collect_template_visible_paths(
+    collect_template_symbol_definitions(
+      "Props",
+      field,
       &field.name,
-      &field.ty,
       &local_type_infos,
-      &mut symbols,
+      &mut definitions,
       &mut BTreeSet::new(),
     );
   }
 
-  Ok(symbols)
+  Ok(definitions)
+}
+
+pub fn route_template_symbols(blocks: &SfcBlocks) -> Result<Vec<String>, CodegenError> {
+  Ok(
+    route_template_symbol_definitions(blocks)?
+      .into_iter()
+      .map(|definition| definition.path)
+      .collect(),
+  )
 }
 /// Validate that `app.html` contains the required Thebe placeholders.
 ///
@@ -964,7 +1007,7 @@ fn collect_local_type_infos(code: &str) -> Result<BTreeMap<String, LocalTypeInfo
           item_struct.ident.to_string(),
           LocalTypeInfo {
             field_types: field_types(&item_struct.fields),
-            named_fields: named_field_types(&item_struct.fields),
+            named_fields: named_field_types(&item_struct.fields, code),
           },
         );
       }
@@ -1001,15 +1044,18 @@ fn field_types(fields: &Fields) -> Vec<Type> {
   }
 }
 
-fn named_field_types(fields: &Fields) -> Vec<LocalNamedField> {
+fn named_field_types(fields: &Fields, code: &str) -> Vec<LocalNamedField> {
   match fields {
     Fields::Named(fields) => fields
       .named
       .iter()
       .filter_map(|field| {
+        let ident = field.ident.as_ref()?;
         Some(LocalNamedField {
-          name: field.ident.as_ref()?.to_string(),
+          name: ident.to_string(),
           ty: field.ty.clone(),
+          type_name: field.ty.to_token_stream().to_string(),
+          span: source_span_from_proc_macro_span(code, ident.span()),
         })
       })
       .collect(),
@@ -1017,18 +1063,27 @@ fn named_field_types(fields: &Fields) -> Vec<LocalNamedField> {
   }
 }
 
-fn collect_template_visible_paths(
-  prefix: &str,
-  ty: &Type,
+fn collect_template_symbol_definitions(
+  owner_type: &str,
+  field: &LocalNamedField,
+  path: &str,
   local_type_infos: &BTreeMap<String, LocalTypeInfo>,
-  symbols: &mut Vec<String>,
+  definitions: &mut Vec<TemplateSymbolDefinition>,
   active_types: &mut BTreeSet<String>,
 ) {
-  if !symbols.iter().any(|symbol| symbol == prefix) {
-    symbols.push(prefix.to_owned());
+  if let Some(span) = field.span
+    && !definitions.iter().any(|definition| definition.path == path)
+  {
+    definitions.push(TemplateSymbolDefinition {
+      path: path.to_owned(),
+      owner_type: owner_type.to_owned(),
+      field_name: field.name.clone(),
+      type_name: field.type_name.clone(),
+      span,
+    });
   }
 
-  let Some(local_type_name) = transparent_local_type_name(ty) else {
+  let Some(local_type_name) = transparent_local_type_name(&field.ty) else {
     return;
   };
   let Some(type_info) = local_type_infos.get(&local_type_name) else {
@@ -1039,16 +1094,56 @@ fn collect_template_visible_paths(
   }
 
   for field in &type_info.named_fields {
-    collect_template_visible_paths(
-      &format!("{prefix}.{}", field.name),
-      &field.ty,
+    collect_template_symbol_definitions(
+      &local_type_name,
+      field,
+      &format!("{path}.{}", field.name),
       local_type_infos,
-      symbols,
+      definitions,
       active_types,
     );
   }
 
   active_types.remove(&local_type_name);
+}
+
+fn source_span_from_proc_macro_span(source: &str, span: proc_macro2::Span) -> Option<SourceSpan> {
+  let start = span.start();
+  let end = span.end();
+  let start = byte_offset_from_line_column(source, start.line, start.column)?;
+  let end = byte_offset_from_line_column(source, end.line, end.column)?;
+  Some(SourceSpan { start, end })
+}
+
+fn byte_offset_from_line_column(source: &str, line: usize, column: usize) -> Option<usize> {
+  if line == 0 {
+    return None;
+  }
+
+  let mut current_line = 1usize;
+  let mut current_column = 0usize;
+
+  if line == 1 && column == 0 {
+    return Some(0);
+  }
+
+  for (idx, ch) in source.char_indices() {
+    if current_line == line && current_column == column {
+      return Some(idx);
+    }
+
+    if ch == '\n' {
+      current_line += 1;
+      current_column = 0;
+      if current_line == line && column == 0 {
+        return Some(idx + 1);
+      }
+    } else {
+      current_column += 1;
+    }
+  }
+
+  (current_line == line && current_column == column).then_some(source.len())
 }
 
 fn transparent_local_type_name(ty: &Type) -> Option<String> {
@@ -1680,6 +1775,35 @@ mod tests {
         "posts",
       ]
     );
+  }
+
+  #[test]
+  fn route_template_symbol_definitions_preserve_field_spans() {
+    let script_setup = "struct Props {\n    profile: Profile,\n}\n\nstruct Profile {\n    display_name: String,\n}";
+    let blocks = SfcBlocks {
+      script_setup: Some(script_setup.to_owned()),
+      ..SfcBlocks::default()
+    };
+
+    let definitions = route_template_symbol_definitions(&blocks).unwrap();
+    let profile = definitions
+      .iter()
+      .find(|definition| definition.path == "profile")
+      .expect("profile definition");
+    let display_name = definitions
+      .iter()
+      .find(|definition| definition.path == "profile.display_name")
+      .expect("nested definition");
+
+    assert_eq!(&script_setup[profile.span.start..profile.span.end], "profile");
+    assert_eq!(profile.owner_type, "Props");
+    assert_eq!(profile.type_name, "Profile");
+    assert_eq!(
+      &script_setup[display_name.span.start..display_name.span.end],
+      "display_name"
+    );
+    assert_eq!(display_name.owner_type, "Profile");
+    assert_eq!(display_name.type_name, "String");
   }
 
   #[test]

@@ -1,0 +1,68 @@
+{
+  "name": "thebe-vscode",
+  "displayName": "Thebe",
+  "description": "VS Code support for Thebe .trs files.",
+  "version": "0.1.0",
+  "publisher": "thebe",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:thebe"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "thebe",
+        "aliases": [
+          "Thebe",
+          "thebe"
+        ],
+        "extensions": [
+          ".trs"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "thebe",
+        "scopeName": "text.html.thebe",
+        "path": "./syntaxes/thebe.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.rust.thebe": "rust",
+          "meta.embedded.block.ts.thebe": "typescript",
+          "meta.embedded.block.css.thebe": "css",
+          "text.html.basic": "html"
+        }
+      }
+    ],
+    "snippets": [
+      {
+        "language": "thebe",
+        "path": "./snippets/thebe.code-snippets"
+      }
+    ],
+    "configuration": {
+      "title": "Thebe",
+      "properties": {
+        "thebe.lsp.path": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the thebe-lsp executable. When empty, the extension tries target/debug/thebe-lsp in the workspace before falling back to PATH."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

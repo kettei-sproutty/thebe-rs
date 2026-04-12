@@ -26,6 +26,10 @@ pub struct SfcBlocks {
   pub head: Option<String>,
   /// Source span of the trimmed `<head>` content.
   pub head_span: Option<SourceSpan>,
+  /// Content of a plain `<script>` block — component module scope.
+  pub script: Option<String>,
+  /// Source span of the trimmed plain `<script>` content.
+  pub script_span: Option<SourceSpan>,
   /// Content of `<script setup>` — server route module (Rust).
   pub script_setup: Option<String>,
   /// Source span of the trimmed `<script setup>` content.
@@ -47,6 +51,7 @@ pub struct SfcBlocks {
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum BlockKind {
   Head,
+  Script,
   ScriptSetup,
   ScriptTs,
   Style,
@@ -56,6 +61,7 @@ impl BlockKind {
   fn label(self) -> &'static str {
     match self {
       Self::Head => "head",
+      Self::Script => "script",
       Self::ScriptSetup => "script setup",
       Self::ScriptTs => r#"script lang="ts""#,
       Self::Style => "style",
@@ -65,10 +71,16 @@ impl BlockKind {
   fn close_tag(self) -> &'static str {
     match self {
       Self::Head => "</head>",
+      Self::Script => "</script>",
       Self::ScriptSetup | Self::ScriptTs => "</script>",
       Self::Style => "</style>",
     }
   }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ParseOptions {
+  allow_plain_script: bool,
 }
 
 struct OpeningTag<'a> {
@@ -100,6 +112,23 @@ struct ExtractedBlock<'a> {
 /// Returns [`ParseError`] when a recognised block is missing its closing tag
 /// or the same block kind appears more than once.
 pub fn parse_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
+  parse_sfc_with_options(input, ParseOptions::default())
+}
+
+/// Parse a component `.trs` file into its constituent blocks.
+///
+/// Unlike [`parse_sfc`], this recognises a top-level plain `<script>` block as
+/// the component's server module scope.
+pub fn parse_component_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
+  parse_sfc_with_options(
+    input,
+    ParseOptions {
+      allow_plain_script: true,
+    },
+  )
+}
+
+fn parse_sfc_with_options(input: &str, options: ParseOptions) -> Result<SfcBlocks, ParseError> {
   let mut blocks = SfcBlocks::default();
   let mut template_parts: Vec<&str> = Vec::new();
   let mut remaining = input;
@@ -119,7 +148,7 @@ pub fn parse_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
     let before = &remaining[..lt_pos];
     let from_lt = &remaining[lt_pos..];
 
-    if let Some(extracted) = try_extract_block(from_lt)? {
+    if let Some(extracted) = try_extract_block(from_lt, options)? {
       if !before.is_empty() {
         template_parts.push(before);
         blocks.template_spans.push(SourceSpan {
@@ -138,6 +167,16 @@ pub fn parse_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
           let (content, span) = trim_block_content(extracted.content, content_span);
           blocks.head = Some(content);
           blocks.head_span = Some(span);
+        }
+        BlockKind::Script => {
+          if blocks.script.is_some() {
+            return Err(ParseError::DuplicateBlock(
+              extracted.kind.label().to_owned(),
+            ));
+          }
+          let (content, span) = trim_block_content(extracted.content, content_span);
+          blocks.script = Some(content);
+          blocks.script_span = Some(span);
         }
         BlockKind::ScriptSetup => {
           if blocks.script_setup.is_some() {
@@ -194,12 +233,15 @@ pub fn parse_sfc(input: &str) -> Result<SfcBlocks, ParseError> {
 ///
 /// Returns `Some((kind, inner_content, rest_of_input))` on success, or `None`
 /// if the current position is not the start of a recognised block.
-fn try_extract_block(input: &str) -> Result<Option<ExtractedBlock<'_>>, ParseError> {
+fn try_extract_block(
+  input: &str,
+  options: ParseOptions,
+) -> Result<Option<ExtractedBlock<'_>>, ParseError> {
   let Some(tag) = parse_opening_tag(input) else {
     return Ok(None);
   };
 
-  let kind = classify_opening_tag(&tag);
+  let kind = classify_opening_tag(&tag, options);
 
   let Some(kind) = kind else {
     return Ok(None);
@@ -243,7 +285,7 @@ fn try_extract_block(input: &str) -> Result<Option<ExtractedBlock<'_>>, ParseErr
   }))
 }
 
-fn classify_opening_tag(tag: &OpeningTag<'_>) -> Option<BlockKind> {
+fn classify_opening_tag(tag: &OpeningTag<'_>, options: ParseOptions) -> Option<BlockKind> {
   if tag.name.eq_ignore_ascii_case("head") {
     return Some(BlockKind::Head);
   }
@@ -265,6 +307,10 @@ fn classify_opening_tag(tag: &OpeningTag<'_>) -> Option<BlockKind> {
     {
       return Some(BlockKind::ScriptTs);
     }
+  }
+
+  if options.allow_plain_script {
+    return Some(BlockKind::Script);
   }
 
   None
@@ -430,6 +476,7 @@ h1 { color: red; }
 
     let blocks = parse_sfc(input).unwrap();
     assert!(blocks.head.is_some());
+    assert!(blocks.script.is_none());
     assert!(blocks.script_setup.is_some());
     assert!(blocks.script_ts.is_some());
     assert!(blocks.style.is_some());
@@ -493,11 +540,51 @@ pub fn handler() {}
     let blocks = parse_sfc(input).unwrap();
     assert!(blocks.script_setup.is_none());
     assert!(blocks.script_ts.is_none());
+    assert!(blocks.script.is_none());
     assert!(
       blocks
         .template
         .contains("<script data-kind=\"setup\" data-lang=\"lang=ts\">")
     );
+  }
+
+  #[test]
+  fn parse_component_sfc_extracts_plain_script_block() {
+    let input = r#"<script>
+pub struct Props {
+  title: String,
+}
+</script>
+
+<Card>{{ title }}</Card>
+
+<style>
+.card { color: red; }
+</style>"#;
+
+    let blocks = parse_component_sfc(input).unwrap();
+
+    assert!(blocks.script.is_some());
+    assert!(blocks.script_setup.is_none());
+    assert!(blocks.script_ts.is_none());
+    assert_eq!(blocks.template, "<Card>{{ title }}</Card>");
+  }
+
+  #[test]
+  fn parse_sfc_keeps_plain_script_tags_inside_route_template() {
+    let input = r#"<script setup>
+#[thebe::get]
+fn handler() -> Props { todo!() }
+</script>
+
+<main>
+  <script type="application/json">{}</script>
+</main>"#;
+
+    let blocks = parse_sfc(input).unwrap();
+
+    assert!(blocks.script.is_none());
+    assert!(blocks.template.contains("<script type=\"application/json\">"));
   }
 
   #[test]

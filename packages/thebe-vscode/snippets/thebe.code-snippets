@@ -1,0 +1,73 @@
+{
+  "Thebe Route": {
+    "prefix": "thebe-route",
+    "body": [
+      "<script setup>",
+      "struct Props {",
+      "  title: String,",
+      "}",
+      "",
+      "#[thebe::get]",
+      "fn handler() -> Props {",
+      "  Props {",
+      "    title: String::from(\"$1\"),",
+      "  }",
+      "}",
+      "</script>",
+      "",
+      "<main>",
+      "  <h1>{{ title }}</h1>",
+      "</main>",
+      "",
+      "<style>",
+      "  main {",
+      "    display: grid;",
+      "    gap: 1rem;",
+      "  }",
+      "</style>"
+    ],
+    "description": "Create a route-oriented Thebe single file component"
+  },
+  "Thebe Component": {
+    "prefix": "thebe-component",
+    "body": [
+      "<script>",
+      "pub struct Props {",
+      "  pub title: String,",
+      "}",
+      "</script>",
+      "",
+      "<div class=\"card\">",
+      "  <h2>{{ props.title }}</h2>",
+      "  <slot />",
+      "</div>",
+      "",
+      "<style>",
+      "  .card {",
+      "    padding: 1rem;",
+      "  }",
+      "</style>"
+    ],
+    "description": "Create a reusable Thebe component"
+  },
+  "Script Setup": {
+    "prefix": "thebe-setup",
+    "body": [
+      "<script setup>",
+      "$0",
+      "</script>"
+    ],
+    "description": "Insert a Thebe route server block"
+  },
+  "Client Script": {
+    "prefix": "thebe-ts",
+    "body": [
+      "<script lang=\"ts\">",
+      "let props = getProps<Props>();",
+      "",
+      "$0",
+      "</script>"
+    ],
+    "description": "Insert a Thebe client script block"
+  }
+}

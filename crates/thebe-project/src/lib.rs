@@ -61,6 +61,8 @@ pub struct ThebeManifest {
   pub app_html: AppHtmlMetadata,
   pub layouts: Vec<LayoutMetadata>,
   pub routes: Vec<RouteMetadata>,
+  #[serde(default)]
+  pub components: Vec<ComponentMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +103,39 @@ pub struct RouteMetadata {
   pub template_bindings: Vec<String>,
   #[serde(default)]
   pub template_symbols: Vec<String>,
+  #[serde(default)]
+  pub template_symbol_definitions: Vec<TemplateSymbolMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentMetadata {
+  pub has_client_script: bool,
+  pub has_style: bool,
+  pub module_path: String,
+  pub prop_names: Vec<String>,
+  #[serde(default)]
+  pub props: Vec<ComponentPropMetadata>,
+  pub source_path: String,
+  pub tag_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentPropMetadata {
+  pub name: String,
+  pub source_span: SourceSpanMetadata,
+  pub type_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateSymbolMetadata {
+  pub field_name: String,
+  pub owner_type: String,
+  pub path: String,
+  pub source_span: SourceSpanMetadata,
+  pub type_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +201,7 @@ struct ParsedRoute {
   state_type: Option<String>,
   template_bindings: Vec<String>,
   template_symbols: Vec<String>,
+  template_symbol_definitions: Vec<thebe_codegen::TemplateSymbolDefinition>,
   template_binding_spans: Vec<thebe_codegen::TemplateBindingOccurrence>,
   types_export_path: Option<String>,
 }
@@ -177,6 +213,15 @@ struct ParsedLayout {
   trs_path: PathBuf,
   template_bindings: Vec<String>,
   template_binding_spans: Vec<thebe_codegen::TemplateBindingOccurrence>,
+}
+
+struct ParsedComponent {
+  source: String,
+  blocks: thebe_parser::SfcBlocks,
+  module_path: String,
+  props: Vec<thebe_codegen::TemplateSymbolDefinition>,
+  tag_name: String,
+  trs_path: PathBuf,
 }
 
 struct LoadedAppHtml {
@@ -256,12 +301,14 @@ pub fn generate_project_with_overlay(
 ) -> anyhow::Result<ProjectArtifacts> {
   let src_dir = project_root.join("src");
   let routes_dir = src_dir.join("routes");
+  let components_dir = src_dir.join("components");
   anyhow::ensure!(
     routes_dir.exists() || overlay.paths_under(&routes_dir).next().is_some(),
     "no `src/routes/` directory found — create your route `.trs` files there"
   );
 
   let layouts = collect_layouts(&routes_dir, overlay)?;
+  let parsed_components = collect_parsed_components(&components_dir, overlay)?;
   let app_html = load_app_html(project_root, overlay)?;
   let trs_files = collect_trs_files(&routes_dir, overlay)?;
   anyhow::ensure!(
@@ -345,6 +392,7 @@ pub fn generate_project_with_overlay(
     &routes_dir,
     &parsed_routes,
     &layouts,
+    &parsed_components,
     app_html.source_path.as_deref(),
   )?;
   write_manifest_file(project_root, &manifest)?;
@@ -451,6 +499,13 @@ fn collect_parsed_routes(
         trs_path.display()
       )
     })?;
+    let template_symbol_definitions =
+      thebe_codegen::route_template_symbol_definitions(&blocks).with_context(|| {
+        format!(
+          "failed to inspect template symbol definitions in {}",
+          trs_path.display()
+        )
+      })?;
     let template_binding_spans =
       collect_template_binding_occurrences(&source, &blocks.template_spans).with_context(|| {
         format!(
@@ -471,6 +526,7 @@ fn collect_parsed_routes(
       handler_info,
       template_bindings,
       template_symbols,
+      template_symbol_definitions,
       template_binding_spans,
       blocks,
       types_export_path,
@@ -478,6 +534,41 @@ fn collect_parsed_routes(
   }
 
   Ok(routes)
+}
+
+fn collect_parsed_components(
+  components_dir: &Path,
+  overlay: &ProjectOverlay,
+) -> anyhow::Result<Vec<ParsedComponent>> {
+  if !components_dir.exists() && overlay.paths_under(components_dir).next().is_none() {
+    return Ok(Vec::new());
+  }
+
+  let mut components = Vec::new();
+
+  for component_path in collect_trs_files(components_dir, overlay)? {
+    let source = overlay.read_to_string(&component_path)?;
+    let blocks = thebe_parser::parse_component_sfc(&source)
+      .with_context(|| format!("parse error in {}", component_path.display()))?;
+    let props = blocks
+      .script
+      .as_deref()
+      .map(thebe_codegen::props_symbol_definitions)
+      .transpose()
+      .with_context(|| format!("failed to inspect props in {}", component_path.display()))?
+      .unwrap_or_default();
+
+    components.push(ParsedComponent {
+      source,
+      blocks,
+      module_path: file_to_component_module_path(&component_path, components_dir),
+      props,
+      tag_name: file_to_component_tag_name(&component_path),
+      trs_path: component_path,
+    });
+  }
+
+  Ok(components)
 }
 
 fn route_has_client_script(blocks: &thebe_parser::SfcBlocks) -> bool {
@@ -494,6 +585,7 @@ fn collect_project_diagnostics(
   let mut diagnostics = Vec::new();
   let src_dir = project_root.join("src");
   let routes_dir = src_dir.join("routes");
+  let components_dir = src_dir.join("components");
 
   if !routes_dir.exists() && overlay.paths_under(&routes_dir).next().is_none() {
     diagnostics.push(project_diagnostic(
@@ -512,6 +604,7 @@ fn collect_project_diagnostics(
 
   let route_files = collect_trs_files(&routes_dir, overlay)?;
   let layout_files = collect_layout_files(&routes_dir, overlay)?;
+  let component_files = collect_trs_files(&components_dir, overlay)?;
   let cargo_has_ts_rs = has_ts_rs_dependency(project_root, overlay)?;
 
   if route_files.is_empty() {
@@ -576,6 +669,14 @@ fn collect_project_diagnostics(
         source_path,
         state_type: route.state_type.clone(),
       });
+    }
+  }
+
+  for component_path in component_files {
+    if let Some(diagnostic) =
+      analyze_component_for_diagnostics(project_root, &component_path, overlay)?
+    {
+      diagnostics.push(diagnostic);
     }
   }
 
@@ -711,6 +812,21 @@ fn analyze_route_for_diagnostics(
     }
   };
 
+  let template_symbol_definitions = match thebe_codegen::route_template_symbol_definitions(&blocks)
+  {
+    Ok(definitions) => definitions,
+    Err(err) => {
+      diagnostics.push(codegen_error_diagnostic(
+        project_root,
+        route_path,
+        &source,
+        &blocks,
+        &err,
+      )?);
+      return Ok(None);
+    }
+  };
+
   let template_binding_spans =
     match collect_template_binding_occurrences(&source, &blocks.template_spans) {
       Ok(bindings) => bindings,
@@ -740,6 +856,7 @@ fn analyze_route_for_diagnostics(
     handler_info,
     template_bindings,
     template_symbols,
+    template_symbol_definitions,
     template_binding_spans,
     blocks,
     types_export_path,
@@ -767,6 +884,45 @@ fn analyze_route_for_diagnostics(
   }
 
   Ok(Some(route))
+}
+
+fn analyze_component_for_diagnostics(
+  project_root: &Path,
+  component_path: &Path,
+  overlay: &ProjectOverlay,
+) -> anyhow::Result<Option<ThebeDiagnostic>> {
+  let source = overlay.read_to_string(component_path)?;
+  let blocks = match thebe_parser::parse_component_sfc(&source) {
+    Ok(blocks) => blocks,
+    Err(err) => {
+      return Ok(Some(file_diagnostic(
+        project_root,
+        component_path,
+        &source,
+        None,
+        "parser",
+        "parse-error",
+        err.to_string(),
+      )?));
+    }
+  };
+
+  let Some(script) = blocks.script.as_deref() else {
+    return Ok(None);
+  };
+
+  match thebe_codegen::props_symbol_definitions(script) {
+    Ok(_) => Ok(None),
+    Err(err) => Ok(Some(file_diagnostic(
+      project_root,
+      component_path,
+      &source,
+      blocks.script_span,
+      "component",
+      "props-analysis-error",
+      err.to_string(),
+    )?)),
+  }
 }
 
 fn parse_layout_for_diagnostics(
@@ -1192,6 +1348,7 @@ fn build_thebe_manifest(
   routes_dir: &Path,
   routes: &[ParsedRoute],
   layouts: &HashMap<PathBuf, ParsedLayout>,
+  components: &[ParsedComponent],
   app_html_path: Option<&Path>,
 ) -> anyhow::Result<ThebeManifest> {
   let layout_entries = build_thebe_manifest_layouts(project_root, layouts)?;
@@ -1199,9 +1356,10 @@ fn build_thebe_manifest(
     .iter()
     .map(|route| build_thebe_manifest_route(project_root, routes_dir, route, layouts))
     .collect::<anyhow::Result<Vec<_>>>()?;
+  let components = build_thebe_manifest_components(project_root, components)?;
 
   Ok(ThebeManifest {
-    version: 4,
+    version: 5,
     server_router_path: THEBE_SERVER_ROUTES_FILE.to_owned(),
     app_html: AppHtmlMetadata {
       source_path: app_html_path
@@ -1211,6 +1369,7 @@ fn build_thebe_manifest(
     },
     layouts: layout_entries,
     routes,
+    components,
   })
 }
 
@@ -1268,7 +1427,45 @@ fn build_thebe_manifest_route(
       .collect(),
     template_bindings: route.template_bindings.clone(),
     template_symbols: route.template_symbols.clone(),
+    template_symbol_definitions: route
+      .template_symbol_definitions
+      .iter()
+      .map(|definition| template_symbol_metadata(&route.source, definition))
+      .collect(),
   })
+}
+
+fn build_thebe_manifest_components(
+  project_root: &Path,
+  components: &[ParsedComponent],
+) -> anyhow::Result<Vec<ComponentMetadata>> {
+  let mut components = components.iter().collect::<Vec<_>>();
+  components.sort_by(|left, right| left.trs_path.cmp(&right.trs_path));
+
+  components
+    .into_iter()
+    .map(|component| {
+      Ok(ComponentMetadata {
+        has_client_script: has_meaningful_block(component.blocks.script_ts.as_deref()),
+        has_style: has_meaningful_block(component.blocks.style.as_deref()),
+        module_path: component.module_path.clone(),
+        prop_names: component
+          .props
+          .iter()
+          .filter(|prop| !prop.path.contains('.'))
+          .map(|prop| prop.field_name.clone())
+          .collect(),
+        props: component
+          .props
+          .iter()
+          .filter(|prop| !prop.path.contains('.'))
+          .map(|prop| component_prop_metadata(&component.source, prop))
+          .collect(),
+        source_path: to_project_relative_path(project_root, &component.trs_path)?,
+        tag_name: component.tag_name.clone(),
+      })
+    })
+    .collect()
 }
 
 fn build_thebe_manifest_layouts(
@@ -1325,6 +1522,30 @@ fn template_binding_span_metadata(
   TemplateBindingMetadata {
     name: binding.name.clone(),
     source_span: source_span_metadata(source, binding.span),
+  }
+}
+
+fn template_symbol_metadata(
+  source: &str,
+  definition: &thebe_codegen::TemplateSymbolDefinition,
+) -> TemplateSymbolMetadata {
+  TemplateSymbolMetadata {
+    field_name: definition.field_name.clone(),
+    owner_type: definition.owner_type.clone(),
+    path: definition.path.clone(),
+    source_span: source_span_metadata(source, definition.span),
+    type_name: definition.type_name.clone(),
+  }
+}
+
+fn component_prop_metadata(
+  source: &str,
+  definition: &thebe_codegen::TemplateSymbolDefinition,
+) -> ComponentPropMetadata {
+  ComponentPropMetadata {
+    name: definition.field_name.clone(),
+    source_span: source_span_metadata(source, definition.span),
+    type_name: definition.type_name.clone(),
   }
 }
 
@@ -1491,6 +1712,34 @@ fn find_layout<'a>(
   None
 }
 
+fn file_to_component_module_path(component_path: &Path, components_dir: &Path) -> String {
+  let rel = component_path.strip_prefix(components_dir).unwrap_or(component_path);
+  let mut parts = vec![String::from("crate"), String::from("components")];
+  parts.extend(
+    rel.components()
+      .map(|component| component.as_os_str().to_string_lossy().into_owned()),
+  );
+
+  if let Some(last) = parts.last_mut() {
+    let stem = Path::new(last)
+      .file_stem()
+      .unwrap_or_default()
+      .to_string_lossy()
+      .into_owned();
+    *last = stem;
+  }
+
+  parts.join("::")
+}
+
+fn file_to_component_tag_name(component_path: &Path) -> String {
+  component_path
+    .file_stem()
+    .unwrap_or_default()
+    .to_string_lossy()
+    .into_owned()
+}
+
 fn file_to_route_path(trs_path: &Path, routes_dir: &Path) -> String {
   let rel = trs_path.strip_prefix(routes_dir).unwrap_or(trs_path);
   let stem = rel.file_stem().unwrap_or_default().to_string_lossy();
@@ -1655,7 +1904,7 @@ mod tests {
   #[test]
   fn build_manifest_records_generated_paths() {
     let manifest = ThebeManifest {
-      version: 4,
+      version: 5,
       server_router_path: THEBE_SERVER_ROUTES_FILE.to_owned(),
       app_html: AppHtmlMetadata {
         source_path: Some("app.html".to_owned()),
@@ -1709,6 +1958,40 @@ mod tests {
         }],
         template_bindings: vec!["count".to_owned()],
         template_symbols: vec!["count".to_owned()],
+        template_symbol_definitions: vec![TemplateSymbolMetadata {
+          field_name: "count".to_owned(),
+          owner_type: "Props".to_owned(),
+          path: "count".to_owned(),
+          source_span: SourceSpanMetadata {
+            start_byte: 30,
+            end_byte: 35,
+            start_line: 3,
+            start_column: 3,
+            end_line: 3,
+            end_column: 8,
+          },
+          type_name: "i64".to_owned(),
+        }],
+      }],
+      components: vec![ComponentMetadata {
+        has_client_script: true,
+        has_style: true,
+        module_path: "crate::components::Card".to_owned(),
+        prop_names: vec!["title".to_owned()],
+        props: vec![ComponentPropMetadata {
+          name: "title".to_owned(),
+          source_span: SourceSpanMetadata {
+            start_byte: 5,
+            end_byte: 10,
+            start_line: 2,
+            start_column: 3,
+            end_line: 2,
+            end_column: 8,
+          },
+          type_name: "String".to_owned(),
+        }],
+        source_path: "src/components/Card.trs".to_owned(),
+        tag_name: "Card".to_owned(),
       }],
     };
 
@@ -1723,6 +2006,7 @@ mod tests {
       ".thebe/types/routes/index.ts"
     );
     assert_eq!(json["routes"][0]["templateSymbols"][0], "count");
+    assert_eq!(json["components"][0]["tagName"], "Card");
   }
 
   #[test]
