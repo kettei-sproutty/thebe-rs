@@ -39,7 +39,7 @@ fn cargo_toml(name: &str) -> String {
   format!(
     r#"[package]
 name = "{name}"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 
 [dependencies]

@@ -2091,7 +2091,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "thebe-analyzer"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "swc_common",
  "swc_ecma_ast",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "thebe-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2113,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "thebe-codegen"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2126,7 +2126,7 @@ dependencies = [
 
 [[package]]
 name = "thebe-css"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "lightningcss",
  "thiserror",
@@ -2134,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "thebe-lsp"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "thebe-analyzer",
@@ -2147,14 +2147,14 @@ dependencies = [
 
 [[package]]
 name = "thebe-parser"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "thebe-project"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "thebe-runtime"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "minijinja",
  "serde_json",

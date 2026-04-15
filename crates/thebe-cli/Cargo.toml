@@ -1,15 +1,18 @@
 [package]
 name = "thebe-cli"
-version = "0.1.0"
-edition = "2024"
-
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
 [[bin]]
 name = "thebe"
 path = "src/main.rs"
 
 [dependencies]
-thebe-project = { path = "../thebe-project" }
-thebe-codegen = { path = "../thebe-codegen" }
+thebe-project = { path = "../thebe-project", version = "0.0.1" }
+thebe-codegen = { path = "../thebe-codegen", version = "0.0.1" }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 notify = "6"

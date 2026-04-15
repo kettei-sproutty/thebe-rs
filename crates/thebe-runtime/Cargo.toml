@@ -1,8 +1,11 @@
 [package]
 name = "thebe-runtime"
-version = "0.1.0"
-edition = "2024"
-
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
 [dependencies]
 minijinja = "2"
 serde_json = { workspace = true }

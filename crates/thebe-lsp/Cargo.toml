@@ -1,18 +1,21 @@
 [package]
 name = "thebe-lsp"
-version = "0.1.0"
-edition = "2024"
-
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
 [[bin]]
 name = "thebe-lsp"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-thebe-analyzer = { path = "../thebe-analyzer" }
-thebe-codegen = { path = "../thebe-codegen" }
-thebe-parser = { path = "../thebe-parser" }
-thebe-project = { path = "../thebe-project" }
+thebe-analyzer = { path = "../thebe-analyzer", version = "0.0.1" }
+thebe-codegen = { path = "../thebe-codegen", version = "0.0.1" }
+thebe-parser = { path = "../thebe-parser", version = "0.0.1" }
+thebe-project = { path = "../thebe-project", version = "0.0.1" }
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "time"] }
 tower-lsp = "0.20"
 

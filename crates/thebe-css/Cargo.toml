@@ -1,8 +1,11 @@
 [package]
 name = "thebe-css"
-version = "0.1.0"
-edition = "2024"
-
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
 [dependencies]
 lightningcss = { version = "1.0.0-alpha.71", features = ["visitor"] }
 thiserror = { workspace = true }
