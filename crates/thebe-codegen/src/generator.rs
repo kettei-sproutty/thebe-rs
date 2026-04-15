@@ -9,7 +9,7 @@ use thebe_parser::{SfcBlocks, SourceSpan};
 ///
 /// Every generated route embeds this verbatim into the served HTML so no
 /// external CDN or npm install is required during `thebe dev`.
-const THEBE_CLIENT_RUNTIME: &str = include_str!("../../../packages/thebe-client/runtime.js");
+const THEBE_CLIENT_RUNTIME: &str = include_str!("../scripts/runtime.js");
 
 const APP_HTML_TITLE_PLACEHOLDER: &str = "%thebe.title%";
 const APP_HTML_HEAD_PLACEHOLDER: &str = "%thebe.head%";
