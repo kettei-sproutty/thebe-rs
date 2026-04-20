@@ -324,6 +324,23 @@ pub fn generate_project_with_overlay(
     .iter()
     .any(|route| route.types_export_path.is_some());
 
+  // Compile component macros for template expansion.
+  let component_macros: Vec<thebe_codegen::ComponentMacro> = parsed_components
+    .iter()
+    .filter_map(|c| {
+      match thebe_codegen::generate_component(&c.blocks, &c.tag_name) {
+        Ok(mac) => Some(mac),
+        Err(err) => {
+          eprintln!(
+            "thebe: warning — skipping component {}: {err}",
+            c.trs_path.display()
+          );
+          None
+        }
+      }
+    })
+    .collect();
+
   if needs_type_bridge {
     ensure_ts_rs_dependency(project_root, overlay)?;
   }
@@ -341,6 +358,7 @@ pub fn generate_project_with_overlay(
       layout_arg,
       &app_html.contents,
       route.types_export_path.as_deref(),
+      &component_macros,
     )
     .with_context(|| format!("codegen error for {}", route.trs_path.display()))?;
 
@@ -641,6 +659,20 @@ fn collect_project_diagnostics(
     }
   }
 
+  // Compile component macros so route codegen can expand component tags.
+  let component_macros: Vec<thebe_codegen::ComponentMacro> = component_files
+    .iter()
+    .filter_map(|path| {
+      let source = overlay.read_to_string(path).ok()?;
+      let blocks = thebe_parser::parse_component_sfc(&source).ok()?;
+      let tag_name = file_to_component_tag_name(path);
+      match thebe_codegen::generate_component(&blocks, &tag_name) {
+        Ok(mac) => Some(mac),
+        Err(_) => None,
+      }
+    })
+    .collect();
+
   let mut route_entries = Vec::new();
   let mut any_client_routes = false;
 
@@ -653,6 +685,7 @@ fn collect_project_diagnostics(
       app_html_valid,
       &route_path,
       overlay,
+      &component_macros,
       &mut diagnostics,
     )?;
 
@@ -753,6 +786,7 @@ fn analyze_route_for_diagnostics(
   app_html_valid: bool,
   route_path: &Path,
   overlay: &ProjectOverlay,
+  component_macros: &[thebe_codegen::ComponentMacro],
   diagnostics: &mut Vec<ThebeDiagnostic>,
 ) -> anyhow::Result<Option<ParsedRoute>> {
   let source = overlay.read_to_string(route_path)?;
@@ -874,6 +908,7 @@ fn analyze_route_for_diagnostics(
       layout_arg,
       app_html,
       route.types_export_path.as_deref(),
+      component_macros,
     ) {
       diagnostics.push(codegen_error_diagnostic(
         project_root,

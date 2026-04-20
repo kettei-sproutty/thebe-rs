@@ -11,6 +11,7 @@ const THEBE_DIR: &str = ".thebe";
 const THEBE_DIAGNOSTICS_FILE: &str = ".thebe/diagnostics.json";
 const THEBE_MANIFEST_FILE: &str = ".thebe/manifest.json";
 const THEBE_SERVER_ROUTES_DIR: &str = ".thebe/server/routes";
+const THEBE_SERVER_COMPONENTS_DIR: &str = ".thebe/server/components";
 const THEBE_SERVER_ROUTES_FILE: &str = ".thebe/server/routes.rs";
 const TYPECHECK_CLIENT_DIR: &str = ".thebe/client";
 const TYPECHECK_TYPES_DIR: &str = ".thebe/types";
@@ -56,6 +57,11 @@ struct ParsedLayout {
 struct LoadedAppHtml {
   contents: String,
   source_path: Option<PathBuf>,
+}
+
+struct ParsedComponent {
+  trs_path: PathBuf,
+  component_macro: thebe_codegen::ComponentMacro,
 }
 
 /// Run `thebe dev`: parse all `.trs` route files, emit generated Rust sources,
@@ -108,6 +114,17 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
   let layouts = collect_layouts(routes_dir)?;
   let app_html = load_app_html(project_root)?;
 
+  // Collect components from src/components/ (optional directory).
+  let components_dir = src_dir.join("components");
+  let component_macros: Vec<thebe_codegen::ComponentMacro> = if components_dir.exists() {
+    collect_components(&components_dir)?
+      .into_iter()
+      .map(|c| c.component_macro)
+      .collect()
+  } else {
+    Vec::new()
+  };
+
   let trs_files = collect_trs_files(routes_dir)?;
   anyhow::ensure!(
     !trs_files.is_empty(),
@@ -137,6 +154,7 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
       layout_arg,
       &app_html.contents,
       route.types_export_path.as_deref(),
+      &component_macros,
     )
     .with_context(|| format!("codegen error for {}", route.trs_path.display()))?;
 
@@ -504,6 +522,7 @@ fn analyze_route_for_diagnostics(
       layout_arg,
       app_html,
       route.types_export_path.as_deref(),
+      &[],
     ) {
       diagnostics.push(codegen_error_diagnostic(
         project_root,
@@ -803,6 +822,13 @@ fn prepare_generated_workspace(project_root: &Path, typecheck_enabled: bool) -> 
     format!(
       "failed to create {}",
       project_root.join(THEBE_SERVER_ROUTES_DIR).display()
+    )
+  })?;
+
+  std::fs::create_dir_all(project_root.join(THEBE_SERVER_COMPONENTS_DIR)).with_context(|| {
+    format!(
+      "failed to create {}",
+      project_root.join(THEBE_SERVER_COMPONENTS_DIR).display()
     )
   })?;
 
@@ -1351,6 +1377,68 @@ fn collect_layouts(routes_dir: &Path) -> anyhow::Result<HashMap<PathBuf, ParsedL
     }
   }
   Ok(map)
+}
+
+/// Walk `components_dir` and compile every `.trs` file found into a
+/// [`thebe_codegen::ComponentMacro`].
+///
+/// Component names are derived from the PascalCase file stem (e.g. `Card.trs`
+/// → `Card`). Duplicate names across subdirectories are rejected to prevent
+/// ambiguous macro collisions.
+fn collect_components(components_dir: &Path) -> anyhow::Result<Vec<ParsedComponent>> {
+  let mut components: Vec<ParsedComponent> = Vec::new();
+
+  for entry in WalkDir::new(components_dir).min_depth(1) {
+    let entry = entry.context("failed to read directory entry")?;
+    if !entry.file_type().is_file() {
+      continue;
+    }
+    if !entry.path().extension().is_some_and(|e| e == "trs") {
+      continue;
+    }
+
+    let trs_path = entry.into_path();
+    let raw_stem = trs_path
+      .file_stem()
+      .unwrap_or_default()
+      .to_string_lossy()
+      .into_owned();
+
+    // Component names must start with an uppercase letter (PascalCase).
+    if !raw_stem.starts_with(|c: char| c.is_ascii_uppercase()) {
+      println!(
+        "thebe: skipping component {} — name must be PascalCase",
+        trs_path.display()
+      );
+      continue;
+    }
+
+    // Reject duplicate names.
+    if components.iter().any(|c| c.component_macro.name == raw_stem) {
+      anyhow::bail!(
+        "duplicate component name `{raw_stem}` — each component must have a unique PascalCase name"
+      );
+    }
+
+    let source = std::fs::read_to_string(&trs_path)
+      .with_context(|| format!("failed to read {}", trs_path.display()))?;
+    let blocks = thebe_parser::parse_component_sfc(&source)
+      .with_context(|| format!("parse error in {}", trs_path.display()))?;
+    let component_macro = thebe_codegen::generate_component(&blocks, &raw_stem)
+      .with_context(|| format!("codegen error for component {}", trs_path.display()))?;
+
+    println!(
+      "thebe: component {} → {} macro",
+      trs_path.display(),
+      component_macro.macro_name
+    );
+    components.push(ParsedComponent {
+      trs_path,
+      component_macro,
+    });
+  }
+
+  Ok(components)
 }
 
 /// Find the nearest `_layout.trs` that applies to `route_file`.

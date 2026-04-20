@@ -308,6 +308,142 @@ pub fn escape_rust_str(s: &str) -> String {
   out
 }
 
+// ── Component expansion ──────────────────────────────────────────────────────
+
+/// Replace `<slot>` / `<slot/>` / `<slot />` in a component template body with
+/// the Minijinja `{{ caller() }}` expression.
+///
+/// Used when building a component's `{% macro %}` body so that child content
+/// passed via `{% call %}` blocks is rendered in the right position.
+pub fn expand_slot(template: &str) -> String {
+  use thebe_parser::{TemplateToken, tokenize_template};
+
+  let tokens = tokenize_template(template);
+  let mut out = String::with_capacity(template.len());
+  for token in tokens {
+    match token {
+      TemplateToken::Text(s) => out.push_str(s),
+      TemplateToken::Slot => out.push_str("{{ caller() }}"),
+      // Nested components inside a component — pass through as raw HTML for now.
+      TemplateToken::ComponentOpen {
+        name,
+        attrs,
+        self_closing,
+      } => {
+        out.push('<');
+        out.push_str(name);
+        for attr in &attrs {
+          out.push(' ');
+          out.push_str(attr.name);
+          if let Some(val) = attr.value {
+            write!(out, "=\"{val}\"").expect("infallible");
+          }
+        }
+        if self_closing {
+          out.push_str(" />");
+        } else {
+          out.push('>');
+        }
+      }
+      TemplateToken::ComponentClose { name } => {
+        write!(out, "</{name}>").expect("infallible");
+      }
+    }
+  }
+  out
+}
+
+/// Build a Minijinja dict-literal string from component tag attributes.
+///
+/// * `:name="expr"` → dynamic: `"name": expr` (value emitted as Jinja expression)
+/// * `name="literal"` → static: `"name": "literal"`
+/// * `name` (boolean, no value) → `"name": true`
+fn build_jinja_props(attrs: &[thebe_parser::TemplateAttr<'_>]) -> String {
+  let mut out = String::from("{");
+  for (i, attr) in attrs.iter().enumerate() {
+    if i > 0 {
+      out.push_str(", ");
+    }
+    let key = attr.name.trim_start_matches(':');
+    write!(out, "\"{key}\": ").expect("infallible");
+    match (attr.name.starts_with(':'), attr.value) {
+      (true, Some(expr)) => out.push_str(expr),
+      (false, Some(literal)) => write!(out, "\"{literal}\"").expect("infallible"),
+      (_, None) => out.push_str("true"),
+    }
+  }
+  out.push('}');
+  out
+}
+
+/// Expand PascalCase component tags in a route template into Minijinja
+/// `{% call %}` / `{% endcall %}` blocks.
+///
+/// `known_names` is the set of component PascalCase names that are registered
+/// (e.g. `["Card", "Button"]`).  Only matching tags are transformed; unrecognised
+/// uppercase tags are passed through verbatim.
+///
+/// The returned string is the expanded template body **without** the macro
+/// definitions prepended — the caller is responsible for prepending them.
+pub fn expand_component_tags(template: &str, known_names: &[&str]) -> String {
+  use thebe_parser::{TemplateToken, tokenize_template};
+
+  if known_names.is_empty() {
+    return template.to_owned();
+  }
+
+  let tokens = tokenize_template(template);
+  let mut out = String::with_capacity(template.len() + 256);
+
+  for token in tokens {
+    match token {
+      TemplateToken::Text(s) => out.push_str(s),
+      TemplateToken::Slot => out.push_str("<slot />"),
+      TemplateToken::ComponentOpen {
+        name,
+        attrs,
+        self_closing,
+      } => {
+        if known_names.contains(&name) {
+          let macro_name = format!("__comp_{}", name.to_lowercase());
+          let props_dict = build_jinja_props(&attrs);
+          if self_closing {
+            write!(out, "{{% call {macro_name}({props_dict}) %}}{{% endcall %}}",)
+              .expect("infallible");
+          } else {
+            write!(out, "{{% call {macro_name}({props_dict}) %}}").expect("infallible");
+          }
+        } else {
+          // Unknown / unregistered PascalCase tag — pass through as raw HTML.
+          out.push('<');
+          out.push_str(name);
+          for attr in &attrs {
+            out.push(' ');
+            out.push_str(attr.name);
+            if let Some(val) = attr.value {
+              write!(out, "=\"{val}\"").expect("infallible");
+            }
+          }
+          if self_closing {
+            out.push_str(" />");
+          } else {
+            out.push('>');
+          }
+        }
+      }
+      TemplateToken::ComponentClose { name } => {
+        if known_names.contains(&name) {
+          out.push_str("{% endcall %}");
+        } else {
+          write!(out, "</{name}>").expect("infallible");
+        }
+      }
+    }
+  }
+
+  out
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

@@ -325,6 +325,7 @@ pub fn generate_route(
   layout: Option<(&SfcBlocks, &str)>,
   app_html: &str,
   props_types_path: Option<&str>,
+  components: &[ComponentMacro],
 ) -> Result<String, CodegenError> {
   let setup = blocks
     .script_setup
@@ -375,11 +376,33 @@ pub fn generate_route(
 
   // Compute a deterministic scope ID and apply CSS scoping.
   let scope = thebe_css::scope_id(route_path);
-  let template_scoped = thebe_css::add_scope_attrs(
-    &template::inject_hydration_markers(&blocks.template),
-    &scope,
-  );
-  let style = blocks
+
+  // Expand component tags (<Card />) into Jinja {% call %} blocks, then inject
+  // hydration markers, then apply CSS scoping — in that order so markers and
+  // scope attrs are not added to Jinja control-flow tokens.
+  let known_component_names: Vec<&str> = components.iter().map(|c| c.name.as_str()).collect();
+  let template_expanded =
+    template::expand_component_tags(&blocks.template, &known_component_names);
+  let template_hydrated = template::inject_hydration_markers(&template_expanded);
+  let template_scoped = thebe_css::add_scope_attrs(&template_hydrated, &scope);
+
+  // Prepend compiled component macro sources (already scoped with component
+  // scope IDs) before the route template body.
+  let component_macros_source: String = components
+    .iter()
+    .map(|c| c.jinja_macro.as_str())
+    .collect::<Vec<_>>()
+    .join("\n");
+  let template_with_macros = if component_macros_source.is_empty() {
+    template_scoped
+  } else {
+    format!("{component_macros_source}\n{template_scoped}")
+  };
+
+  let app_html_literal = escape_rust_raw_str(app_html);
+
+  // Merge component styles into the route style.
+  let route_style = blocks
     .style
     .as_deref()
     .filter(|s| !s.trim().is_empty())
@@ -387,10 +410,22 @@ pub fn generate_route(
     .transpose()
     .map_err(|e| CodegenError::CssError(e.to_string()))?
     .unwrap_or_default();
+  let merged_component_styles: String = components
+    .iter()
+    .filter(|c| !c.style.is_empty())
+    .map(|c| c.style.as_str())
+    .collect::<Vec<_>>()
+    .join("\n");
+  let style = if merged_component_styles.is_empty() {
+    route_style
+  } else if route_style.is_empty() {
+    merged_component_styles
+  } else {
+    format!("{merged_component_styles}\n{route_style}")
+  };
 
-  let app_html_literal = escape_rust_raw_str(app_html);
   let style_literal = escape_rust_raw_str(&style);
-  let template_literal = escape_rust_raw_str(&template_scoped);
+  let template_literal = escape_rust_raw_str(&template_with_macros);
 
   // Process the optional `<script lang="ts">` block.
   let client_js = client_script_ts
@@ -756,10 +791,73 @@ fn extract_state_type(param_type: &str) -> Option<&str> {
 /// Stateful routes must all agree on a single `State<T>` type so the helper can
 /// return one concrete router type.
 ///
-/// # Errors
-///
 /// Returns [`CodegenError::MixedRouteStateTypes`] when routes require more than
 /// one concrete state type.
+
+/// A compiled component ready to be embedded in route template rendering.
+///
+/// The component's Jinja macro body is inlined into any route template that
+/// uses the component so that all rendering stays within a single
+/// `minijinja::Environment` template with no cross-template imports.
+#[derive(Debug, Clone)]
+pub struct ComponentMacro {
+  /// PascalCase component name, e.g. `Card`.
+  pub name: String,
+  /// Jinja macro identifier used in `{% call %}` expressions, e.g. `__comp_card`.
+  pub macro_name: String,
+  /// Full `{% macro __comp_xxx(props) %}...{% endmacro %}` source.
+  ///
+  /// The component's HTML already has its own CSS scope attributes injected;
+  /// `<slot />` has been replaced with `{{ caller() }}`.
+  pub jinja_macro: String,
+  /// Processed and scoped CSS for this component (empty if no `<style>` block).
+  pub style: String,
+}
+
+/// Compile a component `.trs` file into a [`ComponentMacro`] ready for use in
+/// route template rendering.
+///
+/// Unlike routes, components do not produce an Axum handler. The returned value
+/// carries:
+/// - A Jinja `{% macro %}` whose body is the scoped, slot-expanded template.
+/// - Processed CSS scoped to the component via its own `scope_id`.
+///
+/// # Errors
+///
+/// Returns [`CodegenError`] when the template contains invalid bindings or the
+/// `<style>` block cannot be processed.
+pub fn generate_component(
+  blocks: &SfcBlocks,
+  component_name: &str,
+) -> Result<ComponentMacro, CodegenError> {
+  // Validate template bindings; components use `{{ props.field }}` (dotted paths).
+  crate::template::parse_template(&blocks.template)?;
+
+  let scope = thebe_css::scope_id(component_name);
+  let macro_name = format!("__comp_{}", component_name.to_lowercase());
+
+  // Replace <slot /> with {{ caller() }} then apply CSS scope attributes.
+  let template_slot_expanded = crate::template::expand_slot(&blocks.template);
+  let template_scoped = thebe_css::add_scope_attrs(&template_slot_expanded, &scope);
+
+  let jinja_macro = format!(
+    "{{% macro {macro_name}(props) %}}\n{template_scoped}\n{{% endmacro %}}",
+  );
+
+  let style = if let Some(css) = &blocks.style {
+    thebe_css::process_style(css, &scope).map_err(|e| CodegenError::CssError(e.to_string()))?
+  } else {
+    String::new()
+  };
+
+  Ok(ComponentMacro {
+    name: component_name.to_owned(),
+    macro_name,
+    jinja_macro,
+    style,
+  })
+}
+
 pub fn generate_routes_file(routes: &[RouteEntry]) -> Result<String, CodegenError> {
   let mut source = String::new();
   source.push_str("// AUTOGENERATED by thebe \u{2014} do not edit\n");
@@ -1868,6 +1966,7 @@ mod tests {
       None,
       default_app_html(),
       Some("routes/index.ts"),
+      &[],
     )
     .unwrap();
 
@@ -1920,6 +2019,7 @@ mod tests {
       None,
       default_app_html(),
       Some("routes/index.ts"),
+      &[],
     )
     .unwrap_err();
 
@@ -1945,7 +2045,7 @@ mod tests {
 
     let app_html =
       "<html><head><title>%thebe.title%</title>%thebe.head%</head><body>%thebe.body%</body></html>";
-    let src = generate_route(&blocks, "/", None, app_html, None).unwrap();
+    let src = generate_route(&blocks, "/", None, app_html, None, &[]).unwrap();
 
     assert!(src.contains("const __HEAD_TEMPLATE"));
     assert!(src.contains("const __TITLE_TEMPLATE"));
@@ -1968,7 +2068,7 @@ mod tests {
             ..SfcBlocks::default()
         };
 
-    let src = generate_route(&blocks, "/blog/:slug", None, default_app_html(), None).unwrap();
+    let src = generate_route(&blocks, "/blog/:slug", None, default_app_html(), None, &[]).unwrap();
 
     assert!(src.contains(
       "async fn __thebe_render_handler(__thebe_arg0: Path<String>, __thebe_arg1: State<AppState>)"
@@ -1991,7 +2091,7 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let src = generate_route(&blocks, "/", None, default_app_html(), None).unwrap();
+    let src = generate_route(&blocks, "/", None, default_app_html(), None, &[]).unwrap();
 
     assert!(src.contains("pub fn router<S>() -> axum::Router<S>"));
     assert!(src.contains("axum::Router::<S>::new().route("));
@@ -2081,7 +2181,7 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let err = generate_route(&blocks, "/", None, "<html>%thebe.head%</html>", None).unwrap_err();
+    let err = generate_route(&blocks, "/", None, "<html>%thebe.head%</html>", None, &[]).unwrap_err();
 
     assert!(matches!(err, CodegenError::InvalidAppHtml(_)));
   }
@@ -2097,7 +2197,7 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let err = generate_route(&blocks, "/", None, default_app_html(), None).unwrap_err();
+    let err = generate_route(&blocks, "/", None, default_app_html(), None, &[]).unwrap_err();
 
     assert!(matches!(err, CodegenError::InvalidAppHtml(_)));
   }

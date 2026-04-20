@@ -448,6 +448,244 @@ fn trim_block_content(s: &str, span: SourceSpan) -> (String, SourceSpan) {
   )
 }
 
+// ── Template tokenizer ───────────────────────────────────────────────────────
+
+/// An attribute parsed from a component opening tag in an HTML template.
+#[derive(Debug, PartialEq, Clone)]
+pub struct TemplateAttr<'a> {
+  /// Attribute name. May start with `:` to indicate a dynamic (Jinja expression) binding.
+  pub name: &'a str,
+  /// Attribute value without surrounding quotes, or `None` for boolean attributes.
+  pub value: Option<&'a str>,
+}
+
+/// A token produced by the template tokenizer.
+///
+/// Standard HTML elements and `{{ }}` Jinja expressions are emitted as raw
+/// [`TemplateToken::Text`] slices; only PascalCase component tags and `<slot>`
+/// are emitted as structured variants.
+#[derive(Debug, PartialEq)]
+pub enum TemplateToken<'a> {
+  /// A raw text/HTML run that should be forwarded verbatim.
+  Text(&'a str),
+  /// An opening tag for a component (first letter is ASCII uppercase).
+  ComponentOpen {
+    /// PascalCase component name, e.g. `Card`.
+    name: &'a str,
+    /// Parsed attributes.
+    attrs: Vec<TemplateAttr<'a>>,
+    /// `true` when the tag is self-closing (`<Card />`).
+    self_closing: bool,
+  },
+  /// A closing tag for a component (`</Card>`).
+  ComponentClose {
+    /// PascalCase component name.
+    name: &'a str,
+  },
+  /// A `<slot>`, `<slot/>`, or `<slot />` placeholder.
+  Slot,
+}
+
+/// Tokenize a Thebe HTML template string into a flat stream of tokens.
+///
+/// Only tags whose name starts with an ASCII uppercase letter and `<slot>` are
+/// emitted as structured [`TemplateToken`] variants. Everything else —
+/// conventional HTML elements, comments, `{{ }}` Jinja expressions — is
+/// forwarded verbatim as [`TemplateToken::Text`] slices.
+pub fn tokenize_template(template: &str) -> Vec<TemplateToken<'_>> {
+  let mut tokens: Vec<TemplateToken<'_>> = Vec::new();
+  let bytes = template.as_bytes();
+  let len = bytes.len();
+  let mut i = 0usize;
+  let mut text_start = 0usize;
+
+  while i < len {
+    if bytes[i] != b'<' {
+      i += 1;
+      continue;
+    }
+
+    let lt_pos = i;
+    if let Some((tok, consumed)) = try_parse_component_or_slot_tag(&template[lt_pos..]) {
+      if text_start < lt_pos {
+        tokens.push(TemplateToken::Text(&template[text_start..lt_pos]));
+      }
+      tokens.push(tok);
+      i = lt_pos + consumed;
+      text_start = i;
+    } else {
+      i += 1;
+    }
+  }
+
+  if text_start < len {
+    tokens.push(TemplateToken::Text(&template[text_start..]));
+  }
+
+  tokens
+}
+
+/// Try to parse one component open/close tag or `<slot>` starting at `input`
+/// (which must begin with `<`).
+///
+/// Returns `(token, bytes_consumed)` on success, or `None` if this position
+/// is not the start of a recognised component/slot tag.
+fn try_parse_component_or_slot_tag(input: &str) -> Option<(TemplateToken<'_>, usize)> {
+  let bytes = input.as_bytes();
+  debug_assert_eq!(bytes.first(), Some(&b'<'));
+  let mut i = 1usize;
+
+  // Closing tag: </Name>
+  if bytes.get(i) == Some(&b'/') {
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+      i += 1;
+    }
+    let name_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+      i += 1;
+    }
+    let name = &input[name_start..i];
+    if name.is_empty() || !bytes.get(name_start).is_some_and(|b| b.is_ascii_uppercase()) {
+      return None;
+    }
+    while i < bytes.len() && bytes[i] != b'>' {
+      i += 1;
+    }
+    if i >= bytes.len() {
+      return None;
+    }
+    i += 1; // consume '>'
+    return Some((TemplateToken::ComponentClose { name }, i));
+  }
+
+  // Skip optional whitespace after '<'
+  while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+    i += 1;
+  }
+
+  let name_start = i;
+  while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+    i += 1;
+  }
+  let name = &input[name_start..i];
+  if name.is_empty() {
+    return None;
+  }
+
+  // `<slot>` / `<slot />` / `<slot/>` — case-insensitive
+  if name.eq_ignore_ascii_case("slot") {
+    while i < bytes.len() && bytes[i] != b'>' {
+      i += 1;
+    }
+    if i >= bytes.len() {
+      return None;
+    }
+    i += 1;
+    return Some((TemplateToken::Slot, i));
+  }
+
+  // Must start with ASCII uppercase for a PascalCase component.
+  if !bytes.get(name_start).is_some_and(|b| b.is_ascii_uppercase()) {
+    return None;
+  }
+
+  // Parse attributes.
+  let mut attrs: Vec<TemplateAttr<'_>> = Vec::new();
+  let mut self_closing = false;
+
+  'outer: loop {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+      i += 1;
+    }
+    if i >= bytes.len() {
+      return None;
+    }
+    match bytes[i] {
+      b'>' => {
+        i += 1;
+        break 'outer;
+      }
+      b'/' if bytes.get(i + 1) == Some(&b'>') => {
+        self_closing = true;
+        i += 2;
+        break 'outer;
+      }
+      _ => {}
+    }
+
+    // Attribute name (may start with `:` for dynamic bindings).
+    let attr_name_start = i;
+    while i < bytes.len()
+      && !bytes[i].is_ascii_whitespace()
+      && bytes[i] != b'='
+      && bytes[i] != b'>'
+      && !(bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'>'))
+    {
+      i += 1;
+    }
+    if i == attr_name_start {
+      return None;
+    }
+    let attr_name = &input[attr_name_start..i];
+
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+      i += 1;
+    }
+
+    let value = if bytes.get(i) == Some(&b'=') {
+      i += 1;
+      while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+      }
+      if i >= bytes.len() {
+        return None;
+      }
+      if matches!(bytes[i], b'"' | b'\'') {
+        let quote = bytes[i];
+        i += 1;
+        let val_start = i;
+        while i < bytes.len() && bytes[i] != quote {
+          i += 1;
+        }
+        if i >= bytes.len() {
+          return None;
+        }
+        let val = &input[val_start..i];
+        i += 1; // consume closing quote
+        Some(val)
+      } else {
+        // Unquoted value — scan to whitespace or tag end.
+        let val_start = i;
+        while i < bytes.len()
+          && !bytes[i].is_ascii_whitespace()
+          && bytes[i] != b'>'
+          && !(bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'>'))
+        {
+          i += 1;
+        }
+        Some(&input[val_start..i])
+      }
+    } else {
+      None
+    };
+
+    attrs.push(TemplateAttr {
+      name: attr_name,
+      value,
+    });
+  }
+
+  Some((
+    TemplateToken::ComponentOpen {
+      name,
+      attrs,
+      self_closing,
+    },
+    i,
+  ))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

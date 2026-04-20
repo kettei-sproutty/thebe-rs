@@ -20,10 +20,19 @@ pub fn handler() -> Props {
 
 <div class="max-w-2xl mx-auto py-12">
     <h1 class="text-4xl font-extrabold text-slate-900 tracking-tight mb-4 text-center sm:text-left">About {{ name }}</h1>
-    
+
     <p class="text-xl text-slate-600 leading-relaxed mb-10 text-center sm:text-left">
         {{ tagline }}
     </p>
+
+    <div class="grid grid-cols-2 gap-4 mb-10">
+        <StatCard :label="'Framework'" :value="name">
+            <p class="text-xs text-slate-500 mt-1">Full-stack Rust SFC</p>
+        </StatCard>
+        <StatCard label="Rendering" value="SSR">
+            <p class="text-xs text-slate-500 mt-1">Zero virtual DOM</p>
+        </StatCard>
+    </div>
 
     <div class="bg-white p-8 rounded-2xl shadow-sm border border-slate-200">
         <h2 class="text-lg font-semibold text-slate-900 mb-6 uppercase tracking-wider text-sm">Key Features</h2>
