@@ -1,0 +1,3 @@
+[tailwind]
+input = "src/input.css"
+output = "public/global.css"

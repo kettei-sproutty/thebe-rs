@@ -50,67 +50,20 @@ function reset() {
 }
 </script>
 
-<main>
-    <h1>{{ title }}</h1>
-    <p class="hint">The count lives in Axum state. Buttons post to the server and hydrate the returned value.</p>
-     <div class="controls">
-      <button onclick="decrement">−</button>
-      <button onclick="increment">+</button>
-      <button onclick="reset">Reset</button>
+<div class="flex flex-col items-center justify-center flex-grow py-12">
+    <h1 class="text-4xl font-bold text-slate-900 mb-6">{{ title }}</h1>
+    
+    <p class="text-center text-slate-500 max-w-md mb-10 leading-relaxed text-lg">
+        The count lives in Axum state. Buttons post to the server and hydrate the returned value.
+    </p>
+    
+    <div class="bg-white px-12 py-10 rounded-2xl shadow-sm border border-slate-200 flex flex-col items-center">
+        <p class="text-7xl font-extrabold text-indigo-600 mb-8 tracking-tighter">{{ count }}</p>
+        
+        <div class="flex gap-4">
+            <button onclick="decrement" class="h-12 w-16 text-2xl font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 hover:text-slate-900 rounded-xl transition-all shadow-sm active:scale-95">−</button>
+            <button onclick="reset" class="h-12 px-6 text-sm font-semibold text-slate-500 border-2 border-slate-200 hover:border-slate-300 hover:bg-slate-50 rounded-xl transition-all active:scale-95 uppercase tracking-wide">Reset</button>
+            <button onclick="increment" class="h-12 w-16 text-2xl font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl transition-all shadow-sm shadow-indigo-200 active:scale-95">+</button>
+        </div>
     </div>
-    <div style="display: flex; gap: 1rem; justify-content: center; margin-bottom: 2rem;">
-      <p class="count">{{ count }}</p>
-    </div>
-</main>
-
-<style>
-
-main {
-  min-height: 100dvh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  font-family: system-ui, sans-serif;
-}
-
-h1 {
-    font-size: 2rem;
-    margin-bottom: 1rem;
-}
-
-.hint {
-  max-width: 28rem;
-  text-align: center;
-  color: #555;
-  margin: 0 0 1.5rem;
-  line-height: 1.5;
-}
-
-.count {
-    font-size: 4rem;
-    font-weight: bold;
-    margin: 1rem 0;
-}
-
-.controls {
-    display: flex;
-    gap: 1rem;
-    justify-content: center;
-    margin-bottom: 2rem;
-}
-
-button {
-    height: 3rem;
-    font-size: 1.5rem;
-    border: 2px solid #1a1a1a;
-    background: white;
-    border-radius: 0.5rem;
-    cursor: pointer;
-}
-
-button:hover {
-    background: #1a1a1a;
-    color: white;
-}
-</style>
+</div>
