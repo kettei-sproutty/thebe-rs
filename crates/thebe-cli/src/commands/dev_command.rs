@@ -8,6 +8,23 @@ pub fn run(watch: bool) -> anyhow::Result<()> {
   let project_root = find_project_root()?;
   println!("thebe: project root at {}", project_root.display());
 
+  let config = thebe_project::ThebeConfig::load(&project_root)
+    .context("failed to load thebe.toml")?;
+
+  if let Some(pre_build) = config.get_hook("pre_build") {
+    println!("thebe: running pre_build hook: {}", pre_build);
+    let status = Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
+      .arg(if cfg!(target_os = "windows") { "/C" } else { "-c" })
+      .arg(pre_build)
+      .current_dir(&project_root)
+      .status()
+      .context("failed to execute pre_build hook")?;
+
+    if !status.success() {
+      anyhow::bail!("pre_build hook failed with status {:?}", status.code());
+    }
+  }
+
   run_codegen(&project_root)?;
 
   if watch {
@@ -118,6 +135,30 @@ fn run_watch(project_root: &Path) -> anyhow::Result<()> {
     println!("thebe: change detected — rebuilding…");
     kill_server(&mut child);
 
+    match thebe_project::ThebeConfig::load(project_root) {
+      Ok(config) => {
+        if let Some(on_change) = config.get_hook("on_change") {
+          println!("thebe: running on_change hook: {}", on_change);
+          let status = Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
+            .arg(if cfg!(target_os = "windows") { "/C" } else { "-c" })
+            .arg(on_change)
+            .current_dir(project_root)
+            .status();
+
+          if let Err(e) = status {
+            println!("thebe: \u{1b}[31mon_change hook failed\u{1b}[0m: {}", e);
+          } else if let Ok(status) = status {
+            if !status.success() {
+              println!("thebe: \u{1b}[31mon_change hook failed with status {:?}\u{1b}[0m", status.code());
+            }
+          }
+        }
+      }
+      Err(err) => {
+        println!("thebe: \u{1b}[31mfailed to load thebe.toml configuration\u{1b}[0m: {}", err);
+      }
+    }
+
     match run_codegen(project_root) {
       Err(err) => eprintln!("thebe: codegen error: {err:#}"),
       Ok(()) => match spawn_server(project_root) {
@@ -142,6 +183,7 @@ fn is_codegen_event(res: &notify::Result<notify::Event>, project_root: &Path) ->
         path.extension().is_some_and(|ext| ext == "trs")
           || is_app_html_path(path, project_root)
           || is_cargo_toml_path(path, project_root)
+          || is_thebe_toml_path(path, project_root)
       })
     }
     Err(_) => false,
@@ -159,6 +201,13 @@ fn is_cargo_toml_path(path: &Path, project_root: &Path) -> bool {
   path
     .file_name()
     .is_some_and(|file_name| file_name == "Cargo.toml")
+    && path.parent().is_some_and(|parent| parent == project_root)
+}
+
+fn is_thebe_toml_path(path: &Path, project_root: &Path) -> bool {
+  path
+    .file_name()
+    .is_some_and(|file_name| file_name == "thebe.toml")
     && path.parent().is_some_and(|parent| parent == project_root)
 }
 

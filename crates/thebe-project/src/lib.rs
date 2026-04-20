@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use thebe_parser::SourceSpan;
 use walkdir::WalkDir;
 
+pub mod config;
+pub use config::ThebeConfig;
+
 pub const THEBE_DIR: &str = ".thebe";
 pub const THEBE_DIAGNOSTICS_FILE: &str = ".thebe/diagnostics.json";
 pub const THEBE_MANIFEST_FILE: &str = ".thebe/manifest.json";
