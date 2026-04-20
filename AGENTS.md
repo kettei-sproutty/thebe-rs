@@ -62,7 +62,7 @@ See README.md:391-410 for full structure.
 Routes live in `src/routes/`, components in `src/components/`.
 - Routes define handlers via `#[thebe::get]`, `#[thebe::post]`, etc. in `<script setup>`
 - Components have no `<script setup>` and no handlers. Use `<script>` (no "setup") to define `Props`.
-- Dynamic segments: `[slug].trs` → `/blog/:slug` → `Path<String>` extractor
+- Dynamic segments: `[slug].trs` → `/blog/{slug}` → `Path<String>` extractor
 
 See README.md:112-149.
 

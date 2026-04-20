@@ -1490,8 +1490,8 @@ fn file_to_route_path(trs_path: &Path, routes_dir: &Path) -> String {
     "/".to_owned()
   } else {
     let path = segments.join("/");
-    // Convert file-system dynamic segments `[param]` → `:param`.
-    let path = path.replace('[', ":").replace(']', "");
+    // Convert file-system dynamic segments `[param]` → `{param}` (Axum v0.8+ syntax).
+    let path = path.replace('[', "{").replace(']', "}");
     format!("/{path}")
   }
 }
@@ -1568,7 +1568,7 @@ mod tests {
   fn file_to_route_path_maps_nested_and_dynamic_routes() {
     let routes_dir = Path::new("/tmp/app/src/routes");
     let path = Path::new("/tmp/app/src/routes/blog/[slug].trs");
-    assert_eq!(file_to_route_path(path, routes_dir), "/blog/:slug");
+    assert_eq!(file_to_route_path(path, routes_dir), "/blog/{slug}");
   }
 
   #[test]
