@@ -117,6 +117,7 @@ Thebe's design strictly bounds complexity by keeping server code, client updates
 
 - [Architecture & Parsing Strategy](docs/architecture.md)
 - [Current Status](docs/status.md)
+- [Configuration & Tailwind](docs/configuration.md)
 - [Editor Tooling & LSP](docs/editor-tooling.md)
 - [Syntax & File Semantics](docs/syntax-and-semantics.md)
 - [Routing & Axum Handlers](docs/routing-and-handlers.md)
@@ -132,6 +133,7 @@ Thebe's design strictly bounds complexity by keeping server code, client updates
 ```
 my-app/
 ├── Cargo.toml
+├── thebe.toml          # Optional compiler hooks and Tailwind CSS config
 ├── app.html            # outer document shell (`%thebe.head%`, `%thebe.body%`)
 ├── src/
 │   ├── main.rs
