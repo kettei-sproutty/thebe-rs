@@ -16,6 +16,8 @@ thebe-codegen = { path = "../thebe-codegen", version = "0.0.1" }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 notify = "6"
+reqwest = { version = "0.13.2", features = ["blocking"] }
+directories = "6.0.0"
 
 [lints]
 workspace = true

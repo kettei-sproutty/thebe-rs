@@ -3,6 +3,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use anyhow::Context;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct TailwindConfig {
+    pub input: String,
+    pub output: String,
+}
+
 /// Parsed Thebe configuration from `thebe.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -10,6 +17,9 @@ pub struct ThebeConfig {
     /// Hook commands indexed by lifecycle event (e.g., "pre_build", "on_change").
     #[serde(default)]
     pub hooks: HashMap<String, String>,
+    /// Configuration for Tailwind CSS integration.
+    #[serde(default)]
+    pub tailwind: Option<TailwindConfig>,
     /// Additional configuration tables for future extensibility.
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,

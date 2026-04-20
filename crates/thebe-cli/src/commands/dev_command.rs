@@ -25,6 +25,10 @@ pub fn run(watch: bool) -> anyhow::Result<()> {
     }
   }
 
+  if let Some(tailwind_config) = &config.tailwind {
+    crate::tailwind::ensure_and_run(&project_root, tailwind_config)?;
+  }
+
   run_codegen(&project_root)?;
 
   if watch {
@@ -151,6 +155,12 @@ fn run_watch(project_root: &Path) -> anyhow::Result<()> {
             if !status.success() {
               println!("thebe: \u{1b}[31mon_change hook failed with status {:?}\u{1b}[0m", status.code());
             }
+          }
+        }
+
+        if let Some(tailwind_config) = config.tailwind {
+          if let Err(e) = crate::tailwind::ensure_and_run(project_root, &tailwind_config) {
+            println!("thebe: \u{1b}[31mtailwind error\u{1b}[0m: {:?}", e);
           }
         }
       }
