@@ -10,5 +10,6 @@ pub use generator::{
   validate_app_html,
 };
 pub use template::{
-  TemplateBindingOccurrence, list_template_binding_occurrences, list_template_bindings,
+  TemplateBindingOccurrence, inject_attr_bindings, list_template_binding_occurrences,
+  list_template_bindings,
 };

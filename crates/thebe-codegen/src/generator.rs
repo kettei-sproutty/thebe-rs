@@ -377,13 +377,15 @@ pub fn generate_route(
   // Compute a deterministic scope ID and apply CSS scoping.
   let scope = thebe_css::scope_id(route_path);
 
-  // Expand component tags (<Card />) into Jinja {% call %} blocks, then inject
-  // hydration markers, then apply CSS scoping — in that order so markers and
-  // scope attrs are not added to Jinja control-flow tokens.
+  // Expand component tags (<Card />) into Jinja {% call %} blocks, then
+  // transform `:attr="key"` bindings, then inject hydration markers, then apply
+  // CSS scoping — in that order so markers and scope attrs are not added to
+  // Jinja control-flow tokens.
   let known_component_names: Vec<&str> = components.iter().map(|c| c.name.as_str()).collect();
   let template_expanded =
     template::expand_component_tags(&blocks.template, &known_component_names);
-  let template_hydrated = template::inject_hydration_markers(&template_expanded);
+  let template_attr_bound = template::inject_attr_bindings(&template_expanded);
+  let template_hydrated = template::inject_hydration_markers(&template_attr_bound);
   let template_scoped = thebe_css::add_scope_attrs(&template_hydrated, &scope);
 
   // Prepend compiled component macro sources (already scoped with component
@@ -836,9 +838,11 @@ pub fn generate_component(
   let scope = thebe_css::scope_id(component_name);
   let macro_name = format!("__comp_{}", component_name.to_lowercase());
 
-  // Replace <slot /> with {{ caller() }} then apply CSS scope attributes.
+  // Replace <slot /> with {{ caller() }}, transform `:attr` bindings, then
+  // apply CSS scope attributes.
   let template_slot_expanded = crate::template::expand_slot(&blocks.template);
-  let template_scoped = thebe_css::add_scope_attrs(&template_slot_expanded, &scope);
+  let template_attr_bound = crate::template::inject_attr_bindings(&template_slot_expanded);
+  let template_scoped = thebe_css::add_scope_attrs(&template_attr_bound, &scope);
 
   let jinja_macro = format!(
     "{{% macro {macro_name}(props) %}}\n{template_scoped}\n{{% endmacro %}}",

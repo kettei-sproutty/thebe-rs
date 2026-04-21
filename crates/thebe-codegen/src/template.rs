@@ -308,6 +308,258 @@ pub fn escape_rust_str(s: &str) -> String {
   out
 }
 
+// ── Dynamic attribute bindings (:attr="key") ────────────────────────────────
+
+/// Transform a Thebe template so that each `:attr="key"` binding on a plain
+/// HTML element tag is rewritten to a concrete attribute plus a client-side
+/// hydration marker.
+///
+/// ```text
+/// <div :class="theme">
+///   → <div class="{{ theme }}" data-thebe-attr="class:theme">
+/// ```
+///
+/// Multiple dynamic attributes on the same element are coalesced into a single
+/// `data-thebe-attr` value:
+///
+/// ```text
+/// <div :class="theme" :id="itemId">
+///   → <div class="{{ theme }}" id="{{ itemId }}" data-thebe-attr="class:theme,id:itemId">
+/// ```
+///
+/// Static attrs that share a name with a dynamic attr (e.g. `class` alongside
+/// `:class`) are dropped — the dynamic binding takes precedence.
+///
+/// PascalCase (component) tags are skipped — they are handled by
+/// `expand_component_tags`.
+///
+/// Call this **before** `inject_hydration_markers`. The injected `{{ expr }}`
+/// inside attribute position is consumed as part of the tag buffer by the
+/// later pass and will not be wrapped in text-content comment markers.
+pub fn inject_attr_bindings(template: &str) -> String {
+  let mut out = String::with_capacity(template.len() + 64);
+  let mut chars = template.chars().peekable();
+
+  while let Some(ch) = chars.next() {
+    if ch != '<' {
+      out.push(ch);
+      continue;
+    }
+
+    // Accumulate the full tag, quote-aware, up to and including `>`.
+    let mut tag_buf = String::from('<');
+    let mut in_quote: Option<char> = None;
+    loop {
+      let Some(c) = chars.next() else { break };
+      tag_buf.push(c);
+      match in_quote {
+        Some(q) if c == q => in_quote = None,
+        None if c == '"' || c == '\'' => in_quote = Some(c),
+        None if c == '>' => break,
+        _ => {}
+      }
+    }
+
+    out.push_str(&transform_tag_attr_bindings(&tag_buf));
+  }
+
+  out
+}
+
+/// Rewrite `:attr="key"` dynamic bindings in a single **complete** tag string.
+///
+/// Returns the tag unchanged when:
+/// * it is a closing, comment, or doctype token
+/// * the tag name starts with an uppercase letter (component tag)
+/// * the tag contains no `:name="…"` attributes
+fn transform_tag_attr_bindings(tag: &str) -> String {
+  let inner = tag.trim_start_matches('<');
+
+  // Closing tags, comments (`<!--`), and doctypes (`<!`): pass through.
+  let first_meaningful = inner.trim_start();
+  if first_meaningful.starts_with('/') || first_meaningful.starts_with('!') {
+    return tag.to_owned();
+  }
+
+  // Extract tag name.
+  let name_end = first_meaningful
+    .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+    .unwrap_or(first_meaningful.len());
+  let tag_name = &first_meaningful[..name_end];
+
+  // Skip PascalCase (component) and void/empty.
+  if tag_name.is_empty() || tag_name.chars().next().map_or(false, char::is_uppercase) {
+    return tag.to_owned();
+  }
+
+  // Fast path: no `:` in the rest of the tag → nothing to transform.
+  let after_name = &first_meaningful[name_end..];
+  if !after_name.contains(':') {
+    return tag.to_owned();
+  }
+
+  // Determine self-closing before stripping the trailing `>`.
+  let self_closing = tag.ends_with("/>") || tag.trim_end().ends_with("/>");
+
+  // Strip the trailing `>` (and `/` for self-closing) so the attr parser
+  // receives only the attribute list.
+  let attrs_raw = if self_closing {
+    after_name
+      .strip_suffix('>')
+      .and_then(|s| s.strip_suffix('/'))
+      .unwrap_or(after_name)
+  } else {
+    after_name.strip_suffix('>').unwrap_or(after_name)
+  };
+
+  let attrs = parse_tag_attrs(attrs_raw);
+
+  // Collect the bare names that have a corresponding dynamic binding.
+  let dynamic_bare_names: Vec<&str> = attrs
+    .iter()
+    .filter(|(name, _)| name.starts_with(':'))
+    .map(|(name, _)| name[1..].as_ref())
+    .collect();
+
+  if dynamic_bare_names.is_empty() {
+    return tag.to_owned();
+  }
+
+  // Rebuild the tag.
+  let mut rebuilt = format!("<{tag_name}");
+  let mut data_attr_spec = String::new();
+
+  for (name, value) in &attrs {
+    if let Some(bare_name) = name.strip_prefix(':') {
+      // Dynamic binding: `:foo="bar"` → `foo="{{ bar }}"`.
+      let key = value.as_deref().unwrap_or("").trim();
+      if is_valid_binding_key(key) {
+        if !data_attr_spec.is_empty() {
+          data_attr_spec.push(',');
+        }
+        write!(data_attr_spec, "{bare_name}:{key}").expect("infallible");
+        write!(rebuilt, r#" {bare_name}="{{{{ {key} }}}}""#).expect("infallible");
+      } else {
+        // Invalid key — pass through verbatim to avoid silently dropping attrs.
+        match value {
+          Some(v) => write!(rebuilt, r#" {name}="{v}""#).expect("infallible"),
+          None => write!(rebuilt, " {name}").expect("infallible"),
+        }
+      }
+    } else if dynamic_bare_names.contains(&name.as_str()) {
+      // Static attr shadowed by a dynamic binding with the same name: drop it.
+    } else {
+      // Static attr: emit unchanged.
+      match value {
+        Some(v) => write!(rebuilt, r#" {name}="{v}""#).expect("infallible"),
+        None => write!(rebuilt, " {name}").expect("infallible"),
+      }
+    }
+  }
+
+  if !data_attr_spec.is_empty() {
+    write!(rebuilt, r#" data-thebe-attr="{data_attr_spec}""#).expect("infallible");
+  }
+
+  if self_closing {
+    rebuilt.push_str(" />");
+  } else {
+    rebuilt.push('>');
+  }
+
+  rebuilt
+}
+
+/// Parse the attribute list portion of a tag (the text between the tag name
+/// and the closing `>` / `/>`).
+///
+/// Returns a `Vec` of `(name, Option<value>)` pairs in source order.  Attribute
+/// names may begin with `:` for dynamic bindings.  Quoted values are unquoted.
+fn parse_tag_attrs(s: &str) -> Vec<(String, Option<String>)> {
+  let mut attrs = Vec::new();
+  let mut chars = s.chars().peekable();
+
+  loop {
+    // Skip whitespace.
+    while chars.peek().map_or(false, |c| c.is_ascii_whitespace()) {
+      chars.next();
+    }
+
+    // Stop at end, `>`, or the `/` of `/>`.
+    match chars.peek() {
+      None | Some('>') | Some('/') => break,
+      _ => {}
+    }
+
+    // Read attr name; may start with `:`.
+    let mut name = String::new();
+    while let Some(&c) = chars.peek() {
+      if c.is_ascii_whitespace() || c == '=' || c == '>' || c == '/' {
+        break;
+      }
+      name.push(c);
+      chars.next();
+    }
+
+    if name.is_empty() {
+      break;
+    }
+
+    // Skip whitespace.
+    while chars.peek().map_or(false, |c| c.is_ascii_whitespace()) {
+      chars.next();
+    }
+
+    if chars.peek() != Some(&'=') {
+      // Boolean attribute — no value.
+      attrs.push((name, None));
+      continue;
+    }
+
+    chars.next(); // consume `=`
+
+    // Skip whitespace.
+    while chars.peek().map_or(false, |c| c.is_ascii_whitespace()) {
+      chars.next();
+    }
+
+    // Read value — quoted or bare.
+    let value = match chars.peek().copied() {
+      Some(q @ '"') | Some(q @ '\'') => {
+        chars.next(); // consume open quote
+        let mut v = String::new();
+        for c in chars.by_ref() {
+          if c == q {
+            break;
+          }
+          v.push(c);
+        }
+        v
+      }
+      _ => {
+        let mut v = String::new();
+        while let Some(&c) = chars.peek() {
+          if c.is_ascii_whitespace() || c == '>' {
+            break;
+          }
+          v.push(c);
+          chars.next();
+        }
+        v
+      }
+    };
+
+    attrs.push((name, Some(value)));
+  }
+
+  attrs
+}
+
+/// Return `true` if `key` is a valid binding key (identifier or dotted path).
+fn is_valid_binding_key(key: &str) -> bool {
+  validate_binding(key).is_ok()
+}
+
 // ── Component expansion ──────────────────────────────────────────────────────
 
 /// Replace `<slot>` / `<slot/>` / `<slot />` in a component template body with
@@ -552,5 +804,73 @@ mod tests {
   fn hydration_no_bindings_is_passthrough() {
     let tmpl = "<h1>Hello world</h1>";
     assert_eq!(inject_hydration_markers(tmpl), tmpl);
+  }
+
+  // ── inject_attr_bindings ─────────────────────────────────────────────────
+
+  #[test]
+  fn attr_binding_rewrites_dynamic_class() {
+    let out = inject_attr_bindings(r#"<div :class="theme">text</div>"#);
+    assert_eq!(
+      out,
+      r#"<div class="{{ theme }}" data-thebe-attr="class:theme">text</div>"#
+    );
+  }
+
+  #[test]
+  fn attr_binding_multiple_attrs_are_coalesced() {
+    let out = inject_attr_bindings(r#"<a :href="url" :title="label">link</a>"#);
+    assert!(out.contains(r#"href="{{ url }}""#), "{out}");
+    assert!(out.contains(r#"title="{{ label }}""#), "{out}");
+    assert!(out.contains(r#"data-thebe-attr="href:url,title:label""#), "{out}");
+  }
+
+  #[test]
+  fn attr_binding_static_attr_is_preserved() {
+    let out = inject_attr_bindings(r#"<input type="text" :value="query" />"#);
+    assert!(out.contains(r#"type="text""#), "{out}");
+    assert!(out.contains(r#"value="{{ query }}""#), "{out}");
+    assert!(out.contains(r#"data-thebe-attr="value:query""#), "{out}");
+  }
+
+  #[test]
+  fn attr_binding_shadows_static_class() {
+    let out = inject_attr_bindings(r#"<div class="card" :class="extra">x</div>"#);
+    let class_count = out.matches("class=").count();
+    assert_eq!(class_count, 1, "only one class attr expected: {out}");
+    assert!(out.contains(r#"class="{{ extra }}""#), "{out}");
+  }
+
+  #[test]
+  fn attr_binding_self_closing_stays_self_closing() {
+    let out = inject_attr_bindings(r#"<img :src="url" alt="photo" />"#);
+    assert!(out.ends_with("/>"), "should remain self-closing: {out}");
+    assert!(out.contains(r#"src="{{ url }}""#), "{out}");
+    assert!(out.contains(r#"data-thebe-attr="src:url""#), "{out}");
+  }
+
+  #[test]
+  fn attr_binding_dotted_key() {
+    let out = inject_attr_bindings(r#"<img :src="user.avatar" />"#);
+    assert!(out.contains(r#"src="{{ user.avatar }}""#), "{out}");
+    assert!(out.contains(r#"data-thebe-attr="src:user.avatar""#), "{out}");
+  }
+
+  #[test]
+  fn attr_binding_skips_component_tags() {
+    let input = r#"<Card :title="name">x</Card>"#;
+    assert_eq!(inject_attr_bindings(input), input);
+  }
+
+  #[test]
+  fn attr_binding_no_dynamic_is_passthrough() {
+    let tmpl = r#"<button class="btn" disabled>ok</button>"#;
+    assert_eq!(inject_attr_bindings(tmpl), tmpl);
+  }
+
+  #[test]
+  fn attr_binding_skips_closing_tags() {
+    let tmpl = r#"</div>"#;
+    assert_eq!(inject_attr_bindings(tmpl), tmpl);
   }
 }

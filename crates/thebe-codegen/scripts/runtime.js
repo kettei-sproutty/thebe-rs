@@ -19,6 +19,14 @@
   var _handlers = {};
 
   /**
+   * Index built from `data-thebe-attr` markers — maps a binding key to the list
+   * of {el, attr} pairs that should be updated when that key changes.
+   *
+   * Rebuilt on every page mount (DOMContentLoaded + client-side navigation).
+   */
+  var _attrIndex = {};
+
+  /**
    * Register a named event handler.
    * Called by the synthesised registration code injected into the user script.
    */
@@ -73,6 +81,52 @@
     );
     for (var i = 0; i < bound.length; i++) {
       bound[i].textContent = text;
+    }
+
+    // Strategy 3 — reactive attribute bindings (`data-thebe-attr`).
+    var attrBindings = _attrIndex[key];
+    if (attrBindings) {
+      for (var j = 0; j < attrBindings.length; j++) {
+        attrBindings[j].el.setAttribute(attrBindings[j].attr, text);
+      }
+    }
+  }
+
+  /**
+   * Build (or rebuild) the reactive attribute index from every element in the
+   * current document that carries a `data-thebe-attr` marker emitted by the
+   * template compiler.
+   *
+   * `data-thebe-attr` holds a comma-separated list of `attrName:bindKey` pairs,
+   * e.g. `"class:theme,href:url"`.  This function inverts that mapping into
+   * `_attrIndex[bindKey] = [{el, attr}, …]` so `_updateDOM` can patch the
+   * right attribute in O(1) per binding key.
+   *
+   * Must be called after every body mount: initial page load and client-side
+   * navigation.
+   */
+  function _buildAttrIndex() {
+    _attrIndex = {};
+    var els = win.document.querySelectorAll("[data-thebe-attr]");
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      var spec = el.getAttribute("data-thebe-attr") || "";
+      var pairs = spec.split(",");
+      for (var j = 0; j < pairs.length; j++) {
+        var colon = pairs[j].indexOf(":");
+        if (colon === -1) {
+          continue;
+        }
+        var attrName = pairs[j].slice(0, colon).trim();
+        var bindKey = pairs[j].slice(colon + 1).trim();
+        if (!attrName || !bindKey) {
+          continue;
+        }
+        if (!_attrIndex[bindKey]) {
+          _attrIndex[bindKey] = [];
+        }
+        _attrIndex[bindKey].push({ el: el, attr: attrName });
+      }
     }
   }
 
@@ -464,6 +518,9 @@
 
         // Re-wire managed DOM event attributes emitted by codegen.
         _wireEvents();
+
+        // Rebuild the reactive attribute index for the new page.
+        _buildAttrIndex();
       })
       .catch(function () {
         // On network error fall back to a full navigation.
@@ -533,10 +590,12 @@
   if (win.document.readyState === "loading") {
     win.document.addEventListener("DOMContentLoaded", function () {
       _wireEvents();
+      _buildAttrIndex();
       _initRouter();
     });
   } else {
     _wireEvents();
+    _buildAttrIndex();
     _initRouter();
   }
 
