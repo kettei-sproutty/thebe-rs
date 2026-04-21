@@ -22,6 +22,8 @@ enum Command {
     #[arg(long, short)]
     watch: bool,
   },
+  /// Generate code and compile a release binary with `cargo build --release`.
+  Build,
   /// Validate the project and emit `.thebe/diagnostics.json`.
   Check,
   /// Scaffold a new Thebe project.
@@ -35,6 +37,7 @@ fn main() -> anyhow::Result<()> {
   let cli = Cli::parse();
   match cli.command {
     Command::Dev { watch } => commands::dev::run(watch),
+    Command::Build => commands::dev::build(),
     Command::Check => commands::dev::check(),
     Command::New { name } => commands::new::run(&name),
   }

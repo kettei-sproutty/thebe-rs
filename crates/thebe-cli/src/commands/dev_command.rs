@@ -44,6 +44,42 @@ pub fn run(watch: bool) -> anyhow::Result<()> {
   }
 }
 
+/// Run `thebe build`: generate code and compile a release binary.
+pub fn build() -> anyhow::Result<()> {
+  let project_root = find_project_root()?;
+  println!("thebe: project root at {}", project_root.display());
+
+  let config = thebe_project::ThebeConfig::load(&project_root)
+    .context("failed to load thebe.toml")?;
+
+  if let Some(pre_build) = config.get_hook("pre_build") {
+    println!("thebe: running pre_build hook: {pre_build}");
+    let status = Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
+      .arg(if cfg!(target_os = "windows") { "/C" } else { "-c" })
+      .arg(pre_build)
+      .current_dir(&project_root)
+      .status()
+      .context("failed to execute pre_build hook")?;
+    if !status.success() {
+      anyhow::bail!("pre_build hook failed with status {:?}", status.code());
+    }
+  }
+
+  if let Some(tailwind_config) = &config.tailwind {
+    crate::tailwind::ensure_and_run(&project_root, tailwind_config)?;
+  }
+
+  run_codegen(&project_root)?;
+
+  println!("thebe: running `cargo build --release`…");
+  let status = Command::new("cargo")
+    .args(["build", "--release"])
+    .current_dir(&project_root)
+    .status()
+    .context("failed to invoke `cargo build --release`")?;
+  std::process::exit(status.code().unwrap_or(1));
+}
+
 /// Run `thebe check`: validate project files and emit `.thebe/diagnostics.json`.
 pub fn check() -> anyhow::Result<()> {
   let project_root = find_project_root()?;
