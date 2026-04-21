@@ -20,6 +20,7 @@ This page tracks what is actually implemented in the repository today versus wha
   - `thebe new`
   - `thebe dev`
   - `thebe dev --watch`
+  - `thebe build`
   - `thebe check`
 - `thebe-lsp` language server with diagnostics, semantic tokens, hover, document symbols, definition, references, rename, code actions, formatting, and richer completions.
 - Packaged editor assets under `packages/thebe-vscode/` and `packages/tree-sitter-thebe/`.
@@ -30,13 +31,14 @@ This page tracks what is actually implemented in the repository today versus wha
 - The shipped formatter is structural and does not run embedded Rust, TypeScript, or CSS formatters.
 - Rename support is currently limited to route handlers and client event handlers.
 - The tree-sitter grammar is still an initial grammar rather than a full HTML-aware parser.
+- Production builds still inline JS and CSS rather than emitting hashed static assets.
 
 ## Planned Or Missing
 
 - General `src/components/**/*.trs` compilation is still planned. The shipped compiler path currently covers routes and `_layout.trs`, not standalone components.
 - Named slot composition outside route layouts is still planned.
 - Template attribute support for dynamic `:class` and generic `:attr` bindings.
-- A dedicated `thebe build` production build flow.
+- Hashed static asset extraction and cache-busted production asset serving.
 
 ## Reading The Docs Safely
 

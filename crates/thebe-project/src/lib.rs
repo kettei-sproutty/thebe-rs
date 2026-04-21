@@ -9,6 +9,13 @@ use walkdir::WalkDir;
 pub mod config;
 pub use config::ThebeConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuildMode {
+  #[default]
+  Dev,
+  Prod,
+}
+
 pub const THEBE_DIR: &str = ".thebe";
 pub const THEBE_DIAGNOSTICS_FILE: &str = ".thebe/diagnostics.json";
 pub const THEBE_MANIFEST_FILE: &str = ".thebe/manifest.json";
@@ -293,14 +300,18 @@ pub fn find_project_root_from(start: &Path) -> anyhow::Result<PathBuf> {
   }
 }
 
-pub fn generate_project(project_root: &Path) -> anyhow::Result<ProjectArtifacts> {
+pub fn generate_project(
+  project_root: &Path,
+  build_mode: BuildMode,
+) -> anyhow::Result<ProjectArtifacts> {
   let overlay = ProjectOverlay::default();
-  generate_project_with_overlay(project_root, &overlay)
+  generate_project_with_overlay(project_root, &overlay, build_mode)
 }
 
 pub fn generate_project_with_overlay(
   project_root: &Path,
   overlay: &ProjectOverlay,
+  build_mode: BuildMode,
 ) -> anyhow::Result<ProjectArtifacts> {
   let src_dir = project_root.join("src");
   let routes_dir = src_dir.join("routes");
@@ -323,12 +334,13 @@ pub fn generate_project_with_overlay(
   let needs_type_bridge = parsed_routes
     .iter()
     .any(|route| route.types_export_path.is_some());
+  let minify = matches!(build_mode, BuildMode::Prod);
 
   // Compile component macros for template expansion.
   let component_macros: Vec<thebe_codegen::ComponentMacro> = parsed_components
     .iter()
     .filter_map(|c| {
-      match thebe_codegen::generate_component(&c.blocks, &c.tag_name) {
+      match thebe_codegen::generate_component(&c.blocks, &c.tag_name, minify) {
         Ok(mac) => Some(mac),
         Err(err) => {
           eprintln!(
@@ -359,6 +371,7 @@ pub fn generate_project_with_overlay(
       &app_html.contents,
       route.types_export_path.as_deref(),
       &component_macros,
+      minify,
     )
     .with_context(|| format!("codegen error for {}", route.trs_path.display()))?;
 
@@ -463,6 +476,7 @@ pub fn refresh_project_for_editor_with_overlay(
     Ok(EditorRefresh::Generated(generate_project_with_overlay(
       project_root,
       overlay,
+      BuildMode::Dev,
     )?))
   } else {
     Ok(EditorRefresh::Diagnostics(diagnostics))
@@ -666,7 +680,7 @@ fn collect_project_diagnostics(
       let source = overlay.read_to_string(path).ok()?;
       let blocks = thebe_parser::parse_component_sfc(&source).ok()?;
       let tag_name = file_to_component_tag_name(path);
-      match thebe_codegen::generate_component(&blocks, &tag_name) {
+      match thebe_codegen::generate_component(&blocks, &tag_name, false) {
         Ok(mac) => Some(mac),
         Err(_) => None,
       }
@@ -909,6 +923,7 @@ fn analyze_route_for_diagnostics(
       app_html,
       route.types_export_path.as_deref(),
       component_macros,
+      false,
     ) {
       diagnostics.push(codegen_error_diagnostic(
         project_root,
@@ -2164,7 +2179,7 @@ fn handler() -> Props {
       .to_owned(),
     );
 
-    let artifacts = generate_project_with_overlay(project.path(), &overlay)
+    let artifacts = generate_project_with_overlay(project.path(), &overlay, BuildMode::Dev)
       .expect("overlay generation should succeed");
 
     assert_eq!(artifacts.manifest.routes.len(), 1);
@@ -2175,4 +2190,68 @@ fn handler() -> Props {
     assert_eq!(artifacts.manifest.routes[0].handler.name, "handler");
     assert_eq!(artifacts.manifest.routes[0].template_symbols, vec!["title"]);
   }
+
+  #[test]
+  fn generate_project_uses_build_mode_to_toggle_asset_minification() {
+    let project = TestProject::new("build-mode-minify");
+    project.write("Cargo.toml", &fixture_cargo_toml(true));
+    project.write(
+      "src/routes/index.trs",
+      r#"<script setup>
+struct Props {
+  count: i32,
 }
+
+#[thebe::get]
+fn handler() -> Props {
+  Props { count: 0 }
+}
+</script>
+
+<script lang="ts">
+let props = getProps<Props>();
+
+function increment() {
+  if (false) {
+    console.log("dead");
+  }
+  props.count += 1;
+}
+</script>
+
+<style>
+button {
+  color: red;
+}
+</style>
+
+<button onclick="increment">{{ count }}</button>
+"#,
+    );
+
+    generate_project_with_overlay(project.path(), &ProjectOverlay::default(), BuildMode::Dev)
+      .expect("dev generation should succeed");
+    let generated_route_path = project.path().join(THEBE_SERVER_ROUTES_DIR).join("index.rs");
+    let dev_source = fs::read_to_string(&generated_route_path)
+      .expect("dev route source should be written");
+
+    generate_project_with_overlay(project.path(), &ProjectOverlay::default(), BuildMode::Prod)
+      .expect("prod generation should succeed");
+    let prod_source = fs::read_to_string(&generated_route_path)
+      .expect("prod route source should be written");
+
+    assert!(dev_source.contains("Responsibilities:"));
+    assert!(prod_source.contains("/* __thebe_runtime */"));
+    assert!(prod_source.contains("\"use strict\";"));
+    assert!(!prod_source.contains("Responsibilities:"));
+    assert!(dev_source.contains("console.log(\"dead\")"));
+    assert!(dev_source.contains("function increment() {"));
+    assert!(prod_source.contains("function increment(){"));
+    assert!(prod_source.contains("props.count+=1"));
+    assert!(!prod_source.contains("console.log(\"dead\")"));
+    assert!(dev_source.contains("color: red;"));
+    assert!(prod_source.contains("{color:red}"));
+    assert!(prod_source.len() < dev_source.len());
+  }
+}
+

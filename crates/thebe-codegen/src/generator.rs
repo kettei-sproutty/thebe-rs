@@ -25,6 +25,7 @@ const DEFAULT_APP_HTML: &str = r#"<!DOCTYPE html>
   %thebe.body%
 </body>
 </html>"#;
+const THEBE_RUNTIME_SENTINEL: &str = "/* __thebe_runtime */";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HttpMethod {
@@ -326,6 +327,7 @@ pub fn generate_route(
   app_html: &str,
   props_types_path: Option<&str>,
   components: &[ComponentMacro],
+  minify: bool,
 ) -> Result<String, CodegenError> {
   let setup = blocks
     .script_setup
@@ -408,7 +410,7 @@ pub fn generate_route(
     .style
     .as_deref()
     .filter(|s| !s.trim().is_empty())
-    .map(|s| thebe_css::process_style(s, &scope))
+    .map(|s| thebe_css::process_style(s, &scope, minify))
     .transpose()
     .map_err(|e| CodegenError::CssError(e.to_string()))?
     .unwrap_or_default();
@@ -431,15 +433,25 @@ pub fn generate_route(
 
   // Process the optional `<script lang="ts">` block.
   let client_js = client_script_ts
-    .map(|ts| thebe_analyzer::analyze(ts).map(|module| module.js))
+    .map(|ts| thebe_analyzer::analyze(ts, minify).map(|module| module.js))
     .transpose()?
     .unwrap_or_default();
-  let runtime_literal = escape_rust_raw_str(THEBE_CLIENT_RUNTIME);
-  let client_script_literal = escape_rust_raw_str(&client_js);
+
+  let runtime_str = if minify {
+    format!(
+      "{THEBE_RUNTIME_SENTINEL}\n{}",
+      thebe_analyzer::minify_javascript(THEBE_CLIENT_RUNTIME)?
+    )
+  } else {
+    THEBE_CLIENT_RUNTIME.to_string()
+  };
+  let client_script_str = client_js;
+  let runtime_literal = escape_rust_raw_str(&runtime_str);
+  let client_script_literal = escape_rust_raw_str(&client_script_str);
 
   // Process the optional layout.
   let layout_processed = layout
-    .map(|(layout_blocks, layout_scope_path)| process_layout(layout_blocks, layout_scope_path))
+    .map(|(layout_blocks, layout_scope_path)| process_layout(layout_blocks, layout_scope_path, minify))
     .transpose()?;
 
   // Build the final style literal, optional layout template literal, and
@@ -831,6 +843,7 @@ pub struct ComponentMacro {
 pub fn generate_component(
   blocks: &SfcBlocks,
   component_name: &str,
+  minify: bool,
 ) -> Result<ComponentMacro, CodegenError> {
   // Validate template bindings; components use `{{ props.field }}` (dotted paths).
   crate::template::parse_template(&blocks.template)?;
@@ -849,7 +862,7 @@ pub fn generate_component(
   );
 
   let style = if let Some(css) = &blocks.style {
-    thebe_css::process_style(css, &scope).map_err(|e| CodegenError::CssError(e.to_string()))?
+    thebe_css::process_style(css, &scope, minify).map_err(|e| CodegenError::CssError(e.to_string()))?
   } else {
     String::new()
   };
@@ -1023,6 +1036,7 @@ fn extract_title_template(head: &str) -> Result<(Option<String>, String), Codege
 fn process_layout(
   layout_blocks: &SfcBlocks,
   layout_scope_path: &str,
+  minify: bool,
 ) -> Result<ProcessedLayout, CodegenError> {
   // Validate the layout template (slot placeholder is a valid identifier).
   let with_slot = replace_slot(&layout_blocks.template);
@@ -1037,7 +1051,7 @@ fn process_layout(
     .style
     .as_deref()
     .filter(|s| !s.trim().is_empty())
-    .map(|s| thebe_css::process_style(s, &layout_scope))
+    .map(|s| thebe_css::process_style(s, &layout_scope, minify))
     .transpose()
     .map_err(|e| CodegenError::CssError(e.to_string()))?
     .unwrap_or_default();
@@ -1971,6 +1985,7 @@ mod tests {
       default_app_html(),
       Some("routes/index.ts"),
       &[],
+      true,
     )
     .unwrap();
 
@@ -1997,7 +2012,26 @@ mod tests {
     assert!(src.contains("getProps()"), "stripped call missing");
 
     // Registration call must be appended.
-    assert!(src.contains("__thebe_register(\"inc\", inc)"));
+    assert!(src.contains("__thebe_register(\"inc\",inc)"));
+  }
+
+  #[test]
+  fn generate_route_keeps_runtime_sentinel_when_minifying() {
+    use thebe_parser::SfcBlocks;
+
+    let blocks = SfcBlocks {
+      script_setup: Some(
+        "struct Props { count: i32 }\n\n#[thebe::get]\npub fn handler() -> Props { Props { count: 0 } }"
+          .to_owned(),
+      ),
+      template: "<span>{{ count }}</span>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let src = generate_route(&blocks, "/", None, default_app_html(), None, &[], true).unwrap();
+
+    assert!(src.contains("/* __thebe_runtime */"));
+    assert!(!src.contains("Responsibilities:"));
   }
 
   #[test]
@@ -2024,6 +2058,7 @@ mod tests {
       default_app_html(),
       Some("routes/index.ts"),
       &[],
+      true,
     )
     .unwrap_err();
 
@@ -2049,7 +2084,7 @@ mod tests {
 
     let app_html =
       "<html><head><title>%thebe.title%</title>%thebe.head%</head><body>%thebe.body%</body></html>";
-    let src = generate_route(&blocks, "/", None, app_html, None, &[]).unwrap();
+    let src = generate_route(&blocks, "/", None, app_html, None, &[], true).unwrap();
 
     assert!(src.contains("const __HEAD_TEMPLATE"));
     assert!(src.contains("const __TITLE_TEMPLATE"));
@@ -2072,7 +2107,7 @@ mod tests {
             ..SfcBlocks::default()
         };
 
-    let src = generate_route(&blocks, "/blog/:slug", None, default_app_html(), None, &[]).unwrap();
+    let src = generate_route(&blocks, "/blog/:slug", None, default_app_html(), None, &[], true).unwrap();
 
     assert!(src.contains(
       "async fn __thebe_render_handler(__thebe_arg0: Path<String>, __thebe_arg1: State<AppState>)"
@@ -2095,7 +2130,7 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let src = generate_route(&blocks, "/", None, default_app_html(), None, &[]).unwrap();
+    let src = generate_route(&blocks, "/", None, default_app_html(), None, &[], true).unwrap();
 
     assert!(src.contains("pub fn router<S>() -> axum::Router<S>"));
     assert!(src.contains("axum::Router::<S>::new().route("));
@@ -2185,7 +2220,7 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let err = generate_route(&blocks, "/", None, "<html>%thebe.head%</html>", None, &[]).unwrap_err();
+    let err = generate_route(&blocks, "/", None, "<html>%thebe.head%</html>", None, &[], true).unwrap_err();
 
     assert!(matches!(err, CodegenError::InvalidAppHtml(_)));
   }
@@ -2201,7 +2236,7 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let err = generate_route(&blocks, "/", None, default_app_html(), None, &[]).unwrap_err();
+    let err = generate_route(&blocks, "/", None, default_app_html(), None, &[], true).unwrap_err();
 
     assert!(matches!(err, CodegenError::InvalidAppHtml(_)));
   }

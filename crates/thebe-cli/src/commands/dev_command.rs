@@ -26,10 +26,10 @@ pub fn run(watch: bool) -> anyhow::Result<()> {
   }
 
   if let Some(tailwind_config) = &config.tailwind {
-    crate::tailwind::ensure_and_run(&project_root, tailwind_config)?;
+    crate::tailwind::ensure_and_run(&project_root, tailwind_config, thebe_project::BuildMode::Dev)?;
   }
 
-  run_codegen(&project_root)?;
+  run_codegen(&project_root, thebe_project::BuildMode::Dev)?;
 
   if watch {
     run_watch(&project_root)
@@ -66,10 +66,10 @@ pub fn build() -> anyhow::Result<()> {
   }
 
   if let Some(tailwind_config) = &config.tailwind {
-    crate::tailwind::ensure_and_run(&project_root, tailwind_config)?;
+    crate::tailwind::ensure_and_run(&project_root, tailwind_config, thebe_project::BuildMode::Prod)?;
   }
 
-  run_codegen(&project_root)?;
+  run_codegen(&project_root, thebe_project::BuildMode::Prod)?;
 
   println!("thebe: running `cargo build --release`…");
   let status = Command::new("cargo")
@@ -94,8 +94,8 @@ pub fn check() -> anyhow::Result<()> {
   anyhow::bail!("found {} diagnostic(s)", diagnostics.diagnostics.len())
 }
 
-fn run_codegen(project_root: &Path) -> anyhow::Result<()> {
-  thebe_project::generate_project(project_root)?;
+fn run_codegen(project_root: &Path, build_mode: thebe_project::BuildMode) -> anyhow::Result<()> {
+  thebe_project::generate_project(project_root, build_mode)?;
   println!(
     "thebe: refreshed {}",
     project_root.join(thebe_project::THEBE_DIR).display()
@@ -195,7 +195,7 @@ fn run_watch(project_root: &Path) -> anyhow::Result<()> {
         }
 
         if let Some(tailwind_config) = config.tailwind {
-          if let Err(e) = crate::tailwind::ensure_and_run(project_root, &tailwind_config) {
+          if let Err(e) = crate::tailwind::ensure_and_run(project_root, &tailwind_config, thebe_project::BuildMode::Dev) {
             println!("thebe: \u{1b}[31mtailwind error\u{1b}[0m: {:?}", e);
           }
         }
@@ -205,7 +205,7 @@ fn run_watch(project_root: &Path) -> anyhow::Result<()> {
       }
     }
 
-    match run_codegen(project_root) {
+    match run_codegen(project_root, thebe_project::BuildMode::Dev) {
       Err(err) => eprintln!("thebe: codegen error: {err:#}"),
       Ok(()) => match spawn_server(project_root) {
         Ok(new_child) => child = new_child,

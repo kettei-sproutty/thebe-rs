@@ -1,9 +1,14 @@
 mod error;
 pub use error::AnalyzerError;
 use std::fmt::Write as _;
-use swc_common::{FileName, SourceMap, errors::Handler, sync::Lrc};
-use swc_ecma_ast::{Decl, EsVersion, Script, Stmt};
-use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
+use swc_common::{FileName, Globals, Mark, SourceMap, errors::Handler, sync::Lrc, GLOBALS};
+use swc_ecma_ast::{Decl, EsVersion, Program, Script, Stmt};
+use swc_ecma_codegen::{Config as CodegenConfig, Emitter, text_writer::JsWriter};
+use swc_ecma_minifier::{
+  optimize,
+  option::{CompressOptions, ExtraOptions, MinifyOptions},
+};
+use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 
 /// The result of analysing a `<script lang="ts">` block.
 #[derive(Debug)]
@@ -29,7 +34,7 @@ pub struct ClientModule {
 /// # Errors
 ///
 /// Returns [`AnalyzerError`] if the TypeScript block cannot be processed.
-pub fn analyze(script_ts: &str) -> Result<ClientModule, AnalyzerError> {
+pub fn analyze(script_ts: &str, minify: bool) -> Result<ClientModule, AnalyzerError> {
   let script = parse_typescript_script(script_ts)?;
   let event_fns = collect_top_level_function_names(&script);
   let js_raw = strip_typescript(script_ts)?;
@@ -43,19 +48,50 @@ pub fn analyze(script_ts: &str) -> Result<ClientModule, AnalyzerError> {
     }
   }
 
+  if minify {
+    js = minify_javascript(&js)?;
+  }
+
   Ok(ClientModule { js, event_fns })
 }
 
 const CLIENT_SCRIPT_FILENAME: &str = "thebe-client.ts";
+const CLIENT_JAVASCRIPT_FILENAME: &str = "thebe-client.js";
+
+/// Minify plain JavaScript source using SWC's parser and code generator.
+///
+/// This preserves semantics better than line-based trimming while still
+/// keeping the current pipeline lightweight.
+///
+/// # Errors
+///
+/// Returns [`AnalyzerError`] if the JavaScript cannot be parsed or emitted.
+pub fn minify_javascript(script_js: &str) -> Result<String, AnalyzerError> {
+  let script = parse_script(
+    script_js,
+    Syntax::Es(EsSyntax::default()),
+    CLIENT_JAVASCRIPT_FILENAME,
+  )?;
+  let script = compress_script(script)?;
+  emit_script(&script, true)
+}
 
 fn parse_typescript_script(script_ts: &str) -> Result<Script, AnalyzerError> {
+  parse_script(
+    script_ts,
+    Syntax::Typescript(ts_syntax()),
+    CLIENT_SCRIPT_FILENAME,
+  )
+}
+
+fn parse_script(source: &str, syntax: Syntax, filename: &str) -> Result<Script, AnalyzerError> {
   let source_map: Lrc<SourceMap> = Default::default();
   let source_file = source_map.new_source_file(
-    FileName::Custom(CLIENT_SCRIPT_FILENAME.into()).into(),
-    script_ts.to_owned(),
+    FileName::Custom(filename.into()).into(),
+    source.to_owned(),
   );
   let lexer = Lexer::new(
-    Syntax::Typescript(ts_syntax()),
+    syntax,
     EsVersion::latest(),
     StringInput::from(&*source_file),
     None,
@@ -76,6 +112,58 @@ fn parse_typescript_script(script_ts: &str) -> Result<Script, AnalyzerError> {
         .collect::<Vec<_>>()
         .join("\n"),
     ))
+  }
+}
+
+fn emit_script(script: &Script, minify: bool) -> Result<String, AnalyzerError> {
+  let source_map: Lrc<SourceMap> = Default::default();
+  let mut buffer = Vec::new();
+
+  {
+    let writer = JsWriter::new(source_map.clone(), "\n", &mut buffer, None);
+    let mut emitter = Emitter {
+      cfg: CodegenConfig::default().with_minify(minify),
+      cm: source_map,
+      comments: None,
+      wr: Box::new(writer),
+    };
+    emitter
+      .emit_script(script)
+      .map_err(|error| AnalyzerError::Emit(error.to_string()))?;
+  }
+
+  String::from_utf8(buffer).map_err(|error| AnalyzerError::Emit(error.to_string()))
+}
+
+fn compress_script(script: Script) -> Result<Script, AnalyzerError> {
+  let source_map: Lrc<SourceMap> = Default::default();
+  let globals = Globals::default();
+  let mut compress = CompressOptions::default();
+  compress.collapse_vars = false;
+  compress.inline = 0;
+  compress.join_vars = false;
+  compress.reduce_fns = false;
+  compress.unused = false;
+  let options = MinifyOptions {
+    compress: Some(compress),
+    mangle: None,
+    ..Default::default()
+  };
+
+  let program = GLOBALS.set(&globals, || {
+    let extra = ExtraOptions {
+      unresolved_mark: Mark::new(),
+      top_level_mark: Mark::new(),
+      mangle_name_cache: None,
+    };
+    optimize(Program::Script(script), source_map, None, None, &options, &extra)
+  });
+
+  match program {
+    Program::Script(script) => Ok(script),
+    Program::Module(_) => Err(AnalyzerError::Emit(
+      "expected script output from minifier".to_owned(),
+    )),
   }
 }
 
@@ -128,7 +216,7 @@ mod tests {
                 function increment(step: number): void { props.counter += step; }\n\
                 function decrement(step: number): void { props.counter -= step; }";
 
-      let module = analyze(ts).unwrap();
+      let module = analyze(ts, false).unwrap();
 
       assert_eq!(module.event_fns, &["increment", "decrement"]);
       assert!(!module.js.contains("getProps<Props>()"));
@@ -152,7 +240,7 @@ mod tests {
     fn ignores_arrow_functions_for_event_registration() {
       let ts = "const increment = () => 1;\nfunction decrement() { return 0; }";
 
-      let module = analyze(ts).unwrap();
+      let module = analyze(ts, false).unwrap();
 
       assert_eq!(module.event_fns, &["decrement"]);
     }
@@ -161,10 +249,51 @@ mod tests {
     fn preserves_object_literal_colons_while_stripping_types() {
       let ts = "const payload: { key: string } = { key: 'value' };";
 
-      let module = analyze(ts).unwrap();
+      let module = analyze(ts, false).unwrap();
 
       assert!(!module.js.contains("payload: { key: string }"));
       assert!(module.js.contains("key: 'value'"));
+    }
+
+    #[test]
+    fn minify_removes_comments_and_compacts_output() {
+      let ts = "let props = getProps<Props>();\n\
+                // thebe test comment\n\
+                function increment(step: number) {\n\
+                  return step + 1;\n\
+                }";
+
+      let readable = analyze(ts, false).unwrap();
+      let module = analyze(ts, true).unwrap();
+
+      assert!(!module.js.contains("thebe test comment"), "output: {}", module.js);
+      assert!(!module.js.contains("step: number"), "output: {}", module.js);
+      assert!(
+        module.js.contains("function increment(step){"),
+        "output: {}",
+        module.js
+      );
+      assert!(
+        module.js.contains("__thebe_register(\"increment\",increment);"),
+        "output: {}",
+        module.js
+      );
+      assert!(module.js.len() < readable.js.len());
+    }
+
+    #[test]
+    fn minify_eliminates_obvious_dead_branches() {
+      let ts = "function increment(step: number) {\n\
+                if (false) {\n\
+                  console.log('dead');\n\
+                }\n\
+                return step + 1;\n\
+              }";
+
+      let module = analyze(ts, true).unwrap();
+
+      assert!(!module.js.contains("console.log"), "output: {}", module.js);
+      assert!(!module.js.contains("if(false)"), "output: {}", module.js);
     }
   }
 }

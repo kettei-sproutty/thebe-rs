@@ -30,12 +30,12 @@ pub fn scope_id(file_path: &str) -> String {
 /// Process a CSS block by:
 /// 1. Appending `[data-thebe-c-{scope_id}]` to every selector, restricting
 ///    rules to elements rendered by this component.
-/// 2. Minifying the output.
+/// 2. Optionally minifying the output.
 ///
 /// # Errors
 ///
 /// Returns [`CssError`] on CSS parse, transform, or print failure.
-pub fn process_style(css: &str, scope_id: &str) -> Result<String, CssError> {
+pub fn process_style(css: &str, scope_id: &str, minify: bool) -> Result<String, CssError> {
   let attr_name = format!("data-thebe-c-{scope_id}");
   let mut stylesheet =
     StyleSheet::parse(css, ParserOptions::default()).map_err(|e| CssError::Parse(e.to_string()))?;
@@ -46,13 +46,15 @@ pub fn process_style(css: &str, scope_id: &str) -> Result<String, CssError> {
   // The error type is `Infallible`, so `unwrap` is safe here.
   Visit::visit(&mut stylesheet, &mut visitor).unwrap();
 
-  stylesheet
-    .minify(MinifyOptions::default())
-    .map_err(|e| CssError::Minify(e.to_string()))?;
+  if minify {
+    stylesheet
+      .minify(MinifyOptions::default())
+      .map_err(|e| CssError::Minify(e.to_string()))?;
+  }
 
   let result = stylesheet
     .to_css(PrinterOptions {
-      minify: true,
+      minify,
       ..Default::default()
     })
     .map_err(|e| CssError::Print(e.to_string()))?;
@@ -277,7 +279,7 @@ mod tests {
   fn process_style_scopes_simple_selector() {
     let css = "button { color: red; }";
     let id = "abc123";
-    let out = process_style(css, id).unwrap();
+    let out = process_style(css, id, true).unwrap();
     // scope attr must be appended to the type selector, not prepended
     let expected = format!("button[data-thebe-c-{id}]");
     assert!(out.contains(&expected), "output: {out}");
@@ -287,7 +289,7 @@ mod tests {
   fn process_style_descendant_selector() {
     let css = "nav a { color: red; }";
     let id = "abc123";
-    let out = process_style(css, id).unwrap();
+    let out = process_style(css, id, true).unwrap();
     // scope goes on the last compound in source order (`a`), not on `nav`
     let expected = format!("nav a[data-thebe-c-{id}]");
     assert!(out.contains(&expected), "output: {out}");
@@ -297,7 +299,7 @@ mod tests {
   fn process_style_pseudo_class_selector() {
     let css = "button:hover { color: red; }";
     let id = "abc123";
-    let out = process_style(css, id).unwrap();
+    let out = process_style(css, id, true).unwrap();
     // scope goes between base selector and pseudo-class
     let expected = format!("button[data-thebe-c-{id}]:hover");
     assert!(out.contains(&expected), "output: {out}");
@@ -307,11 +309,25 @@ mod tests {
   fn process_style_scopes_class_selector() {
     let css = ".controls { display: flex; }";
     let id = "abc123";
-    let out = process_style(css, id).unwrap();
+    let out = process_style(css, id, true).unwrap();
     assert!(
       out.contains(&format!("[data-thebe-c-{id}]")),
       "output: {out}"
     );
+  }
+
+  #[test]
+  fn process_style_keeps_readable_output_when_not_minifying() {
+    let css = "button { color: red; }";
+    let id = "abc123";
+
+    let readable = process_style(css, id, false).unwrap();
+    let minified = process_style(css, id, true).unwrap();
+
+    assert!(readable.contains("{\n"), "output: {readable}");
+    assert!(readable.contains("  color: red;"), "output: {readable}");
+    assert!(minified.contains("{color:red}"), "output: {minified}");
+    assert!(minified.len() < readable.len());
   }
 
   #[test]

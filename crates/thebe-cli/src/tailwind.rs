@@ -1,5 +1,6 @@
 use anyhow::Context;
 use reqwest::blocking::Client;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,6 +9,7 @@ use std::process::Command;
 pub fn ensure_and_run(
     project_root: &Path,
     tailwind_config: &thebe_project::config::TailwindConfig,
+    build_mode: thebe_project::BuildMode,
 ) -> anyhow::Result<()> {
     let binary_path = ensure_tailwind_binary()?;
 
@@ -16,12 +18,11 @@ pub fn ensure_and_run(
 
     println!("thebe: running tailwindcss on {}", input_path.display());
 
-    let status = Command::new(binary_path)
-        .arg("-i")
-        .arg(&input_path)
-        .arg("-o")
-        .arg(&output_path)
-        .current_dir(project_root)
+    let mut cmd = Command::new(binary_path);
+    cmd.args(tailwind_args(&input_path, &output_path, build_mode))
+        .current_dir(project_root);
+
+    let status = cmd
         .status()
         .context("failed to execute tailwindcss format")?;
 
@@ -30,6 +31,25 @@ pub fn ensure_and_run(
     }
 
     Ok(())
+}
+
+fn tailwind_args(
+    input_path: &Path,
+    output_path: &Path,
+    build_mode: thebe_project::BuildMode,
+) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("-i"),
+        input_path.as_os_str().to_owned(),
+        OsString::from("-o"),
+        output_path.as_os_str().to_owned(),
+    ];
+
+    if matches!(build_mode, thebe_project::BuildMode::Prod) {
+        args.push(OsString::from("--minify"));
+    }
+
+    args
 }
 
 fn ensure_tailwind_binary() -> anyhow::Result<PathBuf> {
@@ -88,5 +108,34 @@ fn get_binary_name() -> anyhow::Result<&'static str> {
         ("windows", "x86_64") => Ok("tailwindcss-windows-x64.exe"),
         ("windows", "aarch64") => Ok("tailwindcss-windows-arm64.exe"),
         _ => anyhow::bail!("unsupported OS or architecture for tailwindcss standalone: {}-{}", os, arch),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tailwind_args;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    #[test]
+    fn tailwind_args_adds_minify_for_prod() {
+        let args = tailwind_args(
+            Path::new("src/input.css"),
+            Path::new("public/global.css"),
+            thebe_project::BuildMode::Prod,
+        );
+
+        assert!(args.contains(&OsString::from("--minify")));
+    }
+
+    #[test]
+    fn tailwind_args_skips_minify_for_dev() {
+        let args = tailwind_args(
+            Path::new("src/input.css"),
+            Path::new("public/global.css"),
+            thebe_project::BuildMode::Dev,
+        );
+
+        assert!(!args.contains(&OsString::from("--minify")));
     }
 }

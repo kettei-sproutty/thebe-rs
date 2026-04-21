@@ -1139,7 +1139,7 @@ fn current_event_handlers(document: &DocumentContext) -> Vec<String> {
     return Vec::new();
   };
 
-  thebe_analyzer::analyze(script_ts)
+  thebe_analyzer::analyze(script_ts, false)
     .map(|module| module.event_fns)
     .unwrap_or_default()
 }
