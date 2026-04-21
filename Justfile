@@ -32,6 +32,15 @@ dev-example-watch:
 update-cli:
   cargo install --path crates/thebe-cli --force
 
+# Install `thebe-lsp` to PATH (makes it available to editors via `thebe-lsp`)
+update-lsp:
+  cargo install --path crates/thebe-lsp --force
+
+# Build `thebe-lsp` and copy it into the VS Code extension's bin/ directory
+bundle-lsp:
+  cargo build -p thebe-lsp --release
+  cp target/release/thebe-lsp packages/thebe-vscode/bin/thebe-lsp
+
 # Scaffold a new project (usage: just new my-app)
 new name:
     cargo build -p thebe-cli
