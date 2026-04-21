@@ -14,6 +14,7 @@ const THEBE_CLIENT_RUNTIME: &str = include_str!("../scripts/runtime.js");
 const APP_HTML_TITLE_PLACEHOLDER: &str = "%thebe.title%";
 const APP_HTML_HEAD_PLACEHOLDER: &str = "%thebe.head%";
 const APP_HTML_BODY_PLACEHOLDER: &str = "%thebe.body%";
+const THEBE_ASSET_URL_PREFIX: &str = "/.thebe/assets";
 const DEFAULT_APP_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -123,8 +124,11 @@ struct ModuleLiterals<'a> {
   template: &'a str,
   title_template: &'a str,
   runtime: &'a str,
+  runtime_asset_url: &'a str,
   client_script: &'a str,
+  client_script_asset_url: &'a str,
   style: &'a str,
+  style_asset_url: &'a str,
   route_path: &'a str,
   /// Pre-processed layout template, or `None` when no layout wraps this route.
   layout_template: Option<&'a str>,
@@ -147,6 +151,57 @@ struct ProcessedLayout {
   template: String,
   style: String,
   head: HeadFragments,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StaticAssetKind {
+  Css,
+  Js,
+}
+
+impl StaticAssetKind {
+  fn content_type(self) -> &'static str {
+    match self {
+      Self::Css => "text/css; charset=utf-8",
+      Self::Js => "text/javascript; charset=utf-8",
+    }
+  }
+
+  fn extension(self) -> &'static str {
+    match self {
+      Self::Css => "css",
+      Self::Js => "js",
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticAsset {
+  pub contents: String,
+  pub file_name: String,
+  pub kind: StaticAssetKind,
+  pub url_path: String,
+}
+
+impl StaticAsset {
+  fn new(kind: StaticAssetKind, contents: String) -> Self {
+    let hash = hash_asset_contents(kind, &contents);
+    let file_name = format!("thebe-{hash}.{}", kind.extension());
+    let url_path = format!("{THEBE_ASSET_URL_PREFIX}/{file_name}");
+
+    Self {
+      contents,
+      file_name,
+      kind,
+      url_path,
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedRoute {
+  pub assets: Vec<StaticAsset>,
+  pub source: String,
 }
 
 /// Metadata the CLI provides about a discovered route file.
@@ -328,7 +383,7 @@ pub fn generate_route(
   props_types_path: Option<&str>,
   components: &[ComponentMacro],
   minify: bool,
-) -> Result<String, CodegenError> {
+) -> Result<GeneratedRoute, CodegenError> {
   let setup = blocks
     .script_setup
     .as_deref()
@@ -428,7 +483,6 @@ pub fn generate_route(
     format!("{merged_component_styles}\n{route_style}")
   };
 
-  let style_literal = escape_rust_raw_str(&style);
   let template_literal = escape_rust_raw_str(&template_with_macros);
 
   // Process the optional `<script lang="ts">` block.
@@ -446,8 +500,6 @@ pub fn generate_route(
     THEBE_CLIENT_RUNTIME.to_string()
   };
   let client_script_str = client_js;
-  let runtime_literal = escape_rust_raw_str(&runtime_str);
-  let client_script_literal = escape_rust_raw_str(&client_script_str);
 
   // Process the optional layout.
   let layout_processed = layout
@@ -456,7 +508,7 @@ pub fn generate_route(
 
   // Build the final style literal, optional layout template literal, and
   // merged head contribution. Route titles override layout titles.
-  let (final_style_literal, layout_template_opt, merged_head) = match layout_processed {
+  let (final_style, layout_template_opt, merged_head) = match layout_processed {
     Some(processed_layout) => {
       let merged_style = if processed_layout.style.is_empty() {
         style.clone()
@@ -466,12 +518,12 @@ pub fn generate_route(
         format!("{}\n{style}", processed_layout.style)
       };
       (
-        escape_rust_raw_str(&merged_style),
+        merged_style,
         Some(escape_rust_raw_str(&processed_layout.template)),
         merge_head_fragments(&processed_layout.head, &route_head),
       )
     }
-    None => (style_literal.clone(), None, route_head),
+    None => (style, None, route_head),
   };
 
   if merged_head.title_template.is_some() && !app_html.contains(APP_HTML_TITLE_PLACEHOLDER) {
@@ -485,14 +537,51 @@ pub fn generate_route(
     escape_rust_raw_str(merged_head.title_template.as_deref().unwrap_or_default());
   let route_path_literal = escape_rust_raw_str(route_path);
 
+  let mut assets = Vec::new();
+  let runtime_asset_url = if minify {
+    let asset = StaticAsset::new(StaticAssetKind::Js, runtime_str.clone());
+    let url_path = asset.url_path.clone();
+    assets.push(asset);
+    url_path
+  } else {
+    String::new()
+  };
+  let client_script_asset_url = if minify && !client_script_str.is_empty() {
+    let asset = StaticAsset::new(StaticAssetKind::Js, client_script_str.clone());
+    let url_path = asset.url_path.clone();
+    assets.push(asset);
+    url_path
+  } else {
+    String::new()
+  };
+  let style_asset_url = if minify && !final_style.is_empty() {
+    let asset = StaticAsset::new(StaticAssetKind::Css, final_style.clone());
+    let url_path = asset.url_path.clone();
+    assets.push(asset);
+    url_path
+  } else {
+    String::new()
+  };
+
+  let runtime_literal = escape_rust_raw_str(if minify { "" } else { &runtime_str });
+  let client_script_literal =
+    escape_rust_raw_str(if minify { "" } else { &client_script_str });
+  let final_style_literal = escape_rust_raw_str(if minify { "" } else { &final_style });
+  let runtime_asset_url_literal = escape_rust_raw_str(&runtime_asset_url);
+  let client_script_asset_url_literal = escape_rust_raw_str(&client_script_asset_url);
+  let style_asset_url_literal = escape_rust_raw_str(&style_asset_url);
+
   let literals = ModuleLiterals {
     app_html: &app_html_literal,
     head_template: &head_literal,
     template: &template_literal,
     title_template: &title_literal,
     runtime: &runtime_literal,
+    runtime_asset_url: &runtime_asset_url_literal,
     client_script: &client_script_literal,
+    client_script_asset_url: &client_script_asset_url_literal,
     style: &final_style_literal,
+    style_asset_url: &style_asset_url_literal,
     route_path: &route_path_literal,
     layout_template: layout_template_opt.as_deref(),
   };
@@ -501,14 +590,17 @@ pub fn generate_route(
     call: &handler_call,
   };
 
-  Ok(build_route_module(
-    &setup_with_serde,
-    literals,
-    wrapper,
-    &handler,
-    route_path,
-    props_types_path.is_some(),
-  ))
+  Ok(GeneratedRoute {
+    assets,
+    source: build_route_module(
+      &setup_with_serde,
+      literals,
+      wrapper,
+      &handler,
+      route_path,
+      props_types_path.is_some(),
+    ),
+  })
 }
 
 fn build_route_module(
@@ -556,7 +648,19 @@ fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
     literals.runtime
   )
   .expect("infallible");
+  writeln!(
+    source,
+    "const __RUNTIME_ASSET_URL: &str = {};",
+    literals.runtime_asset_url
+  )
+  .expect("infallible");
   writeln!(source, "const __STYLE: &str = {};", literals.style).expect("infallible");
+  writeln!(
+    source,
+    "const __STYLE_ASSET_URL: &str = {};",
+    literals.style_asset_url
+  )
+  .expect("infallible");
   writeln!(
     source,
     "const __ROUTE_PATH: &str = {};",
@@ -567,6 +671,12 @@ fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
     source,
     "const __CLIENT_SCRIPT: &str = {};",
     literals.client_script
+  )
+  .expect("infallible");
+  writeln!(
+    source,
+    "const __CLIENT_SCRIPT_ASSET_URL: &str = {};",
+    literals.client_script_asset_url
   )
   .expect("infallible");
   if let Some(layout_tmpl) = literals.layout_template {
@@ -683,15 +793,23 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
 fn write_html_assembly(source: &mut String) {
   source.push_str("    let __props_json = __ctx.to_string();\n");
   source.push_str(
-    r##"    let __head = if __STYLE.is_empty() {
-    __head_html
+    r##"    let __head = if __STYLE_ASSET_URL.is_empty() {
+    if __STYLE.is_empty() {
+      __head_html
+    } else if __head_html.is_empty() {
+      format!(r#"<style data-thebe-head="style">{style}</style>"#, style = __STYLE)
+    } else {
+      format!(r#"{head}
+<style data-thebe-head="style">{style}</style>"#, head = __head_html, style = __STYLE)
+    }
   } else if __head_html.is_empty() {
-    format!(r#"<style data-thebe-head="style">{style}</style>"#, style = __STYLE)
+    format!(r#"<link rel="stylesheet" href="{href}" data-thebe-head="style" />"#, href = __STYLE_ASSET_URL)
   } else {
     format!(r#"{head}
-<style data-thebe-head="style">{style}</style>"#, head = __head_html, style = __STYLE)
+<link rel="stylesheet" href="{href}" data-thebe-head="style" />"#, head = __head_html, href = __STYLE_ASSET_URL)
   };
-    let __body_with_scripts = format!(r#"{body}
+    let __body_with_scripts = if __RUNTIME_ASSET_URL.is_empty() {
+      format!(r#"{body}
 <script id="__thebe_props" type="application/json">{props_json}</script>
 <script>{runtime}</script>
 <script>{user_script}</script>"#,
@@ -701,7 +819,29 @@ fn write_html_assembly(source: &mut String) {
   source.push_str("        props_json = __props_json,\n");
   source.push_str("        runtime = __CLIENT_RUNTIME,\n");
   source.push_str("        user_script = __CLIENT_SCRIPT,\n");
-  source.push_str("    );\n");
+  source.push_str(
+    r##"    )
+    } else if __CLIENT_SCRIPT_ASSET_URL.is_empty() {
+      format!(r#"{body}
+<script id="__thebe_props" type="application/json">{props_json}</script>
+<script data-thebe-runtime src="{runtime_src}"></script>"#,
+        body = __body,
+        props_json = __props_json,
+        runtime_src = __RUNTIME_ASSET_URL,
+      )
+    } else {
+      format!(r#"{body}
+<script id="__thebe_props" type="application/json">{props_json}</script>
+<script data-thebe-runtime src="{runtime_src}"></script>
+<script src="{user_script_src}"></script>"#,
+        body = __body,
+        props_json = __props_json,
+        runtime_src = __RUNTIME_ASSET_URL,
+        user_script_src = __CLIENT_SCRIPT_ASSET_URL,
+      )
+    };
+"##,
+  );
   source.push_str(
     "    let __html = __thebe_render_app_html(&__title, &__head, &__body_with_scripts);\n",
   );
@@ -875,7 +1015,10 @@ pub fn generate_component(
   })
 }
 
-pub fn generate_routes_file(routes: &[RouteEntry]) -> Result<String, CodegenError> {
+pub fn generate_routes_file(
+  routes: &[RouteEntry],
+  assets: &[StaticAsset],
+) -> Result<String, CodegenError> {
   let mut source = String::new();
   source.push_str("// AUTOGENERATED by thebe \u{2014} do not edit\n");
   for route in routes {
@@ -883,6 +1026,7 @@ pub fn generate_routes_file(routes: &[RouteEntry]) -> Result<String, CodegenErro
     writeln!(source, "mod {};", route.mod_name).expect("infallible");
   }
   source.push('\n');
+  write_asset_support(&mut source, assets);
   match shared_route_state_type(routes)? {
     Some(state_type) => {
       writeln!(
@@ -891,6 +1035,7 @@ pub fn generate_routes_file(routes: &[RouteEntry]) -> Result<String, CodegenErro
       )
       .expect("infallible");
       writeln!(source, "    axum::Router::<{state_type}>::new()").expect("infallible");
+      write_asset_routes(&mut source, assets);
       for route in routes {
         if route.state_type.is_some() {
           writeln!(source, "        .merge({}::router())", route.mod_name).expect("infallible");
@@ -910,6 +1055,7 @@ pub fn generate_routes_file(routes: &[RouteEntry]) -> Result<String, CodegenErro
       source.push_str("    S: Clone + Send + Sync + 'static,\n");
       source.push_str("{\n");
       source.push_str("    axum::Router::<S>::new()\n");
+      write_asset_routes(&mut source, assets);
       for route in routes {
         writeln!(source, "        .merge({}::router::<S>())", route.mod_name).expect("infallible");
       }
@@ -918,6 +1064,95 @@ pub fn generate_routes_file(routes: &[RouteEntry]) -> Result<String, CodegenErro
   source.push_str("}\n");
 
   Ok(source)
+}
+
+fn write_asset_support(source: &mut String, assets: &[StaticAsset]) {
+  let mut sorted_assets = assets.iter().collect::<Vec<_>>();
+  sorted_assets.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+
+  for asset in &sorted_assets {
+    let const_name = asset_const_name(asset);
+    writeln!(
+      source,
+      "const {const_name}: &str = include_str!(\"../assets/{}\");",
+      asset.file_name
+    )
+    .expect("infallible");
+  }
+  if !sorted_assets.is_empty() {
+    source.push('\n');
+  }
+
+  for asset in &sorted_assets {
+    let const_name = asset_const_name(asset);
+    let fn_name = asset_fn_name(asset);
+    writeln!(
+      source,
+      "async fn {fn_name}() -> impl axum::response::IntoResponse {{"
+    )
+    .expect("infallible");
+    source.push_str("    (\n");
+    writeln!(
+      source,
+      "        [(axum::http::header::CONTENT_TYPE, \"{}\"), (axum::http::header::CACHE_CONTROL, \"public, max-age=31536000, immutable\")],",
+      asset.kind.content_type()
+    )
+    .expect("infallible");
+    writeln!(source, "        {const_name},").expect("infallible");
+    source.push_str("    )\n");
+    source.push_str("}\n\n");
+  }
+}
+
+fn write_asset_routes(source: &mut String, assets: &[StaticAsset]) {
+  let mut sorted_assets = assets.iter().collect::<Vec<_>>();
+  sorted_assets.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+
+  for asset in sorted_assets {
+    let fn_name = asset_fn_name(asset);
+    writeln!(
+      source,
+      "        .route(\"{}\", axum::routing::get({fn_name}))",
+      asset.url_path
+    )
+    .expect("infallible");
+  }
+}
+
+fn asset_const_name(asset: &StaticAsset) -> String {
+  format!(
+    "__THEBE_ASSET_{}",
+    asset_ident_fragment(&asset.file_name).to_ascii_uppercase()
+  )
+}
+
+fn asset_fn_name(asset: &StaticAsset) -> String {
+  format!("__thebe_asset_{}", asset_ident_fragment(&asset.file_name))
+}
+
+fn asset_ident_fragment(file_name: &str) -> String {
+  file_name
+    .chars()
+    .map(|ch| {
+      if ch.is_ascii_alphanumeric() {
+        ch.to_ascii_lowercase()
+      } else {
+        '_'
+      }
+    })
+    .collect()
+}
+
+fn hash_asset_contents(kind: StaticAssetKind, contents: &str) -> String {
+  const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+  const FNV_PRIME: u64 = 1_099_511_628_211;
+
+  let mut hash = FNV_OFFSET;
+  for byte in kind.extension().bytes().chain([0]).chain(contents.bytes()) {
+    hash ^= u64::from(byte);
+    hash = hash.wrapping_mul(FNV_PRIME);
+  }
+  format!("{hash:016x}")
 }
 
 fn shared_route_state_type(routes: &[RouteEntry]) -> Result<Option<&str>, CodegenError> {
@@ -1978,17 +2213,19 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let src = generate_route(
+    let generated = generate_route(
       &blocks,
       "/",
       None,
       default_app_html(),
       Some("routes/index.ts"),
       &[],
-      true,
+      false,
     )
     .unwrap();
+    let src = generated.source;
 
+    assert!(generated.assets.is_empty());
     assert!(src.contains("const __APP_HTML"), "app shell const missing");
     // The generated source must contain both client consts.
     assert!(src.contains("__CLIENT_RUNTIME"), "runtime const missing");
@@ -2012,7 +2249,51 @@ mod tests {
     assert!(src.contains("getProps()"), "stripped call missing");
 
     // Registration call must be appended.
-    assert!(src.contains("__thebe_register(\"inc\",inc)"));
+    assert!(src.contains("__thebe_register(\"inc\""));
+  }
+
+  #[test]
+  fn generate_route_extracts_prod_assets() {
+    use thebe_parser::SfcBlocks;
+
+    let blocks = SfcBlocks {
+      script_setup: Some(
+        "struct Props { counter: i32 }\n\n#[thebe::get]\npub fn handler() -> Props { Props { counter: 0 } }"
+          .to_owned(),
+      ),
+      script_ts: Some(
+        "let props = getProps<Props>();\nfunction inc() { props.counter += 1; }".to_owned(),
+      ),
+      style: Some("span { color: red; }".to_owned()),
+      template: "<span>{{ counter }}</span>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let generated = generate_route(
+      &blocks,
+      "/",
+      None,
+      default_app_html(),
+      Some("routes/index.ts"),
+      &[],
+      true,
+    )
+    .unwrap();
+
+    assert_eq!(generated.assets.len(), 3);
+    assert!(generated.source.contains("const __RUNTIME_ASSET_URL"));
+    assert!(generated.source.contains("const __CLIENT_SCRIPT_ASSET_URL"));
+    assert!(generated.source.contains("const __STYLE_ASSET_URL"));
+    assert!(generated.source.contains("data-thebe-runtime src=\"{runtime_src}\""));
+    assert!(generated.source.contains("<link rel=\"stylesheet\" href=\"{href}\" data-thebe-head=\"style\" />"));
+    assert!(generated
+      .assets
+      .iter()
+      .any(|asset| asset.kind == StaticAssetKind::Css && asset.contents.contains("{color:red}")));
+    assert!(generated
+      .assets
+      .iter()
+      .any(|asset| asset.kind == StaticAssetKind::Js && asset.contents.contains("props.counter+=1")));
   }
 
   #[test]
@@ -2028,10 +2309,15 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let src = generate_route(&blocks, "/", None, default_app_html(), None, &[], true).unwrap();
+    let generated = generate_route(&blocks, "/", None, default_app_html(), None, &[], true).unwrap();
+    let runtime_asset = generated
+      .assets
+      .iter()
+      .find(|asset| asset.kind == StaticAssetKind::Js)
+      .unwrap();
 
-    assert!(src.contains("/* __thebe_runtime */"));
-    assert!(!src.contains("Responsibilities:"));
+    assert!(runtime_asset.contents.contains("/* __thebe_runtime */"));
+    assert!(!runtime_asset.contents.contains("Responsibilities:"));
   }
 
   #[test]
@@ -2084,7 +2370,9 @@ mod tests {
 
     let app_html =
       "<html><head><title>%thebe.title%</title>%thebe.head%</head><body>%thebe.body%</body></html>";
-    let src = generate_route(&blocks, "/", None, app_html, None, &[], true).unwrap();
+    let src = generate_route(&blocks, "/", None, app_html, None, &[], true)
+      .unwrap()
+      .source;
 
     assert!(src.contains("const __HEAD_TEMPLATE"));
     assert!(src.contains("const __TITLE_TEMPLATE"));
@@ -2107,7 +2395,9 @@ mod tests {
             ..SfcBlocks::default()
         };
 
-    let src = generate_route(&blocks, "/blog/:slug", None, default_app_html(), None, &[], true).unwrap();
+    let src = generate_route(&blocks, "/blog/:slug", None, default_app_html(), None, &[], true)
+      .unwrap()
+      .source;
 
     assert!(src.contains(
       "async fn __thebe_render_handler(__thebe_arg0: Path<String>, __thebe_arg1: State<AppState>)"
@@ -2130,7 +2420,9 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let src = generate_route(&blocks, "/", None, default_app_html(), None, &[], true).unwrap();
+    let src = generate_route(&blocks, "/", None, default_app_html(), None, &[], true)
+      .unwrap()
+      .source;
 
     assert!(src.contains("pub fn router<S>() -> axum::Router<S>"));
     assert!(src.contains("axum::Router::<S>::new().route("));
@@ -2149,7 +2441,7 @@ mod tests {
         source_path: "routes/blog/[slug].rs".to_owned(),
         state_type: None,
       },
-    ])
+    ], &[])
     .unwrap();
 
     assert!(source.contains("#[path = \"routes/index.rs\"]"));
@@ -2174,7 +2466,7 @@ mod tests {
         source_path: "routes/profile.rs".to_owned(),
         state_type: Some("AppState".to_owned()),
       },
-    ])
+    ], &[])
     .unwrap();
 
     assert!(source.contains("pub(crate) fn thebe_routes() -> axum::Router<AppState>"));
@@ -2195,10 +2487,42 @@ mod tests {
         source_path: "routes/admin.rs".to_owned(),
         state_type: Some("AdminState".to_owned()),
       },
-    ])
+    ], &[])
     .unwrap_err();
 
     assert!(matches!(err, CodegenError::MixedRouteStateTypes(_)));
+  }
+
+  #[test]
+  fn generate_routes_file_serves_hashed_assets() {
+    let source = generate_routes_file(
+      &[RouteEntry {
+        mod_name: "route__index".to_owned(),
+        source_path: "routes/index.rs".to_owned(),
+        state_type: None,
+      }],
+      &[
+        StaticAsset {
+          contents: "body{color:red}".to_owned(),
+          file_name: "thebe-deadbeef.css".to_owned(),
+          kind: StaticAssetKind::Css,
+          url_path: "/.thebe/assets/thebe-deadbeef.css".to_owned(),
+        },
+        StaticAsset {
+          contents: "console.log(1);".to_owned(),
+          file_name: "thebe-feedface.js".to_owned(),
+          kind: StaticAssetKind::Js,
+          url_path: "/.thebe/assets/thebe-feedface.js".to_owned(),
+        },
+      ],
+    )
+    .unwrap();
+
+    assert!(source.contains("include_str!(\"../assets/thebe-deadbeef.css\")"));
+    assert!(source.contains("include_str!(\"../assets/thebe-feedface.js\")"));
+    assert!(source.contains("public, max-age=31536000, immutable"));
+    assert!(source.contains(".route(\"/.thebe/assets/thebe-deadbeef.css\", axum::routing::get(__thebe_asset_thebe_deadbeef_css))"));
+    assert!(source.contains(".route(\"/.thebe/assets/thebe-feedface.js\", axum::routing::get(__thebe_asset_thebe_feedface_js))"));
   }
 
   #[test]

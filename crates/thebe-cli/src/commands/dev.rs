@@ -155,6 +155,7 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
       &app_html.contents,
       route.types_export_path.as_deref(),
       &component_macros,
+        false,
     )
     .with_context(|| format!("codegen error for {}", route.trs_path.display()))?;
 
@@ -170,7 +171,7 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
       std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::write(&rs_path, &generated)
+    std::fs::write(&rs_path, &generated.source)
       .with_context(|| format!("failed to write {}", rs_path.display()))?;
 
     if let Some(types_export_path) = &route.types_export_path {
@@ -205,7 +206,7 @@ fn run_codegen(project_root: &Path, src_dir: &Path, routes_dir: &Path) -> anyhow
     });
   }
 
-  let routes_file = thebe_codegen::generate_routes_file(&route_entries)
+    let routes_file = thebe_codegen::generate_routes_file(&route_entries, &[])
     .context("failed to generate .thebe/server/routes.rs")?;
   let routes_path = project_root.join(THEBE_SERVER_ROUTES_FILE);
   std::fs::write(&routes_path, &routes_file)
@@ -391,7 +392,7 @@ fn collect_project_diagnostics(project_root: &Path) -> anyhow::Result<Vec<serde_
     )?);
   }
 
-  if let Err(err) = thebe_codegen::generate_routes_file(&route_entries) {
+  if let Err(err) = thebe_codegen::generate_routes_file(&route_entries, &[]) {
     diagnostics.push(project_diagnostic(
       "project",
       "mixed-route-state-types",
@@ -523,6 +524,7 @@ fn analyze_route_for_diagnostics(
       app_html,
       route.types_export_path.as_deref(),
       &[],
+      false,
     ) {
       diagnostics.push(codegen_error_diagnostic(
         project_root,

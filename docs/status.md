@@ -16,6 +16,7 @@ This page tracks what is actually implemented in the repository today versus wha
 - Client `getProps<Props>()` bridge with `ts-rs`-generated types for client routes.
 - Event-handler discovery and client runtime wiring for `on*` attributes.
 - Generated `.thebe/` workspace artifacts through `crates/thebe-project`.
+- Production route JS/CSS extraction into hashed `/.thebe/assets/*` assets served by generated route helpers.
 - CLI commands:
   - `thebe new`
   - `thebe dev`
@@ -31,14 +32,13 @@ This page tracks what is actually implemented in the repository today versus wha
 - The shipped formatter is structural and does not run embedded Rust, TypeScript, or CSS formatters.
 - Rename support is currently limited to route handlers and client event handlers.
 - The tree-sitter grammar is still an initial grammar rather than a full HTML-aware parser.
-- Production builds still inline JS and CSS rather than emitting hashed static assets.
+- Production assets are emitted under `.thebe/assets` and served by generated routes rather than a standalone public dist pipeline.
 
 ## Planned Or Missing
 
 - General `src/components/**/*.trs` compilation is still planned. The shipped compiler path currently covers routes and `_layout.trs`, not standalone components.
 - Named slot composition outside route layouts is still planned.
 - Template attribute support for dynamic `:class` and generic `:attr` bindings.
-- Hashed static asset extraction and cache-busted production asset serving.
 
 ## Reading The Docs Safely
 

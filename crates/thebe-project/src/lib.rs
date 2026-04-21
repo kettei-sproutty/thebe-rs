@@ -1,6 +1,6 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use thebe_parser::SourceSpan;
@@ -17,6 +17,7 @@ pub enum BuildMode {
 }
 
 pub const THEBE_DIR: &str = ".thebe";
+pub const THEBE_ASSETS_DIR: &str = ".thebe/assets";
 pub const THEBE_DIAGNOSTICS_FILE: &str = ".thebe/diagnostics.json";
 pub const THEBE_MANIFEST_FILE: &str = ".thebe/manifest.json";
 pub const THEBE_SERVER_ROUTES_DIR: &str = ".thebe/server/routes";
@@ -359,6 +360,7 @@ pub fn generate_project_with_overlay(
   prepare_generated_workspace(project_root, needs_type_bridge)?;
 
   let mut route_entries = Vec::new();
+  let mut generated_assets = BTreeMap::new();
 
   for route in &parsed_routes {
     let layout_arg = find_layout(&layouts, &route.trs_path, &routes_dir)
@@ -387,8 +389,24 @@ pub fn generate_project_with_overlay(
       std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::write(&rs_path, &generated)
+    std::fs::write(&rs_path, &generated.source)
       .with_context(|| format!("failed to write {}", rs_path.display()))?;
+
+    for asset in generated.assets {
+      match generated_assets.get(&asset.file_name) {
+        Some(existing) if existing != &asset => {
+          anyhow::bail!(
+            "hashed asset collision for {} while generating {}",
+            asset.file_name,
+            route.trs_path.display()
+          );
+        }
+        Some(_) => {}
+        None => {
+          generated_assets.insert(asset.file_name.clone(), asset);
+        }
+      }
+    }
 
     if let Some(types_export_path) = &route.types_export_path {
       let client_ts = route
@@ -415,7 +433,20 @@ pub fn generate_project_with_overlay(
     });
   }
 
-  let routes_file = thebe_codegen::generate_routes_file(&route_entries)
+  if !generated_assets.is_empty() {
+    let assets_dir = project_root.join(THEBE_ASSETS_DIR);
+    std::fs::create_dir_all(&assets_dir)
+      .with_context(|| format!("failed to create {}", assets_dir.display()))?;
+
+    for asset in generated_assets.values() {
+      let asset_path = assets_dir.join(&asset.file_name);
+      std::fs::write(&asset_path, &asset.contents)
+        .with_context(|| format!("failed to write {}", asset_path.display()))?;
+    }
+  }
+
+  let asset_list = generated_assets.into_values().collect::<Vec<_>>();
+  let routes_file = thebe_codegen::generate_routes_file(&route_entries, &asset_list)
     .context("failed to generate .thebe/server/routes.rs")?;
   let routes_path = project_root.join(THEBE_SERVER_ROUTES_FILE);
   std::fs::write(&routes_path, &routes_file)
@@ -745,7 +776,7 @@ fn collect_project_diagnostics(
     )?);
   }
 
-  if let Err(err) = thebe_codegen::generate_routes_file(&route_entries) {
+  if let Err(err) = thebe_codegen::generate_routes_file(&route_entries, &[]) {
     diagnostics.push(project_diagnostic(
       "project",
       "mixed-route-state-types",
@@ -2234,24 +2265,52 @@ button {
     let generated_route_path = project.path().join(THEBE_SERVER_ROUTES_DIR).join("index.rs");
     let dev_source = fs::read_to_string(&generated_route_path)
       .expect("dev route source should be written");
+    let asset_dir = project.path().join(THEBE_ASSETS_DIR);
+
+    assert!(!asset_dir.exists());
 
     generate_project_with_overlay(project.path(), &ProjectOverlay::default(), BuildMode::Prod)
       .expect("prod generation should succeed");
     let prod_source = fs::read_to_string(&generated_route_path)
       .expect("prod route source should be written");
+    let prod_assets = fs::read_dir(&asset_dir)
+      .expect("prod assets should be written")
+      .map(|entry| entry.expect("asset entry should be readable").path())
+      .collect::<Vec<_>>();
+    let prod_asset_contents = prod_assets
+      .iter()
+      .map(|path| fs::read_to_string(path).expect("asset should be readable"))
+      .collect::<Vec<_>>();
 
     assert!(dev_source.contains("Responsibilities:"));
-    assert!(prod_source.contains("/* __thebe_runtime */"));
-    assert!(prod_source.contains("\"use strict\";"));
-    assert!(!prod_source.contains("Responsibilities:"));
     assert!(dev_source.contains("console.log(\"dead\")"));
     assert!(dev_source.contains("function increment() {"));
-    assert!(prod_source.contains("function increment(){"));
-    assert!(prod_source.contains("props.count+=1"));
-    assert!(!prod_source.contains("console.log(\"dead\")"));
     assert!(dev_source.contains("color: red;"));
-    assert!(prod_source.contains("{color:red}"));
-    assert!(prod_source.len() < dev_source.len());
+
+    assert!(prod_source.contains("/.thebe/assets/thebe-"));
+    assert!(prod_source.contains("data-thebe-runtime"));
+    assert!(!prod_source.contains("Responsibilities:"));
+    assert!(!prod_source.contains("console.log(\"dead\")"));
+
+    assert_eq!(prod_assets.len(), 3);
+    assert_eq!(
+      prod_assets
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "js"))
+        .count(),
+      2
+    );
+    assert_eq!(
+      prod_assets
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "css"))
+        .count(),
+      1
+    );
+    assert!(prod_asset_contents.iter().any(|contents| contents.contains("/* __thebe_runtime */")));
+    assert!(prod_asset_contents.iter().any(|contents| contents.contains("props.count+=1")));
+    assert!(!prod_asset_contents.iter().any(|contents| contents.contains("console.log(\"dead\")")));
+    assert!(prod_asset_contents.iter().any(|contents| contents.contains("{color:red}")));
   }
 }
 

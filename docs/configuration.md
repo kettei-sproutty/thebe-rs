@@ -20,7 +20,7 @@ input = "src/input.css"
 output = "public/global.css"
 ```
 
-Because the Tailwind compiler runs as part of the Thebe build pipeline, your styles are instantly rebuilt whenever you change a `.trs` component during `thebe dev`. During `thebe build`, the standalone CLI is invoked with `--minify` so the emitted CSS is compressed for production.
+Because the Tailwind compiler runs as part of the Thebe build pipeline, your styles are instantly rebuilt whenever you change a `.trs` component during `thebe dev`. During `thebe build`, the standalone CLI is invoked with `--minify` so the emitted CSS is compressed for production. Thebe also extracts generated route CSS and client/runtime JavaScript into hashed `/.thebe/assets/*` files for cache-busted production responses.
 
 ## The `[hooks]` Block
 

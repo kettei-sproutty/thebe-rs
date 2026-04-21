@@ -453,6 +453,7 @@
       if (
         src.id === "__thebe_props" ||
         !_isExecutableScript(src) ||
+        src.hasAttribute("data-thebe-runtime") ||
         src.textContent.indexOf("__thebe_runtime") !== -1
       ) {
         continue;
