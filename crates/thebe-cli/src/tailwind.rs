@@ -1,7 +1,6 @@
 use anyhow::Context;
 use reqwest::blocking::Client;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
