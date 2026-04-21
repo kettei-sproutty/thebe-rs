@@ -25,6 +25,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
 - Document symbols for route handlers, template bindings, and component props.
 - Go-to-definition between `.trs` source files and generated Rust/TypeScript artifacts, plus exact nested `Props` field targets and component tag/prop targets.
 - References for route handlers, template bindings, and precise nested `Props` field paths.
+- Workspace symbol search across loaded Thebe project manifests for routes, handlers, template symbols, layouts, components, and component props.
 - Semantic tokens for block tags, template bindings, component tags, directives, and event attributes.
 - Rename support for route handlers and client event handlers.
 - Code actions for inserting missing top-level blocks and adding `ts-rs` when typed client routes require it.
@@ -33,7 +34,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
   - top-level block snippets such as `<head>`, `<script setup>`, `<script lang="ts">`, and `<style>`
   - template symbol completions from route `Props` metadata plus current unsaved source
   - event-handler name completions from the current `<script lang="ts">` block
-  - component tag completions
+  - component tag completions, including missing component import insertion when a matching Rust block is present
   - component prop completions
   - template attribute completions for directives and bound attributes such as `:if`, `:class`, generic `:attr`, and common `on*` handlers
 
@@ -52,7 +53,6 @@ The editor loop is not disk-only anymore.
 The editor story is broader now, but a few edges are still intentionally narrow:
 
 - The tree-sitter grammar is still initial and does not yet model full HTML-aware nesting or embedded Rust/TypeScript/CSS subgrammars.
-- Component completion does not yet insert or rewrite Rust `use crate::components::...` imports automatically.
 - Rename support is currently scoped to route handlers and client event handlers rather than arbitrary Rust or TypeScript symbols.
 - Formatting currently normalizes top-level `.trs` structure, but it does not invoke dedicated Rust, TypeScript, or CSS formatters inside embedded blocks.
 

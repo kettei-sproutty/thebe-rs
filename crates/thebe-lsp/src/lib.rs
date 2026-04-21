@@ -25,9 +25,9 @@ use tower_lsp::lsp_types::{
   SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
   SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
   SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-  ServerCapabilities, ServerInfo, SymbolKind, TextDocumentSyncCapability,
-  TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
-  WorkspaceEdit,
+  ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind,
+  TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+  TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -186,6 +186,12 @@ impl BackendState {
       .projects
       .get(project_root)
       .is_some_and(|project| project.revision == revision)
+  }
+
+  fn project_roots(&self) -> Vec<PathBuf> {
+    let mut roots = self.projects.keys().cloned().collect::<Vec<_>>();
+    roots.sort();
+    roots
   }
 
   fn bump_revision(&mut self, project_root: PathBuf) -> u64 {
@@ -363,6 +369,10 @@ impl Backend {
     read_backend_state(&self.state).snapshot(project_root)
   }
 
+  fn known_project_roots(&self) -> Vec<PathBuf> {
+    read_backend_state(&self.state).project_roots()
+  }
+
   fn note_refresh_requested(&self, project_root: &Path, revision: u64) {
     write_backend_state(&self.state).note_refresh_requested(project_root, revision);
   }
@@ -411,45 +421,45 @@ impl Backend {
     .await;
   }
 
-  fn load_or_refresh_artifacts(&self, uri: &Url) -> Option<(PathBuf, ProjectArtifacts)> {
-    let project_root = find_project_root_from_uri(uri)?;
-    let snapshot = self.project_snapshot(&project_root);
+  fn load_or_refresh_artifacts_for_project(&self, project_root: &Path) -> Option<ProjectArtifacts> {
+    let snapshot = self.project_snapshot(project_root);
 
     if let Some(artifacts) = snapshot.cached_artifacts {
-      return Some((project_root, artifacts));
+      return Some(artifacts);
     }
 
-    if let Ok(artifacts) = thebe_project::load_project_artifacts(&project_root) {
-      return Some((project_root, artifacts));
+    if let Ok(artifacts) = thebe_project::load_project_artifacts(project_root) {
+      return Some(artifacts);
     }
 
-    match thebe_project::refresh_project_for_editor_with_overlay(&project_root, &snapshot.overlay)
+    match thebe_project::refresh_project_for_editor_with_overlay(project_root, &snapshot.overlay)
       .ok()?
     {
       EditorRefresh::Generated(artifacts) => {
-        let _ = write_backend_state(&self.state).remember_generated(
-          &project_root,
-          snapshot.revision,
-          &artifacts,
-        );
-        Some((project_root, artifacts))
+        let _ =
+          write_backend_state(&self.state).remember_generated(project_root, snapshot.revision, &artifacts);
+        Some(artifacts)
       }
       EditorRefresh::Diagnostics(diagnostics) => {
-        let (_, cached_artifacts) = write_backend_state(&self.state).remember_diagnostics(
-          &project_root,
-          snapshot.revision,
-          &diagnostics,
-        );
+        let (_, cached_artifacts) =
+          write_backend_state(&self.state).remember_diagnostics(project_root, snapshot.revision, &diagnostics);
 
-        cached_artifacts
-          .map(|artifacts| (project_root.clone(), artifacts))
-          .or_else(|| {
-            thebe_project::load_project_artifacts(&project_root)
-              .ok()
-              .map(|artifacts| (project_root, artifacts))
-          })
+        cached_artifacts.or_else(|| {
+          thebe_project::load_project_artifacts(project_root)
+            .ok()
+            .map(|mut artifacts| {
+              artifacts.diagnostics = diagnostics.clone();
+              artifacts
+            })
+        })
       }
     }
+  }
+
+  fn load_or_refresh_artifacts(&self, uri: &Url) -> Option<(PathBuf, ProjectArtifacts)> {
+    let project_root = find_project_root_from_uri(uri)?;
+    let artifacts = self.load_or_refresh_artifacts_for_project(&project_root)?;
+    Some((project_root, artifacts))
   }
 
   fn document_context(&self, uri: &Url) -> Option<DocumentContext> {
@@ -572,6 +582,7 @@ impl LanguageServer for Backend {
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        workspace_symbol_provider: Some(OneOf::Left(true)),
         rename_provider: Some(OneOf::Right(RenameOptions {
           prepare_provider: Some(true),
           work_done_progress_options: Default::default(),
@@ -769,6 +780,29 @@ impl LanguageServer for Backend {
       params.context.include_declaration,
     )
     .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())
+  }
+
+  async fn symbol(&self, params: WorkspaceSymbolParams) -> LspResult<Option<Vec<SymbolInformation>>> {
+    let mut symbols = Vec::new();
+
+    for project_root in self.known_project_roots() {
+      let Some(artifacts) = self.load_or_refresh_artifacts_for_project(&project_root) else {
+        continue;
+      };
+
+      symbols.extend(
+        workspace_symbols_for_manifest(&project_root, &artifacts.manifest, &params.query)
+          .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?,
+      );
+    }
+
+    sort_symbol_information(&mut symbols);
+
+    if symbols.is_empty() {
+      Ok(None)
+    } else {
+      Ok(Some(symbols))
+    }
   }
 
   async fn prepare_rename(
@@ -969,7 +1003,9 @@ fn component_tag_completion_items(
   prefix: &str,
   replace: ByteRange,
 ) -> Vec<CompletionItem> {
-  let mut imports = current_component_imports(document);
+  let current_imports = current_component_imports(document);
+  let import_insert_offset = component_import_insert_offset(document);
+  let mut imports = available_component_imports(document, &current_imports);
   imports.sort_by(|left, right| left.tag_name.cmp(&right.tag_name));
   imports.dedup_by(|left, right| left.tag_name == right.tag_name);
 
@@ -979,11 +1015,17 @@ fn component_tag_completion_items(
     .map(|component| CompletionItem {
       label: component.tag_name.clone(),
       kind: Some(CompletionItemKind::CLASS),
-      detail: Some(component.module_path),
+      detail: Some(component.module_path.clone()),
       text_edit: Some(CompletionTextEdit::Edit(TextEdit {
         range: range_from_offsets(&document.source, replace.start, replace.end),
-        new_text: component.tag_name,
+        new_text: component.tag_name.clone(),
       })),
+      additional_text_edits: missing_component_import_edit(
+        &document.source,
+        &component,
+        &current_imports,
+        import_insert_offset,
+      ),
       ..CompletionItem::default()
     })
     .collect()
@@ -1454,48 +1496,111 @@ fn is_component_path(relative_path: &str) -> bool {
 fn current_component_imports(document: &DocumentContext) -> Vec<ComponentImport> {
   let mut imports = Vec::new();
 
-  if !is_component_path(&document.relative_path)
-    && let Ok(blocks) = parse_source_blocks(&document.source)
-    && let Some(script_setup) = blocks.script_setup.as_deref()
-  {
-    for line in script_setup.lines() {
-      let line = line.trim();
-      if !line.starts_with("use ") || !line.ends_with(';') || !line.contains("crate::components::")
-      {
-        continue;
-      }
+  if let Ok(blocks) = parse_document_blocks(document) {
+    let import_block = if is_component_path(&document.relative_path) {
+      blocks.script.as_deref()
+    } else {
+      blocks.script_setup.as_deref()
+    };
 
-      let import = line.trim_start_matches("use ").trim_end_matches(';').trim();
-      if import.contains('{') {
-        continue;
-      }
-
-      let (module_path, tag_name) = if let Some((path, alias)) = import.split_once(" as ") {
-        (path.trim().to_owned(), alias.trim().to_owned())
-      } else {
-        let Some(tag_name) = import.rsplit("::").next() else {
+    if let Some(import_block) = import_block {
+      for line in import_block.lines() {
+        let line = line.trim();
+        if !line.starts_with("use ")
+          || !line.ends_with(';')
+          || !line.contains("crate::components::")
+        {
           continue;
-        };
-        (import.to_owned(), tag_name.to_owned())
-      };
+        }
 
-      imports.push(ComponentImport {
-        module_path,
-        tag_name,
-      });
+        let import = line.trim_start_matches("use ").trim_end_matches(';').trim();
+        if import.contains('{') {
+          continue;
+        }
+
+        let (module_path, tag_name) = if let Some((path, alias)) = import.split_once(" as ") {
+          (path.trim().to_owned(), alias.trim().to_owned())
+        } else {
+          let Some(tag_name) = import.rsplit("::").next() else {
+            continue;
+          };
+          (import.to_owned(), tag_name.to_owned())
+        };
+
+        imports.push(ComponentImport {
+          module_path,
+          tag_name,
+        });
+      }
     }
   }
 
-  if imports.is_empty()
-    && let Some(artifacts) = document.cached_artifacts.as_ref()
-  {
-    imports.extend(artifacts.manifest.components.iter().map(|component| ComponentImport {
-      module_path: component.module_path.clone(),
-      tag_name: component.tag_name.clone(),
-    }));
+  imports
+}
+
+fn available_component_imports(
+  document: &DocumentContext,
+  current_imports: &[ComponentImport],
+) -> Vec<ComponentImport> {
+  let Some(artifacts) = document.cached_artifacts.as_ref() else {
+    return current_imports.to_vec();
+  };
+
+  let mut imports = artifacts
+    .manifest
+    .components
+    .iter()
+    .map(|component| {
+      let tag_name = current_imports
+        .iter()
+        .find(|import| import.module_path == component.module_path)
+        .map_or_else(|| component.tag_name.clone(), |import| import.tag_name.clone());
+
+      ComponentImport {
+        module_path: component.module_path.clone(),
+        tag_name,
+      }
+    })
+    .collect::<Vec<_>>();
+
+  for import in current_imports {
+    if imports.iter().any(|candidate| candidate.module_path == import.module_path) {
+      continue;
+    }
+
+    imports.push(import.clone());
   }
 
   imports
+}
+
+fn component_import_insert_offset(document: &DocumentContext) -> Option<usize> {
+  let blocks = parse_document_blocks(document).ok()?;
+  if is_component_path(&document.relative_path) {
+    return blocks.script_span.map(|span| span.start);
+  }
+
+  blocks.script_setup_span.map(|span| span.start)
+}
+
+fn missing_component_import_edit(
+  source: &str,
+  component: &ComponentImport,
+  current_imports: &[ComponentImport],
+  import_insert_offset: Option<usize>,
+) -> Option<Vec<TextEdit>> {
+  if current_imports
+    .iter()
+    .any(|import| import.module_path == component.module_path)
+  {
+    return None;
+  }
+
+  let offset = import_insert_offset?;
+  Some(vec![TextEdit {
+    range: range_from_offsets(source, offset, offset),
+    new_text: format!("use {};\n", component.module_path),
+  }])
 }
 
 fn component_metadata_for_tag<'a>(
@@ -3113,6 +3218,172 @@ fn document_symbols_for_component(component: &ComponentMetadata) -> Vec<Document
 
 #[expect(
   deprecated,
+  reason = "lsp-types 0.94 still requires populating SymbolInformation::deprecated"
+)]
+fn workspace_symbols_for_manifest(
+  project_root: &Path,
+  manifest: &ThebeManifest,
+  query: &str,
+) -> Result<Vec<SymbolInformation>> {
+  let mut symbols = Vec::new();
+
+  for route in &manifest.routes {
+    let route_location = file_start_location(project_root, &route.source_path)?;
+    if workspace_symbol_matches(
+      query,
+      [&route.route_path, &route.source_path, &route.module_name],
+    ) {
+      symbols.push(SymbolInformation {
+        name: route.route_path.clone(),
+        kind: SymbolKind::MODULE,
+        tags: None,
+        deprecated: None,
+        location: route_location.clone(),
+        container_name: Some(route.source_path.clone()),
+      });
+    }
+
+    let handler_location = route.handler.source_span.map_or_else(
+      || file_start_location(project_root, &route.source_path),
+      |span| location_for_relative_path(project_root, &route.source_path, span),
+    )?;
+    if workspace_symbol_matches(
+      query,
+      [&route.handler.name, &route.route_path, &route.source_path],
+    ) {
+      symbols.push(SymbolInformation {
+        name: route.handler.name.clone(),
+        kind: SymbolKind::FUNCTION,
+        tags: None,
+        deprecated: None,
+        location: handler_location,
+        container_name: Some(route.route_path.clone()),
+      });
+    }
+
+    for definition in &route.template_symbol_definitions {
+      if !workspace_symbol_matches(
+        query,
+        [
+          definition.path.as_str(),
+          definition.field_name.as_str(),
+          route.route_path.as_str(),
+          definition.type_name.as_str(),
+        ],
+      ) {
+        continue;
+      }
+
+      symbols.push(SymbolInformation {
+        name: definition.path.clone(),
+        kind: SymbolKind::VARIABLE,
+        tags: None,
+        deprecated: None,
+        location: location_for_relative_path(
+          project_root,
+          &route.source_path,
+          definition.source_span,
+        )?,
+        container_name: Some(route.route_path.clone()),
+      });
+    }
+  }
+
+  for layout in &manifest.layouts {
+    let layout_location = file_start_location(project_root, &layout.source_path)?;
+    if workspace_symbol_matches(query, [&layout.source_path, &layout.scope_path]) {
+      symbols.push(SymbolInformation {
+        name: layout.source_path.clone(),
+        kind: SymbolKind::MODULE,
+        tags: None,
+        deprecated: None,
+        location: layout_location,
+        container_name: Some("layout".to_owned()),
+      });
+    }
+
+    for binding in &layout.template_binding_spans {
+      if !workspace_symbol_matches(query, [&binding.name, &layout.source_path]) {
+        continue;
+      }
+
+      symbols.push(SymbolInformation {
+        name: binding.name.clone(),
+        kind: SymbolKind::VARIABLE,
+        tags: None,
+        deprecated: None,
+        location: location_for_relative_path(project_root, &layout.source_path, binding.source_span)?,
+        container_name: Some(layout.source_path.clone()),
+      });
+    }
+  }
+
+  for component in &manifest.components {
+    let component_location = file_start_location(project_root, &component.source_path)?;
+    if workspace_symbol_matches(
+      query,
+      [&component.tag_name, &component.module_path, &component.source_path],
+    ) {
+      symbols.push(SymbolInformation {
+        name: component.tag_name.clone(),
+        kind: SymbolKind::CLASS,
+        tags: None,
+        deprecated: None,
+        location: component_location,
+        container_name: Some(component.module_path.clone()),
+      });
+    }
+
+    for prop in &component.props {
+      if !workspace_symbol_matches(
+        query,
+        [&prop.name, &component.tag_name, &component.module_path],
+      ) {
+        continue;
+      }
+
+      symbols.push(SymbolInformation {
+        name: prop.name.clone(),
+        kind: SymbolKind::PROPERTY,
+        tags: None,
+        deprecated: None,
+        location: location_for_relative_path(project_root, &component.source_path, prop.source_span)?,
+        container_name: Some(component.tag_name.clone()),
+      });
+    }
+  }
+
+  Ok(symbols)
+}
+
+fn workspace_symbol_matches<T>(query: &str, candidates: impl IntoIterator<Item = T>) -> bool
+where
+  T: AsRef<str>,
+{
+  let query = query.trim();
+  if query.is_empty() {
+    return true;
+  }
+
+  let query = query.to_ascii_lowercase();
+  candidates
+    .into_iter()
+    .any(|candidate| candidate.as_ref().to_ascii_lowercase().contains(&query))
+}
+
+fn sort_symbol_information(symbols: &mut [SymbolInformation]) {
+  symbols.sort_by(|left, right| {
+    left
+      .name
+      .cmp(&right.name)
+      .then_with(|| left.location.uri.as_str().cmp(right.location.uri.as_str()))
+      .then_with(|| compare_positions(left.location.range.start, right.location.range.start))
+      .then_with(|| compare_positions(left.location.range.end, right.location.range.end))
+  });
+}
+
+#[expect(
+  deprecated,
   reason = "lsp-types 0.94 still requires populating DocumentSymbol::deprecated"
 )]
 fn binding_symbols(
@@ -3417,6 +3688,102 @@ function decrement() {
 
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].label, "increment");
+  }
+
+  #[test]
+  fn component_tag_completion_items_add_import_edits_for_unimported_components() {
+    let source = r#"<script setup>
+use crate::components::Badge;
+
+struct Props {
+  count: i64,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props { count: 0 }
+}
+</script>
+
+<Ca
+"#;
+    let replace_start = source.find("Ca").expect("component tag prefix");
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: source.to_owned(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: fixture_manifest(),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+
+    let items = component_tag_completion_items(
+      &document,
+      "Ca",
+      ByteRange {
+        start: replace_start,
+        end: replace_start + 2,
+      },
+    );
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].label, "Card");
+    let edits = items[0]
+      .additional_text_edits
+      .as_ref()
+      .expect("missing import edit");
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].new_text, "use crate::components::Card;\n");
+    assert_eq!(edits[0].range.start, Position::new(1, 0));
+  }
+
+  #[test]
+  fn component_tag_completion_items_preserve_existing_component_aliases() {
+    let source = r#"<script setup>
+use crate::components::Card as SummaryCard;
+
+struct Props {
+  count: i64,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props { count: 0 }
+}
+</script>
+
+<Sum
+"#;
+    let replace_start = source.find("Sum").expect("component tag prefix");
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: source.to_owned(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: fixture_manifest(),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+
+    let items = component_tag_completion_items(
+      &document,
+      "Sum",
+      ByteRange {
+        start: replace_start,
+        end: replace_start + 3,
+      },
+    );
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].label, "SummaryCard");
+    assert!(items[0].additional_text_edits.is_none());
   }
 
   #[test]
@@ -3776,6 +4143,34 @@ fn handler(State(state): State<crate::AppState>) -> Props {
     assert_eq!(symbols[0].name, "handler");
     assert_eq!(symbols[1].name, "username");
     assert_eq!(symbols[2].name, "profile.display_name");
+  }
+
+  #[test]
+  fn workspace_symbols_include_route_handlers_and_template_definitions() {
+    let symbols = workspace_symbols_for_manifest(
+      Path::new("/tmp/app"),
+      &fixture_manifest(),
+      "profile",
+    )
+    .expect("workspace symbols");
+
+    assert!(symbols.iter().any(|symbol| {
+      symbol.name == "/profile" && symbol.kind == SymbolKind::MODULE
+    }));
+    assert!(symbols.iter().any(|symbol| {
+      symbol.name == "handler" && symbol.container_name.as_deref() == Some("/profile")
+    }));
+    assert!(symbols.iter().any(|symbol| symbol.name == "profile.display_name"));
+  }
+
+  #[test]
+  fn workspace_symbols_match_component_props_case_insensitively() {
+    let symbols = workspace_symbols_for_manifest(Path::new("/tmp/app"), &fixture_manifest(), "TITLE")
+      .expect("workspace symbols");
+
+    assert!(symbols.iter().any(|symbol| {
+      symbol.name == "title" && symbol.container_name.as_deref() == Some("Card")
+    }));
   }
 
   #[test]
