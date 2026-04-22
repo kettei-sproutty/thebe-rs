@@ -29,7 +29,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
 - Workspace symbol search across loaded Thebe project manifests for routes, handlers, template symbols, layouts, components, and component props.
 - Semantic tokens for block tags, template bindings, component tags, directives, and event attributes.
 - Linked editing for matched template tag pairs.
-- Rename support for route handlers, route template symbols, component prop definitions/usages, local component tag/import relationships, and client event handlers.
+- Rename support for route handlers, route template symbols, component prop definitions/usages, component tag/import relationships across known `.trs` sources, and client event handlers.
 - Code actions for inserting missing top-level blocks and adding `ts-rs` when typed client routes require it.
 - Formatting support for normalizing `.trs` block layout, plus best-effort formatting for embedded Rust, TypeScript, and CSS blocks.
 - `.trs` completions for:
@@ -55,7 +55,7 @@ The editor loop is not disk-only anymore.
 The editor story is broader now, but a few edges are still intentionally narrow:
 
 - The tree-sitter grammar is still initial and does not yet model full HTML-aware nesting or embedded Rust/TypeScript/CSS subgrammars.
-- Rename support is currently scoped to route handlers, route template symbols, component prop definitions/usages, local component tag/import relationships, and client event handlers rather than arbitrary Rust or TypeScript symbols.
+- Rename support is currently scoped to route handlers, route template symbols, component prop definitions/usages, component tag/import relationships across known `.trs` sources, and client event handlers rather than arbitrary Rust or TypeScript symbols.
 - Formatting now normalizes top-level `.trs` structure and uses best-effort block formatters for embedded Rust, TypeScript, and CSS, but it still does not provide full language-service formatting semantics inside those blocks.
 
 ## Practical Scope Today

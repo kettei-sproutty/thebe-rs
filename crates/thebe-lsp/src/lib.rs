@@ -2549,9 +2549,8 @@ fn component_tag_reference_locations(
     locations.push(file_start_location(project_root, &component.source_path)?);
   }
 
-  for relative_path in known_source_paths(manifest)
+  for relative_path in known_trs_source_paths(manifest, current_relative_path)
     .into_iter()
-    .filter(|path| path.ends_with(".trs"))
   {
     let Some(source) = source_for_relative_path(
       project_root,
@@ -2593,9 +2592,8 @@ fn component_prop_reference_locations(
     )?);
   }
 
-  for relative_path in known_source_paths(manifest)
+  for relative_path in known_trs_source_paths(manifest, current_relative_path)
     .into_iter()
-    .filter(|path| path.ends_with(".trs"))
   {
     let Some(source) = source_for_relative_path(
       project_root,
@@ -3415,9 +3413,8 @@ fn component_prop_rename_edits(
     relative_path: component.source_path.clone(),
   }];
 
-  for relative_path in known_source_paths(manifest)
+  for relative_path in known_trs_source_paths(manifest, &document.relative_path)
     .into_iter()
-    .filter(|path| path.ends_with(".trs"))
   {
     let Some(source) = source_for_relative_path(
       &document.project_root,
@@ -3455,27 +3452,16 @@ fn component_tag_rename_target(
   document: &DocumentContext,
   position: Position,
 ) -> Option<RenameTarget> {
-  let blocks = parse_document_blocks(document).ok()?;
+  let manifest = &document.cached_artifacts.as_ref()?.manifest;
+  parse_document_blocks(document).ok()?;
   let imports = component_import_occurrences(document);
 
   for import in imports {
-    let usage_ranges = template_tag_name_ranges(
+    let usage_ranges = component_tag_usage_ranges_for_local_name(
+      &document.relative_path,
       &document.source,
-      &blocks.template_spans,
       &import.local_name,
     );
-    let usage_ranges = if usage_ranges.is_empty() {
-      template_tag_name_ranges(
-        &document.source,
-        &[thebe_parser::SourceSpan {
-          start: 0,
-          end: document.source.len(),
-        }],
-        &import.local_name,
-      )
-    } else {
-      usage_ranges
-    };
     let import_range = range_from_offsets(
       &document.source,
       import.local_range.start,
@@ -3489,42 +3475,123 @@ fn component_tag_rename_target(
     if !position_in_range(position, import_range.clone()) && current_usage.is_none() {
       continue;
     }
-
-    let import_edit = if import.imported_name == import.local_name {
-      LocatedRenameEdit::local(
-        document,
-        RenameEdit::ImportAlias {
-          imported_name: import.imported_name,
-          range: import_range.clone(),
-        },
-      )
-    } else {
-      LocatedRenameEdit::local(
-        document,
-        RenameEdit::Replace {
-          range: import_range.clone(),
-        },
-      )
-    };
-
-    let mut edits = vec![import_edit];
-    edits.extend(usage_ranges.into_iter().map(|range| {
-      LocatedRenameEdit::local(
-        document,
-        RenameEdit::Replace {
-          range: range_from_offsets(&document.source, range.start, range.end),
-        },
-      )
-    }));
+    let component = manifest
+      .components
+      .iter()
+      .find(|component| component.module_path == import.module_path)?;
 
     return Some(RenameTarget {
       current_name: import.local_name,
-      edits,
+      edits: component_tag_rename_edits(document, manifest, component),
       range: current_usage.unwrap_or(import_range),
     });
   }
 
   None
+}
+
+fn component_tag_rename_edits(
+  document: &DocumentContext,
+  manifest: &ThebeManifest,
+  component: &ComponentMetadata,
+) -> Vec<LocatedRenameEdit> {
+  let mut edits = Vec::new();
+
+  for relative_path in known_trs_source_paths(manifest, &document.relative_path)
+    .into_iter()
+  {
+    let Some(source) = source_for_relative_path(
+      &document.project_root,
+      &document.relative_path,
+      &document.source,
+      &relative_path,
+    ) else {
+      continue;
+    };
+    let source_document = DocumentContext {
+      project_root: PathBuf::new(),
+      relative_path: relative_path.clone(),
+      source: source.clone(),
+      cached_artifacts: None,
+    };
+
+    edits.extend(
+      component_import_occurrences(&source_document)
+        .into_iter()
+        .filter(|import| import.module_path == component.module_path)
+        .flat_map(|import| {
+          let import_range = range_from_offsets(
+            &source,
+            import.local_range.start,
+            import.local_range.end,
+          );
+          let import_edit = if import.imported_name == import.local_name {
+            LocatedRenameEdit {
+              edit: RenameEdit::ImportAlias {
+                imported_name: import.imported_name,
+                range: import_range,
+              },
+              relative_path: relative_path.clone(),
+            }
+          } else {
+            LocatedRenameEdit {
+              edit: RenameEdit::Replace { range: import_range },
+              relative_path: relative_path.clone(),
+            }
+          };
+
+          std::iter::once(import_edit).chain(
+            component_tag_usage_ranges_for_local_name(
+              &relative_path,
+              &source,
+              &import.local_name,
+            )
+            .into_iter()
+            .map(|range| LocatedRenameEdit {
+              edit: RenameEdit::Replace {
+                range: range_from_offsets(&source, range.start, range.end),
+              },
+              relative_path: relative_path.clone(),
+            }),
+          )
+        }),
+    );
+  }
+
+  edits.sort_by(|left, right| {
+    left
+      .relative_path
+      .cmp(&right.relative_path)
+      .then_with(|| compare_positions(left.range().start, right.range().start))
+      .then_with(|| compare_positions(left.range().end, right.range().end))
+  });
+  edits.dedup_by(|left, right| left.relative_path == right.relative_path && left.range() == right.range());
+  edits
+}
+
+fn component_tag_usage_ranges_for_local_name(
+  relative_path: &str,
+  source: &str,
+  local_name: &str,
+) -> Vec<ByteRange> {
+  let blocks = parse_blocks_for_path(relative_path, source).ok();
+  let template_spans = blocks
+    .as_ref()
+    .map(|blocks| blocks.template_spans.as_slice())
+    .unwrap_or(&[]);
+  let ranges = template_tag_name_ranges(source, template_spans, local_name);
+  if !ranges.is_empty() || template_spans.is_empty() {
+    return ranges;
+  }
+
+  template_tag_name_ranges(
+    source,
+    &[thebe_parser::SourceSpan {
+      start: 0,
+      end: source.len(),
+    }],
+    local_name,
+  )
 }
 
 fn event_handler_rename_target(
@@ -4225,6 +4292,21 @@ fn known_source_paths(manifest: &ThebeManifest) -> Vec<String> {
       .iter()
       .map(|component| component.source_path.clone()),
   );
+
+  paths.sort();
+  paths.dedup();
+  paths
+}
+
+fn known_trs_source_paths(manifest: &ThebeManifest, current_relative_path: &str) -> Vec<String> {
+  let mut paths = known_source_paths(manifest)
+    .into_iter()
+    .filter(|path| path.ends_with(".trs"))
+    .collect::<Vec<_>>();
+
+  if current_relative_path.ends_with(".trs") {
+    paths.push(current_relative_path.to_owned());
+  }
 
   paths.sort();
   paths.dedup();
@@ -5295,6 +5377,87 @@ fn handler() -> Props {
         .count(),
       2
     );
+  }
+
+  #[test]
+  fn rename_for_document_rewrites_component_imports_and_tag_usages_across_workspace() {
+    let project = TempProject::new();
+    let component_source = r#"<script>
+pub struct Props {
+  title: String,
+}
+</script>
+
+<article>{{ props.title }}</article>
+"#;
+    let route_source = r#"<script setup>
+use crate::components::Card;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <Card title=\"primary\" />
+</main>
+"#;
+    let other_route_source = r#"<script setup>
+use crate::components::Card;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<section>
+  <Card :title=\"secondary\" />
+</section>
+"#;
+    project.write("src/components/Card.trs", component_source);
+    project.write("src/routes/index.trs", route_source);
+    project.write("src/routes/other.trs", other_route_source);
+
+    let document = DocumentContext {
+      project_root: project.root.clone(),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: route_source.to_owned(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: component_prop_fixture_manifest(
+          component_source,
+          &["src/routes/index.trs", "src/routes/other.trs"],
+        ),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+    let position = position_from_byte_offset(
+      &document.source,
+      document.source.find("<Card").expect("component tag") + 2,
+    );
+
+    let edit = rename_for_document(&document, position, "SummaryCard").expect("rename edit");
+    let changes = edit.changes.expect("rename changes");
+
+    assert_eq!(changes.len(), 2);
+    assert!(changes.iter().any(|(uri, edits)| {
+      uri.path().ends_with("/src/routes/index.trs")
+        && edits.iter().any(|edit| edit.new_text == "Card as SummaryCard")
+        && edits.iter().filter(|edit| edit.new_text == "SummaryCard").count() == 1
+    }));
+    assert!(changes.iter().any(|(uri, edits)| {
+      uri.path().ends_with("/src/routes/other.trs")
+        && edits.iter().any(|edit| edit.new_text == "Card as SummaryCard")
+        && edits.iter().filter(|edit| edit.new_text == "SummaryCard").count() == 1
+    }));
   }
 
   #[test]
