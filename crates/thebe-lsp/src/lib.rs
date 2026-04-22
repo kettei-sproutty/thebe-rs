@@ -1,7 +1,9 @@
 use anyhow::Result;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use thebe_parser::SfcBlocks;
@@ -17,17 +19,20 @@ use tower_lsp::lsp_types::{
   CodeActionProviderCapability, CompletionItem, CompletionItemKind, CompletionOptions,
   CompletionParams, CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
   DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-  DidSaveTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
+  DidSaveTextDocumentParams, DocumentFormattingParams, DocumentHighlight,
+  DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
   DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover,
   HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-  InsertTextFormat, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
-  Position, PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams,
-  SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
-  SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
-  SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-  ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind,
-  TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-  TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceEdit, WorkspaceSymbolParams,
+  InsertTextFormat, LinkedEditingRangeParams, LinkedEditingRangeServerCapabilities,
+  LinkedEditingRanges, Location, MarkupContent, MarkupKind, MessageType,
+  NumberOrString, OneOf, Position, PrepareRenameResponse, Range, ReferenceParams,
+  RenameOptions, RenameParams, SemanticToken, SemanticTokenModifier,
+  SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
+  SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+  SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
+  SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind,
+  TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
+  WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -241,11 +246,33 @@ struct ComponentImport {
   tag_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComponentImportOccurrence {
+  imported_name: String,
+  local_name: String,
+  local_range: ByteRange,
+  module_path: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SemanticTokenSpan {
   end: usize,
   start: usize,
   token_type: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TagNameOccurrence {
+  is_closing: bool,
+  name: String,
+  range: ByteRange,
+  self_closing: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TemplateTagPair {
+  close: ByteRange,
+  open: ByteRange,
 }
 
 #[derive(Debug, Default)]
@@ -579,6 +606,7 @@ impl LanguageServer for Backend {
       }),
       capabilities: ServerCapabilities {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
+        document_highlight_provider: Some(OneOf::Left(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
@@ -610,6 +638,7 @@ impl LanguageServer for Backend {
             work_done_progress_options: Default::default(),
           }),
         ),
+        linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
         text_document_sync: Some(TextDocumentSyncCapability::Options(
           TextDocumentSyncOptions {
             open_close: Some(true),
@@ -717,6 +746,21 @@ impl LanguageServer for Backend {
       &document.source,
       &artifacts.manifest,
       &document.relative_path,
+      params.text_document_position_params.position,
+    ))
+  }
+
+  async fn document_highlight(
+    &self,
+    params: DocumentHighlightParams,
+  ) -> LspResult<Option<Vec<DocumentHighlight>>> {
+    let uri = &params.text_document_position_params.text_document.uri;
+    let Some(document) = self.document_context(uri) else {
+      return Ok(None);
+    };
+
+    Ok(document_highlights_for_document(
+      &document,
       params.text_document_position_params.position,
     ))
   }
@@ -861,6 +905,21 @@ impl LanguageServer for Backend {
     };
 
     Ok(semantic_tokens_for_document(&document).map(SemanticTokensResult::Tokens))
+  }
+
+  async fn linked_editing_range(
+    &self,
+    params: LinkedEditingRangeParams,
+  ) -> LspResult<Option<LinkedEditingRanges>> {
+    let uri = &params.text_document_position_params.text_document.uri;
+    let Some(document) = self.document_context(uri) else {
+      return Ok(None);
+    };
+
+    Ok(linked_editing_ranges_for_document(
+      &document,
+      params.text_document_position_params.position,
+    ))
   }
 }
 
@@ -1494,48 +1553,84 @@ fn is_component_path(relative_path: &str) -> bool {
 }
 
 fn current_component_imports(document: &DocumentContext) -> Vec<ComponentImport> {
-  let mut imports = Vec::new();
+  component_import_occurrences(document)
+    .into_iter()
+    .map(|occurrence| ComponentImport {
+      module_path: occurrence.module_path,
+      tag_name: occurrence.local_name,
+    })
+    .collect()
+}
 
-  if let Ok(blocks) = parse_document_blocks(document) {
-    let import_block = if is_component_path(&document.relative_path) {
-      blocks.script.as_deref()
+fn component_import_occurrences(document: &DocumentContext) -> Vec<ComponentImportOccurrence> {
+  let Ok(blocks) = parse_document_blocks(document) else {
+    return Vec::new();
+  };
+
+  let (import_block, import_span) = if is_component_path(&document.relative_path) {
+    (blocks.script.as_deref(), blocks.script_span)
+  } else {
+    (blocks.script_setup.as_deref(), blocks.script_setup_span)
+  };
+  let (Some(import_block), Some(import_span)) = (import_block, import_span) else {
+    return Vec::new();
+  };
+
+  let mut occurrences = Vec::new();
+  let mut line_offset = 0usize;
+
+  for line in import_block.split_inclusive('\n') {
+    let line_text = line.trim_end_matches(['\r', '\n']);
+    let trimmed = line_text.trim();
+    if !trimmed.starts_with("use ")
+      || !trimmed.ends_with(';')
+      || !trimmed.contains("crate::components::")
+    {
+      line_offset += line.len();
+      continue;
+    }
+
+    let import = trimmed.trim_start_matches("use ").trim_end_matches(';').trim();
+    if import.contains('{') {
+      line_offset += line.len();
+      continue;
+    }
+
+    let (module_path, local_name) = if let Some((path, alias)) = import.split_once(" as ") {
+      (path.trim().to_owned(), alias.trim().to_owned())
     } else {
-      blocks.script_setup.as_deref()
+      let Some(tag_name) = import.rsplit("::").next() else {
+        line_offset += line.len();
+        continue;
+      };
+      (import.to_owned(), tag_name.to_owned())
+    };
+    let Some(imported_name) = module_path.rsplit("::").next().map(str::to_owned) else {
+      line_offset += line.len();
+      continue;
     };
 
-    if let Some(import_block) = import_block {
-      for line in import_block.lines() {
-        let line = line.trim();
-        if !line.starts_with("use ")
-          || !line.ends_with(';')
-          || !line.contains("crate::components::")
-        {
-          continue;
-        }
+    let statement = line_text.split_once(';').map_or(line_text, |(before, _)| before);
+    let Some(local_name_start) = statement.rfind(&local_name) else {
+      line_offset += line.len();
+      continue;
+    };
 
-        let import = line.trim_start_matches("use ").trim_end_matches(';').trim();
-        if import.contains('{') {
-          continue;
-        }
+    let absolute_start = import_span.start + line_offset + local_name_start;
+    occurrences.push(ComponentImportOccurrence {
+      imported_name,
+      local_name: local_name.clone(),
+      local_range: ByteRange {
+        start: absolute_start,
+        end: absolute_start + local_name.len(),
+      },
+      module_path,
+    });
 
-        let (module_path, tag_name) = if let Some((path, alias)) = import.split_once(" as ") {
-          (path.trim().to_owned(), alias.trim().to_owned())
-        } else {
-          let Some(tag_name) = import.rsplit("::").next() else {
-            continue;
-          };
-          (import.to_owned(), tag_name.to_owned())
-        };
-
-        imports.push(ComponentImport {
-          module_path,
-          tag_name,
-        });
-      }
-    }
+    line_offset += line.len();
   }
 
-  imports
+  occurrences
 }
 
 fn available_component_imports(
@@ -1794,6 +1889,39 @@ fn hover_for_document(
     return Some(component_prop_hover(component, prop));
   }
 
+  if let Some((component, prop)) = component_prop_at_position_in_document(
+    source,
+    manifest,
+    relative_path,
+    position,
+  ) {
+    let range = current_component_prop_usage_range(source, position)
+      .map(|range| range_from_offsets(source, range.start, range.end))
+      .unwrap_or_else(|| range_from_span(&prop.source_span));
+    return Some(component_prop_hover_at_range(component, prop, range));
+  }
+
+  if let Some(component) = component_tag_at_position_in_document(
+    source,
+    manifest,
+    relative_path,
+    position,
+  ) {
+    let range = current_component_tag_usage_range(source, position)
+      .map(|range| range_from_offsets(source, range.start, range.end))
+      .unwrap_or_else(full_document_range);
+    return Some(component_hover(component, range));
+  }
+
+  if let Some((component, range)) = component_import_hover_target(
+    source,
+    manifest,
+    relative_path,
+    position,
+  ) {
+    return Some(component_hover(component, range));
+  }
+
   None
 }
 
@@ -1918,12 +2046,32 @@ fn definition_for_document(
     return Ok(Some(GotoDefinitionResponse::Scalar(location)));
   }
 
-  if let Some((component, prop)) = component_prop_at_position(source, manifest, position) {
+  if let Some((component, prop)) = component_prop_at_position_in_document(
+    source,
+    manifest,
+    relative_path,
+    position,
+  ) {
     let location = location_for_relative_path(project_root, &component.source_path, prop.source_span)?;
     return Ok(Some(GotoDefinitionResponse::Scalar(location)));
   }
 
-  if let Some(component) = component_tag_at_position(source, manifest, position) {
+  if let Some(component) = component_tag_at_position_in_document(
+    source,
+    manifest,
+    relative_path,
+    position,
+  ) {
+    let location = file_start_location(project_root, &component.source_path)?;
+    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+  }
+
+  if let Some(component) = component_import_at_position(
+    source,
+    manifest,
+    relative_path,
+    position,
+  ) {
     let location = file_start_location(project_root, &component.source_path)?;
     return Ok(Some(GotoDefinitionResponse::Scalar(location)));
   }
@@ -2087,6 +2235,85 @@ fn references_for_document(
     )?);
   }
 
+  if let Some((component, prop)) = component_prop_at_position_in_document(
+    source,
+    manifest,
+    relative_path,
+    position,
+  ) {
+    let current_usage = current_component_prop_usage_range(source, position);
+    locations.extend(component_prop_reference_locations(
+      project_root,
+      manifest,
+      relative_path,
+      source,
+      component,
+      prop,
+      include_declaration,
+      current_usage,
+    )?);
+    dedup_locations(&mut locations);
+    return Ok((!locations.is_empty()).then_some(locations));
+  }
+
+  if let Some((component, prop)) = component_prop_definition_at_position(
+    manifest,
+    relative_path,
+    position,
+  ) {
+    locations.extend(component_prop_reference_locations(
+      project_root,
+      manifest,
+      relative_path,
+      source,
+      component,
+      prop,
+      include_declaration,
+      None,
+    )?);
+    dedup_locations(&mut locations);
+    return Ok((!locations.is_empty()).then_some(locations));
+  }
+
+  if let Some(component) = component_tag_at_position_in_document(
+    source,
+    manifest,
+    relative_path,
+    position,
+  ) {
+    let current_usage = current_component_tag_usage_range(source, position);
+    locations.extend(component_tag_reference_locations(
+      project_root,
+      manifest,
+      relative_path,
+      source,
+      component,
+      include_declaration,
+      current_usage,
+    )?);
+    dedup_locations(&mut locations);
+    return Ok((!locations.is_empty()).then_some(locations));
+  }
+
+  if let Some(component) = component_import_at_position(
+    source,
+    manifest,
+    relative_path,
+    position,
+  ) {
+    locations.extend(component_tag_reference_locations(
+      project_root,
+      manifest,
+      relative_path,
+      source,
+      component,
+      include_declaration,
+      None,
+    )?);
+    dedup_locations(&mut locations);
+    return Ok((!locations.is_empty()).then_some(locations));
+  }
+
   dedup_locations(&mut locations);
   Ok((!locations.is_empty()).then_some(locations))
 }
@@ -2179,9 +2406,10 @@ fn binding_symbol_reference_locations(
     .collect()
 }
 
-fn component_tag_at_position<'a>(
+fn component_tag_at_position_in_document<'a>(
   source: &str,
   manifest: &'a ThebeManifest,
+  relative_path: &str,
   position: Position,
 ) -> Option<&'a ComponentMetadata> {
   let offset = byte_offset_from_position(source, position)?;
@@ -2189,27 +2417,437 @@ fn component_tag_at_position<'a>(
   if offset < start || offset > end {
     return None;
   }
-  manifest
-    .components
-    .iter()
-    .find(|component| component.tag_name == tag_name)
+  resolve_component_by_tag_name(source, manifest, relative_path, &tag_name)
 }
 
-fn component_prop_at_position<'a>(
+fn component_prop_at_position_in_document<'a>(
   source: &str,
   manifest: &'a ThebeManifest,
+  relative_path: &str,
   position: Position,
 ) -> Option<(&'a ComponentMetadata, &'a ComponentPropMetadata)> {
   let offset = byte_offset_from_position(source, position)?;
   let (tag_name, _, _) = tag_name_at_offset(source, offset)?;
-  let component = manifest
-    .components
-    .iter()
-    .find(|component| component.tag_name == tag_name)?;
+  let component = resolve_component_by_tag_name(source, manifest, relative_path, &tag_name)?;
   let (attribute_name, _, _) = attribute_name_at_offset(source, offset)?;
   let prop_name = attribute_name.trim_start_matches(':');
   let prop = component.props.iter().find(|prop| prop.name == prop_name)?;
   Some((component, prop))
+}
+
+fn component_prop_definition_at_position<'a>(
+  manifest: &'a ThebeManifest,
+  relative_path: &str,
+  position: Position,
+) -> Option<(&'a ComponentMetadata, &'a ComponentPropMetadata)> {
+  let component = manifest
+    .components
+    .iter()
+    .find(|component| component.source_path == relative_path)?;
+  let prop = component
+    .props
+    .iter()
+    .find(|prop| position_in_span(position, &prop.source_span))?;
+  Some((component, prop))
+}
+
+fn component_import_at_position<'a>(
+  source: &str,
+  manifest: &'a ThebeManifest,
+  relative_path: &str,
+  position: Position,
+) -> Option<&'a ComponentMetadata> {
+  component_import_hover_target(source, manifest, relative_path, position).map(|(component, _)| component)
+}
+
+fn component_import_hover_target<'a>(
+  source: &str,
+  manifest: &'a ThebeManifest,
+  relative_path: &str,
+  position: Position,
+) -> Option<(&'a ComponentMetadata, Range)> {
+  let document = DocumentContext {
+    project_root: PathBuf::new(),
+    relative_path: relative_path.to_owned(),
+    source: source.to_owned(),
+    cached_artifacts: None,
+  };
+  let import = component_import_occurrences(&document).into_iter().find(|import| {
+    position_in_range(
+      position,
+      range_from_offsets(source, import.local_range.start, import.local_range.end),
+    )
+  })?;
+  let range = range_from_offsets(source, import.local_range.start, import.local_range.end);
+
+  let component = manifest
+    .components
+    .iter()
+    .find(|component| component.module_path == import.module_path)?;
+  Some((component, range))
+}
+
+fn resolve_component_by_tag_name<'a>(
+  source: &str,
+  manifest: &'a ThebeManifest,
+  relative_path: &str,
+  tag_name: &str,
+) -> Option<&'a ComponentMetadata> {
+  if let Some(component) = manifest
+    .components
+    .iter()
+    .find(|component| component.tag_name == tag_name)
+  {
+    return Some(component);
+  }
+
+  let document = DocumentContext {
+    project_root: PathBuf::new(),
+    relative_path: relative_path.to_owned(),
+    source: source.to_owned(),
+    cached_artifacts: None,
+  };
+  let import = current_component_imports(&document)
+    .into_iter()
+    .find(|import| import.tag_name == tag_name)?;
+  manifest
+    .components
+    .iter()
+    .find(|component| component.module_path == import.module_path)
+}
+
+fn current_component_prop_usage_range(source: &str, position: Position) -> Option<ByteRange> {
+  let offset = byte_offset_from_position(source, position)?;
+  let (attribute_name, start, end) = attribute_name_at_offset(source, offset)?;
+  let prop_name = attribute_name.trim_start_matches(':');
+  let prefix = attribute_name.len().saturating_sub(prop_name.len());
+
+  Some(ByteRange {
+    start: start + prefix,
+    end,
+  })
+}
+
+fn current_component_tag_usage_range(source: &str, position: Position) -> Option<ByteRange> {
+  let offset = byte_offset_from_position(source, position)?;
+  let (_, start, end) = tag_name_at_offset(source, offset)?;
+  Some(ByteRange { start, end })
+}
+
+fn component_tag_reference_locations(
+  project_root: &Path,
+  manifest: &ThebeManifest,
+  current_relative_path: &str,
+  current_source: &str,
+  component: &ComponentMetadata,
+  include_declaration: bool,
+  current_usage: Option<ByteRange>,
+) -> Result<Vec<Location>> {
+  let mut locations = Vec::new();
+
+  if include_declaration {
+    locations.push(file_start_location(project_root, &component.source_path)?);
+  }
+
+  for relative_path in known_source_paths(manifest)
+    .into_iter()
+    .filter(|path| path.ends_with(".trs"))
+  {
+    let Some(source) = source_for_relative_path(
+      project_root,
+      current_relative_path,
+      current_source,
+      &relative_path,
+    ) else {
+      continue;
+    };
+
+    for range in component_tag_reference_ranges_in_source(&relative_path, &source, component) {
+      if relative_path == current_relative_path && current_usage == Some(range) {
+        continue;
+      }
+      locations.push(location_for_byte_range(project_root, &relative_path, &source, range)?);
+    }
+  }
+
+  Ok(locations)
+}
+
+fn component_prop_reference_locations(
+  project_root: &Path,
+  manifest: &ThebeManifest,
+  current_relative_path: &str,
+  current_source: &str,
+  component: &ComponentMetadata,
+  prop: &ComponentPropMetadata,
+  include_declaration: bool,
+  current_usage: Option<ByteRange>,
+) -> Result<Vec<Location>> {
+  let mut locations = Vec::new();
+
+  if include_declaration {
+    locations.push(location_for_relative_path(
+      project_root,
+      &component.source_path,
+      prop.source_span,
+    )?);
+  }
+
+  for relative_path in known_source_paths(manifest)
+    .into_iter()
+    .filter(|path| path.ends_with(".trs"))
+  {
+    let Some(source) = source_for_relative_path(
+      project_root,
+      current_relative_path,
+      current_source,
+      &relative_path,
+    ) else {
+      continue;
+    };
+
+    for range in component_prop_reference_ranges_in_source(&relative_path, &source, component, &prop.name) {
+      if relative_path == current_relative_path && current_usage == Some(range) {
+        continue;
+      }
+      locations.push(location_for_byte_range(project_root, &relative_path, &source, range)?);
+    }
+  }
+
+  Ok(locations)
+}
+
+fn component_prop_reference_ranges_in_source(
+  relative_path: &str,
+  source: &str,
+  component: &ComponentMetadata,
+  prop_name: &str,
+) -> Vec<ByteRange> {
+  let blocks = parse_blocks_for_path(relative_path, source).ok();
+  let template_spans = blocks
+    .as_ref()
+    .map(|blocks| blocks.template_spans.as_slice())
+    .unwrap_or(&[]);
+  let tag_names = component_local_tag_names_for_source(relative_path, source, component);
+  if tag_names.is_empty() {
+    return Vec::new();
+  }
+
+  let ranges = component_prop_reference_ranges(source, template_spans, &tag_names, prop_name);
+  if !ranges.is_empty() || template_spans.is_empty() {
+    return ranges;
+  }
+
+  component_prop_reference_ranges(
+    source,
+    &[thebe_parser::SourceSpan {
+      start: 0,
+      end: source.len(),
+    }],
+    &tag_names,
+    prop_name,
+  )
+}
+
+fn component_tag_reference_ranges_in_source(
+  relative_path: &str,
+  source: &str,
+  component: &ComponentMetadata,
+) -> Vec<ByteRange> {
+  let blocks = parse_blocks_for_path(relative_path, source).ok();
+  let template_spans = blocks
+    .as_ref()
+    .map(|blocks| blocks.template_spans.as_slice())
+    .unwrap_or(&[]);
+  let tag_names = component_local_tag_names_for_source(relative_path, source, component);
+  if tag_names.is_empty() {
+    return Vec::new();
+  }
+
+  let ranges = tag_names
+    .iter()
+    .flat_map(|tag_name| template_tag_name_ranges(source, template_spans, tag_name))
+    .collect::<Vec<_>>();
+  if !ranges.is_empty() || template_spans.is_empty() {
+    return ranges;
+  }
+
+  tag_names
+    .iter()
+    .flat_map(|tag_name| {
+      template_tag_name_ranges(
+        source,
+        &[thebe_parser::SourceSpan {
+          start: 0,
+          end: source.len(),
+        }],
+        tag_name,
+      )
+    })
+    .collect()
+}
+
+fn component_local_tag_names_for_source(
+  relative_path: &str,
+  source: &str,
+  component: &ComponentMetadata,
+) -> Vec<String> {
+  let document = DocumentContext {
+    project_root: PathBuf::new(),
+    relative_path: relative_path.to_owned(),
+    source: source.to_owned(),
+    cached_artifacts: None,
+  };
+  let mut tag_names = current_component_imports(&document)
+    .into_iter()
+    .filter(|import| import.module_path == component.module_path)
+    .map(|import| import.tag_name)
+    .collect::<Vec<_>>();
+
+  if tag_names.is_empty() {
+    tag_names.push(component.tag_name.clone());
+  }
+
+  tag_names.sort();
+  tag_names.dedup();
+  tag_names
+}
+
+fn component_prop_reference_ranges(
+  source: &str,
+  template_spans: &[thebe_parser::SourceSpan],
+  tag_names: &[String],
+  prop_name: &str,
+) -> Vec<ByteRange> {
+  let spans = if template_spans.is_empty() {
+    vec![thebe_parser::SourceSpan {
+      start: 0,
+      end: source.len(),
+    }]
+  } else {
+    template_spans.to_vec()
+  };
+  let mut ranges = Vec::new();
+
+  for span in spans {
+    let bytes = source.as_bytes();
+    let mut idx = span.start;
+    while idx < span.end {
+      if bytes[idx] != b'<' {
+        idx += 1;
+        continue;
+      }
+
+      let Some(tag_end) = source[idx..span.end].find('>').map(|relative| idx + relative) else {
+        break;
+      };
+      let tag = &source[idx..=tag_end];
+      let is_closing = tag.as_bytes().get(1).is_some_and(|byte| *byte == b'/');
+      let Some((tag_name, mut cursor)) = open_tag_name(tag) else {
+        idx = tag_end + 1;
+        continue;
+      };
+      if is_closing || !tag_names.iter().any(|candidate| candidate == &tag_name) {
+        idx = tag_end + 1;
+        continue;
+      }
+
+      let tag_bytes = tag.as_bytes();
+      while cursor < tag_bytes.len() {
+        while cursor < tag_bytes.len() && tag_bytes[cursor].is_ascii_whitespace() {
+          cursor += 1;
+        }
+
+        let name_start = cursor;
+        while cursor < tag_bytes.len()
+          && (tag_bytes[cursor].is_ascii_alphanumeric()
+            || matches!(tag_bytes[cursor], b':' | b'-' | b'_'))
+        {
+          cursor += 1;
+        }
+        if name_start == cursor {
+          cursor += 1;
+          continue;
+        }
+
+        let attribute_name = &tag[name_start..cursor];
+        let attribute_prop = attribute_name.trim_start_matches(':');
+        if attribute_prop == prop_name {
+          let prefix = attribute_name.len().saturating_sub(attribute_prop.len());
+          let start = idx + name_start + prefix;
+          ranges.push(ByteRange {
+            start,
+            end: start + prop_name.len(),
+          });
+        }
+
+        while cursor < tag_bytes.len() && tag_bytes[cursor].is_ascii_whitespace() {
+          cursor += 1;
+        }
+        if cursor < tag_bytes.len() && tag_bytes[cursor] == b'=' {
+          cursor += 1;
+          while cursor < tag_bytes.len() && tag_bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+          }
+          if cursor < tag_bytes.len() && matches!(tag_bytes[cursor], b'\'' | b'"') {
+            let quote = tag_bytes[cursor];
+            cursor += 1;
+            while cursor < tag_bytes.len() && tag_bytes[cursor] != quote {
+              cursor += 1;
+            }
+            cursor = cursor.saturating_add(1);
+          } else {
+            while cursor < tag_bytes.len()
+              && !tag_bytes[cursor].is_ascii_whitespace()
+              && tag_bytes[cursor] != b'>'
+            {
+              cursor += 1;
+            }
+          }
+        }
+      }
+
+      idx = tag_end + 1;
+    }
+  }
+
+  ranges
+}
+
+fn parse_blocks_for_path(
+  relative_path: &str,
+  source: &str,
+) -> std::result::Result<SfcBlocks, thebe_parser::ParseError> {
+  if is_component_path(relative_path) {
+    parse_component_source_blocks(source)
+  } else {
+    parse_source_blocks(source)
+  }
+}
+
+fn source_for_relative_path(
+  project_root: &Path,
+  current_relative_path: &str,
+  current_source: &str,
+  relative_path: &str,
+) -> Option<String> {
+  if relative_path == current_relative_path {
+    return Some(current_source.to_owned());
+  }
+
+  std::fs::read_to_string(project_root.join(relative_path)).ok()
+}
+
+fn location_for_byte_range(
+  project_root: &Path,
+  relative_path: &str,
+  source: &str,
+  range: ByteRange,
+) -> Result<Location> {
+  Ok(Location {
+    uri: file_url(project_root, relative_path)?,
+    range: range_from_offsets(source, range.start, range.end),
+  })
 }
 
 fn tag_name_at_offset(source: &str, offset: usize) -> Option<(String, usize, usize)> {
@@ -2294,20 +2932,18 @@ fn rename_for_document(
   }
 
   let target = rename_target(document, position)?;
-  let uri = file_url(&document.project_root, &document.relative_path).ok()?;
+  let mut changes = HashMap::new();
+
+  for edit in target.edits {
+    let uri = file_url(&document.project_root, &edit.relative_path).ok()?;
+    changes
+      .entry(uri)
+      .or_insert_with(Vec::new)
+      .push(edit.edit.into_text_edit(new_name));
+  }
 
   Some(WorkspaceEdit {
-    changes: Some(HashMap::from([(
-      uri,
-      target
-        .edits
-        .into_iter()
-        .map(|edit| TextEdit {
-          range: edit.range,
-          new_text: new_name.to_owned(),
-        })
-        .collect(),
-    )])),
+    changes: Some(changes),
     document_changes: None,
     change_annotations: None,
   })
@@ -2420,6 +3056,72 @@ fn format_document(document: &DocumentContext) -> Option<Vec<TextEdit>> {
   }])
 }
 
+fn document_highlights_for_document(
+  document: &DocumentContext,
+  position: Position,
+) -> Option<Vec<DocumentHighlight>> {
+  let target = rename_target(document, position)?;
+  let local_edits = target
+    .edits
+    .iter()
+    .filter(|edit| edit.relative_path == document.relative_path)
+    .cloned()
+    .collect::<Vec<_>>();
+  let write_range = local_edits.first().map(LocatedRenameEdit::range)?;
+  let mut highlights = local_edits
+    .into_iter()
+    .map(|edit| DocumentHighlight {
+      range: edit.range(),
+      kind: Some(if edit.range() == write_range {
+        DocumentHighlightKind::WRITE
+      } else {
+        DocumentHighlightKind::READ
+      }),
+    })
+    .collect::<Vec<_>>();
+
+  highlights.sort_by(|left, right| {
+    compare_positions(left.range.start, right.range.start)
+      .then_with(|| compare_positions(left.range.end, right.range.end))
+  });
+  highlights.dedup_by(|left, right| left.range == right.range && left.kind == right.kind);
+
+  Some(highlights)
+}
+
+fn linked_editing_ranges_for_document(
+  document: &DocumentContext,
+  position: Position,
+) -> Option<LinkedEditingRanges> {
+  if !document.relative_path.ends_with(".trs") {
+    return None;
+  }
+
+  let template_spans = parse_document_blocks(document)
+    .ok()
+    .map(|blocks| blocks.template_spans)
+    .unwrap_or_default();
+  let pair = template_tag_pair_at_position(&document.source, &template_spans, position).or_else(
+    || {
+      template_tag_pair_at_position(
+        &document.source,
+        &[thebe_parser::SourceSpan {
+          start: 0,
+          end: document.source.len(),
+        }],
+        position,
+      )
+    },
+  )?;
+  Some(LinkedEditingRanges {
+    ranges: vec![
+      range_from_offsets(&document.source, pair.open.start, pair.open.end),
+      range_from_offsets(&document.source, pair.close.start, pair.close.end),
+    ],
+    word_pattern: Some("[A-Za-z][A-Za-z0-9:_-]*".to_owned()),
+  })
+}
+
 fn semantic_tokens_for_document(document: &DocumentContext) -> Option<SemanticTokens> {
   if !document.relative_path.ends_with(".trs") {
     return None;
@@ -2480,12 +3182,64 @@ fn semantic_tokens_for_document(document: &DocumentContext) -> Option<SemanticTo
 #[derive(Debug, Clone)]
 struct RenameTarget {
   current_name: String,
-  edits: Vec<TextEdit>,
+  edits: Vec<LocatedRenameEdit>,
   range: Range,
+}
+
+#[derive(Debug, Clone)]
+enum RenameEdit {
+  ImportAlias { imported_name: String, range: Range },
+  Replace { range: Range },
+}
+
+impl RenameEdit {
+  fn range(&self) -> Range {
+    match self {
+      Self::ImportAlias { range, .. } | Self::Replace { range } => range.clone(),
+    }
+  }
+
+  fn into_text_edit(self, new_name: &str) -> TextEdit {
+    match self {
+      Self::ImportAlias {
+        imported_name,
+        range,
+      } => TextEdit {
+        range,
+        new_text: format!("{imported_name} as {new_name}"),
+      },
+      Self::Replace { range } => TextEdit {
+        range,
+        new_text: new_name.to_owned(),
+      },
+    }
+  }
+}
+
+#[derive(Debug, Clone)]
+struct LocatedRenameEdit {
+  edit: RenameEdit,
+  relative_path: String,
+}
+
+impl LocatedRenameEdit {
+  fn local(document: &DocumentContext, edit: RenameEdit) -> Self {
+    Self {
+      edit,
+      relative_path: document.relative_path.clone(),
+    }
+  }
+
+  fn range(&self) -> Range {
+    self.edit.range()
+  }
 }
 
 fn rename_target(document: &DocumentContext, position: Position) -> Option<RenameTarget> {
   route_handler_rename_target(document, position)
+    .or_else(|| template_symbol_rename_target(document, position))
+    .or_else(|| component_prop_rename_target(document, position))
+    .or_else(|| component_tag_rename_target(document, position))
     .or_else(|| event_handler_rename_target(document, position))
 }
 
@@ -2509,12 +3263,268 @@ fn route_handler_rename_target(
 
   Some(RenameTarget {
     current_name: handler_info.name,
-    edits: vec![TextEdit {
-      range,
-      new_text: String::new(),
-    }],
+    edits: vec![LocatedRenameEdit::local(
+      document,
+      RenameEdit::Replace {
+        range,
+      },
+    )],
     range,
   })
+}
+
+fn template_symbol_rename_target(
+  document: &DocumentContext,
+  position: Position,
+) -> Option<RenameTarget> {
+  let manifest = &document.cached_artifacts.as_ref()?.manifest;
+  let route = manifest
+    .routes
+    .iter()
+    .find(|route| route.source_path == document.relative_path)?;
+
+  if let Some(definition) = route
+    .template_symbol_definitions
+    .iter()
+    .find(|definition| position_in_span(position, &definition.source_span))
+  {
+    let range = range_from_span(&definition.source_span);
+    return Some(RenameTarget {
+      current_name: definition.field_name.clone(),
+      edits: template_symbol_rename_edits(document, route, &definition.path),
+      range,
+    });
+  }
+
+  let binding = route
+    .template_binding_spans
+    .iter()
+    .find(|binding| position_in_span(position, &binding.source_span))?;
+  let path_match = binding_path_match_at_position(&document.source, binding, position)?;
+  let definition = template_symbol_definition(route, &path_match.path)?;
+
+  Some(RenameTarget {
+    current_name: definition.field_name.clone(),
+    edits: template_symbol_rename_edits(document, route, &path_match.path),
+    range: path_match.range(&document.source),
+  })
+}
+
+fn template_symbol_rename_edits(
+  document: &DocumentContext,
+  route: &RouteMetadata,
+  symbol_path: &str,
+) -> Vec<LocatedRenameEdit> {
+  let mut edits = Vec::new();
+
+  if let Some(definition) = template_symbol_definition(route, symbol_path) {
+    edits.push(LocatedRenameEdit::local(
+      document,
+      RenameEdit::Replace {
+        range: range_from_span(&definition.source_span),
+      },
+    ));
+  }
+
+  edits.extend(route.template_binding_spans.iter().filter_map(|binding| {
+    template_symbol_binding_edit_range(&document.source, binding, symbol_path).map(|range| {
+      LocatedRenameEdit::local(
+        document,
+        RenameEdit::Replace {
+          range: range_from_offsets(&document.source, range.start, range.end),
+        },
+      )
+    })
+  }));
+
+  edits
+}
+
+fn template_symbol_binding_edit_range(
+  source: &str,
+  binding: &TemplateBindingMetadata,
+  symbol_path: &str,
+) -> Option<ByteRange> {
+  if binding.name != symbol_path && !binding.name.starts_with(&format!("{symbol_path}.")) {
+    return None;
+  }
+
+  let token = &source[binding.source_span.start_byte..binding.source_span.end_byte];
+  let binding_name_start = token.find(&binding.name)? + binding.source_span.start_byte;
+  let field_name = symbol_path.rsplit('.').next()?;
+  let field_offset = symbol_path.rfind('.').map_or(0, |index| index + 1);
+  let start = binding_name_start + field_offset;
+
+  Some(ByteRange {
+    start,
+    end: start + field_name.len(),
+  })
+}
+
+fn component_prop_rename_target(
+  document: &DocumentContext,
+  position: Position,
+) -> Option<RenameTarget> {
+  let manifest = &document.cached_artifacts.as_ref()?.manifest;
+  let (component, prop, range) = current_component_prop_target(document, manifest, position)?;
+
+  Some(RenameTarget {
+    current_name: prop.name.clone(),
+    edits: component_prop_rename_edits(document, manifest, component, prop),
+    range,
+  })
+}
+
+fn current_component_prop_target<'a>(
+  document: &'a DocumentContext,
+  manifest: &'a ThebeManifest,
+  position: Position,
+) -> Option<(&'a ComponentMetadata, &'a ComponentPropMetadata, Range)> {
+  if let Some((component, prop)) = component_prop_at_position_in_document(
+    &document.source,
+    manifest,
+    &document.relative_path,
+    position,
+  ) {
+    let usage_range = current_component_prop_usage_range(&document.source, position)?;
+    return Some((
+      component,
+      prop,
+      range_from_offsets(&document.source, usage_range.start, usage_range.end),
+    ));
+  }
+
+  let (component, prop) = component_prop_definition_at_position(
+    manifest,
+    &document.relative_path,
+    position,
+  )?;
+  Some((component, prop, range_from_span(&prop.source_span)))
+}
+
+fn component_prop_rename_edits(
+  document: &DocumentContext,
+  manifest: &ThebeManifest,
+  component: &ComponentMetadata,
+  prop: &ComponentPropMetadata,
+) -> Vec<LocatedRenameEdit> {
+  let mut edits = vec![LocatedRenameEdit {
+    edit: RenameEdit::Replace {
+      range: range_from_span(&prop.source_span),
+    },
+    relative_path: component.source_path.clone(),
+  }];
+
+  for relative_path in known_source_paths(manifest)
+    .into_iter()
+    .filter(|path| path.ends_with(".trs"))
+  {
+    let Some(source) = source_for_relative_path(
+      &document.project_root,
+      &document.relative_path,
+      &document.source,
+      &relative_path,
+    ) else {
+      continue;
+    };
+
+    edits.extend(
+      component_prop_reference_ranges_in_source(&relative_path, &source, component, &prop.name)
+        .into_iter()
+        .map(|range| LocatedRenameEdit {
+          edit: RenameEdit::Replace {
+            range: range_from_offsets(&source, range.start, range.end),
+          },
+          relative_path: relative_path.clone(),
+        }),
+    );
+  }
+
+  edits.sort_by(|left, right| {
+    left
+      .relative_path
+      .cmp(&right.relative_path)
+      .then_with(|| compare_positions(left.range().start, right.range().start))
+      .then_with(|| compare_positions(left.range().end, right.range().end))
+  });
+  edits.dedup_by(|left, right| left.relative_path == right.relative_path && left.range() == right.range());
+  edits
+}
+
+fn component_tag_rename_target(
+  document: &DocumentContext,
+  position: Position,
+) -> Option<RenameTarget> {
+  let blocks = parse_document_blocks(document).ok()?;
+  let imports = component_import_occurrences(document);
+
+  for import in imports {
+    let usage_ranges = template_tag_name_ranges(
+      &document.source,
+      &blocks.template_spans,
+      &import.local_name,
+    );
+    let usage_ranges = if usage_ranges.is_empty() {
+      template_tag_name_ranges(
+        &document.source,
+        &[thebe_parser::SourceSpan {
+          start: 0,
+          end: document.source.len(),
+        }],
+        &import.local_name,
+      )
+    } else {
+      usage_ranges
+    };
+    let import_range = range_from_offsets(
+      &document.source,
+      import.local_range.start,
+      import.local_range.end,
+    );
+    let current_usage = usage_ranges.iter().find_map(|range| {
+      let range = range_from_offsets(&document.source, range.start, range.end);
+      position_in_range(position, range.clone()).then_some(range)
+    });
+
+    if !position_in_range(position, import_range.clone()) && current_usage.is_none() {
+      continue;
+    }
+
+    let import_edit = if import.imported_name == import.local_name {
+      LocatedRenameEdit::local(
+        document,
+        RenameEdit::ImportAlias {
+          imported_name: import.imported_name,
+          range: import_range.clone(),
+        },
+      )
+    } else {
+      LocatedRenameEdit::local(
+        document,
+        RenameEdit::Replace {
+          range: import_range.clone(),
+        },
+      )
+    };
+
+    let mut edits = vec![import_edit];
+    edits.extend(usage_ranges.into_iter().map(|range| {
+      LocatedRenameEdit::local(
+        document,
+        RenameEdit::Replace {
+          range: range_from_offsets(&document.source, range.start, range.end),
+        },
+      )
+    }));
+
+    return Some(RenameTarget {
+      current_name: import.local_name,
+      edits,
+      range: current_usage.unwrap_or(import_range),
+    });
+  }
+
+  None
 }
 
 fn event_handler_rename_target(
@@ -2533,13 +3543,19 @@ fn event_handler_rename_target(
     let all_ranges = std::iter::once(*definition).chain(usage_ranges.iter().copied());
     if all_ranges.clone().any(|range| position_in_range(position, range_from_offsets(&document.source, range.start, range.end))) {
       let mut edits = Vec::new();
-      edits.push(TextEdit {
-        range: range_from_offsets(&document.source, definition.start, definition.end),
-        new_text: String::new(),
-      });
-      edits.extend(usage_ranges.into_iter().map(|range| TextEdit {
-        range: range_from_offsets(&document.source, range.start, range.end),
-        new_text: String::new(),
+      edits.push(LocatedRenameEdit::local(
+        document,
+        RenameEdit::Replace {
+          range: range_from_offsets(&document.source, definition.start, definition.end),
+        },
+      ));
+      edits.extend(usage_ranges.into_iter().map(|range| {
+        LocatedRenameEdit::local(
+          document,
+          RenameEdit::Replace {
+            range: range_from_offsets(&document.source, range.start, range.end),
+          },
+        )
       }));
       let range = range_from_offsets(&document.source, definition.start, definition.end);
       return Some(RenameTarget {
@@ -2655,6 +3671,142 @@ fn event_handler_reference_ranges(source: &str, handler_name: &str) -> Vec<ByteR
   ranges
 }
 
+fn template_tag_occurrences(
+  source: &str,
+  template_spans: &[thebe_parser::SourceSpan],
+) -> Vec<TagNameOccurrence> {
+  let mut occurrences = Vec::new();
+
+  if template_spans.is_empty() {
+    scan_template_tag_occurrences_in_span(
+      source,
+      thebe_parser::SourceSpan {
+        start: 0,
+        end: source.len(),
+      },
+      &mut occurrences,
+    );
+    return occurrences;
+  }
+
+  for span in template_spans {
+    scan_template_tag_occurrences_in_span(source, *span, &mut occurrences);
+  }
+
+  occurrences
+}
+
+fn scan_template_tag_occurrences_in_span(
+  source: &str,
+  span: thebe_parser::SourceSpan,
+  occurrences: &mut Vec<TagNameOccurrence>,
+) {
+  let bytes = source.as_bytes();
+  let mut idx = span.start;
+  while idx < span.end {
+    if bytes[idx] != b'<' {
+      idx += 1;
+      continue;
+    }
+
+    let Some(tag_end) = source[idx..span.end].find('>').map(|relative| idx + relative) else {
+      break;
+    };
+    let tag = &source[idx..=tag_end];
+    if let Some(occurrence) = tag_name_occurrence(tag, idx) {
+      occurrences.push(occurrence);
+    }
+    idx = tag_end + 1;
+  }
+}
+
+fn tag_name_occurrence(tag: &str, absolute_start: usize) -> Option<TagNameOccurrence> {
+  let bytes = tag.as_bytes();
+  let mut idx = 1usize;
+  let mut is_closing = false;
+
+  if bytes.get(idx).is_some_and(|byte| *byte == b'/') {
+    is_closing = true;
+    idx += 1;
+  }
+  while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+    idx += 1;
+  }
+
+  let start = idx;
+  while idx < bytes.len()
+    && (bytes[idx].is_ascii_alphanumeric() || matches!(bytes[idx], b':' | b'-' | b'_'))
+  {
+    idx += 1;
+  }
+  if start == idx {
+    return None;
+  }
+
+  Some(TagNameOccurrence {
+    is_closing,
+    name: tag[start..idx].to_owned(),
+    range: ByteRange {
+      start: absolute_start + start,
+      end: absolute_start + idx,
+    },
+    self_closing: !is_closing && tag.trim_end().ends_with("/>") ,
+  })
+}
+
+fn template_tag_name_ranges(
+  source: &str,
+  template_spans: &[thebe_parser::SourceSpan],
+  tag_name: &str,
+) -> Vec<ByteRange> {
+  template_tag_occurrences(source, template_spans)
+    .into_iter()
+    .filter(|occurrence| occurrence.name == tag_name)
+    .map(|occurrence| occurrence.range)
+    .collect()
+}
+
+fn template_tag_pair_at_position(
+  source: &str,
+  template_spans: &[thebe_parser::SourceSpan],
+  position: Position,
+) -> Option<TemplateTagPair> {
+  let offset = byte_offset_from_position(source, position)?;
+  template_tag_pairs(source, template_spans)
+    .into_iter()
+    .find(|pair| {
+      (offset >= pair.open.start && offset <= pair.open.end)
+        || (offset >= pair.close.start && offset <= pair.close.end)
+    })
+}
+
+fn template_tag_pairs(
+  source: &str,
+  template_spans: &[thebe_parser::SourceSpan],
+) -> Vec<TemplateTagPair> {
+  let mut stack = Vec::new();
+  let mut pairs = Vec::new();
+
+  for occurrence in template_tag_occurrences(source, template_spans) {
+    if occurrence.is_closing {
+      if let Some(index) = stack
+        .iter()
+        .rposition(|open: &TagNameOccurrence| open.name == occurrence.name)
+      {
+        let open = stack.remove(index);
+        pairs.push(TemplateTagPair {
+          close: occurrence.range,
+          open: open.range,
+        });
+      }
+    } else if !occurrence.self_closing {
+      stack.push(occurrence);
+    }
+  }
+
+  pairs
+}
+
 fn ts_rs_dependency_edit(source: &str) -> Option<TextEdit> {
   if source.contains("ts-rs") {
     return None;
@@ -2677,6 +3829,27 @@ fn ts_rs_dependency_edit(source: &str) -> Option<TextEdit> {
 }
 
 fn format_trs_document(document: &DocumentContext, blocks: &SfcBlocks) -> String {
+  format_trs_document_with(
+    document,
+    blocks,
+    try_format_rust_source,
+    try_format_typescript_source,
+    try_format_css_source,
+  )
+}
+
+fn format_trs_document_with<R, T, C>(
+  document: &DocumentContext,
+  blocks: &SfcBlocks,
+  rust_formatter: R,
+  script_ts_formatter: T,
+  style_formatter: C,
+) -> String
+where
+  R: Fn(&str) -> Option<String>,
+  T: Fn(&str) -> Option<String>,
+  C: Fn(&str) -> Option<String>,
+{
   let mut sections = Vec::new();
 
   if let Some(head) = blocks.head.as_deref() {
@@ -2684,24 +3857,40 @@ fn format_trs_document(document: &DocumentContext, blocks: &SfcBlocks) -> String
   }
   if is_component_path(&document.relative_path) {
     if let Some(script) = blocks.script.as_deref() {
-      sections.push(render_block("script", script));
+      sections.push(render_formatted_block("script", script, &rust_formatter));
     }
   } else if let Some(script_setup) = blocks.script_setup.as_deref() {
-    sections.push(render_block("script setup", script_setup));
+    sections.push(render_formatted_block(
+      "script setup",
+      script_setup,
+      &rust_formatter,
+    ));
   }
   if let Some(script_ts) = blocks.script_ts.as_deref() {
-    sections.push(render_block("script lang=\"ts\"", script_ts));
+    sections.push(render_formatted_block(
+      "script lang=\"ts\"",
+      script_ts,
+      &script_ts_formatter,
+    ));
   }
   if !blocks.template.trim().is_empty() {
     sections.push(dedent_block(&blocks.template, 0));
   }
   if let Some(style) = blocks.style.as_deref() {
-    sections.push(render_block("style", style));
+    sections.push(render_formatted_block("style", style, &style_formatter));
   }
 
   let mut output = sections.join("\n\n");
   output.push('\n');
   output
+}
+
+fn render_formatted_block<F>(tag: &str, contents: &str, formatter: &F) -> String
+where
+  F: Fn(&str) -> Option<String>,
+{
+  let formatted = formatter(contents).unwrap_or_else(|| contents.to_owned());
+  render_block(tag, &formatted)
 }
 
 fn render_block(tag: &str, contents: &str) -> String {
@@ -2734,6 +3923,52 @@ fn dedent_block(contents: &str, indent: usize) -> String {
     })
     .collect::<Vec<_>>()
     .join("\n")
+}
+
+#[cfg(test)]
+fn no_embedded_formatter(_: &str) -> Option<String> {
+  None
+}
+
+fn try_format_rust_source(source: &str) -> Option<String> {
+  if source.trim().is_empty() {
+    return Some(String::new());
+  }
+
+  let mut child = Command::new("rustfmt")
+    .args(["--emit", "stdout", "--edition", "2024"])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .ok()?;
+
+  let mut stdin = child.stdin.take()?;
+  stdin.write_all(source.as_bytes()).ok()?;
+  drop(stdin);
+
+  let output = child.wait_with_output().ok()?;
+  if !output.status.success() {
+    return None;
+  }
+
+  String::from_utf8(output.stdout).ok()
+}
+
+fn try_format_typescript_source(source: &str) -> Option<String> {
+  if source.trim().is_empty() {
+    return Some(String::new());
+  }
+
+  thebe_analyzer::format_typescript(source).ok()
+}
+
+fn try_format_css_source(source: &str) -> Option<String> {
+  if source.trim().is_empty() {
+    return Some(String::new());
+  }
+
+  thebe_css::format_style_block(source).ok()
 }
 
 fn template_binding_token_spans(source: &str, template_spans: &[thebe_parser::SourceSpan]) -> Vec<SemanticTokenSpan> {
@@ -3153,7 +4388,34 @@ fn template_symbol_hover(definition: &TemplateSymbolMetadata, range: Range) -> H
   }
 }
 
+fn component_hover(component: &ComponentMetadata, range: Range) -> Hover {
+  let props = if component.prop_names.is_empty() {
+    "none".to_owned()
+  } else {
+    component.prop_names.join(", ")
+  };
+
+  Hover {
+    contents: HoverContents::Markup(MarkupContent {
+      kind: MarkupKind::Markdown,
+      value: format!(
+        "**Component** `{}`\n\n- Module: `{}`\n- Props: `{}`",
+        component.tag_name, component.module_path, props,
+      ),
+    }),
+    range: Some(range),
+  }
+}
+
 fn component_prop_hover(component: &ComponentMetadata, prop: &ComponentPropMetadata) -> Hover {
+  component_prop_hover_at_range(component, prop, range_from_span(&prop.source_span))
+}
+
+fn component_prop_hover_at_range(
+  component: &ComponentMetadata,
+  prop: &ComponentPropMetadata,
+  range: Range,
+) -> Hover {
   Hover {
     contents: HoverContents::Markup(MarkupContent {
       kind: MarkupKind::Markdown,
@@ -3162,7 +4424,7 @@ fn component_prop_hover(component: &ComponentMetadata, prop: &ComponentPropMetad
         prop.name, component.tag_name, prop.type_name,
       ),
     }),
-    range: Some(range_from_span(&prop.source_span)),
+    range: Some(range),
   }
 }
 
@@ -3691,6 +4953,785 @@ function decrement() {
   }
 
   #[test]
+  fn format_trs_document_uses_rust_formatter_for_route_script_setup() {
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: r#"<script setup>
+fn   handler()->Props{Props{count:0}}
+</script>
+
+<main>{{ count }}</main>
+"#
+      .to_owned(),
+      cached_artifacts: None,
+    };
+    let blocks = parse_document_blocks(&document).expect("valid blocks");
+
+    let formatted = format_trs_document_with(
+      &document,
+      &blocks,
+      |_| Some("fn handler() -> Props {\n    Props { count: 0 }\n}".to_owned()),
+      no_embedded_formatter,
+      no_embedded_formatter,
+    );
+
+    assert!(formatted.contains(
+      "<script setup>\n  fn handler() -> Props {\n      Props { count: 0 }\n  }\n</script>"
+    ));
+  }
+
+  #[test]
+  fn format_trs_document_uses_rust_formatter_for_component_script() {
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/components/Counter.trs".to_owned(),
+      source: r#"<script>
+pub   struct Props{pub count:i64}
+</script>
+
+<main>{{ props.count }}</main>
+"#
+      .to_owned(),
+      cached_artifacts: None,
+    };
+    let blocks = parse_document_blocks(&document).expect("valid blocks");
+
+    let formatted = format_trs_document_with(
+      &document,
+      &blocks,
+      |_| Some("pub struct Props {\n    pub count: i64,\n}".to_owned()),
+      no_embedded_formatter,
+      no_embedded_formatter,
+    );
+
+    assert!(formatted.contains(
+      "<script>\n  pub struct Props {\n      pub count: i64,\n  }\n</script>"
+    ));
+  }
+
+  #[test]
+  fn format_trs_document_falls_back_when_rust_formatter_is_unavailable() {
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: r#"<script setup>
+    fn handler() -> Props {
+        Props { count: 0 }
+    }
+</script>
+"#
+      .to_owned(),
+      cached_artifacts: None,
+    };
+    let blocks = parse_document_blocks(&document).expect("valid blocks");
+
+    let formatted = format_trs_document_with(
+      &document,
+      &blocks,
+      |_| None,
+      no_embedded_formatter,
+      no_embedded_formatter,
+    );
+
+    assert_eq!(
+      formatted,
+      "<script setup>\n  fn handler() -> Props {\n          Props { count: 0 }\n      }\n</script>\n"
+    );
+  }
+
+  #[test]
+  fn format_trs_document_uses_typescript_formatter_for_client_script() {
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: r#"<script lang="ts">
+function increment(step:number){return step+1}
+</script>
+"#
+      .to_owned(),
+      cached_artifacts: None,
+    };
+    let blocks = parse_document_blocks(&document).expect("valid blocks");
+
+    let formatted = format_trs_document_with(
+      &document,
+      &blocks,
+      no_embedded_formatter,
+      |_| Some("function increment(step: number) {\n  return step + 1;\n}".to_owned()),
+      no_embedded_formatter,
+    );
+
+    assert!(formatted.contains(
+      "<script lang=\"ts\">\n  function increment(step: number) {\n    return step + 1;\n  }\n</script>"
+    ));
+  }
+
+  #[test]
+  fn format_trs_document_uses_css_formatter_for_style_block() {
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: r#"<style>
+button{color:red}
+</style>
+"#
+      .to_owned(),
+      cached_artifacts: None,
+    };
+    let blocks = parse_document_blocks(&document).expect("valid blocks");
+
+    let formatted = format_trs_document_with(
+      &document,
+      &blocks,
+      no_embedded_formatter,
+      no_embedded_formatter,
+      |_| Some("button {\n  color: red;\n}".to_owned()),
+    );
+
+    assert!(formatted.contains("<style>\n  button {\n    color: red;\n  }\n</style>"));
+  }
+
+  #[test]
+  fn rename_for_document_updates_top_level_template_symbol_definition_and_bindings() {
+    let source = fixture_route_source().to_owned();
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/profile.trs".to_owned(),
+      source: source.clone(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: fixture_manifest(),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+    let position = position_from_byte_offset(
+      &source,
+      source.find("{{ username }}").expect("username binding") + 5,
+    );
+
+    let edit = rename_for_document(&document, position, "handle").expect("rename edit");
+    let changes = edit.changes.expect("rename changes");
+    let edits = changes.values().next().expect("rename file edits");
+
+    assert_eq!(edits.len(), 3);
+    assert!(edits.iter().all(|edit| edit.new_text == "handle"));
+    assert!(edits.iter().any(|edit| edit.range.start == Position::new(2, 2)));
+  }
+
+  #[test]
+  fn rename_for_document_updates_nested_template_symbol_definition_and_binding_segment() {
+    let source = fixture_route_source().to_owned();
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/profile.trs".to_owned(),
+      source: source.clone(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: fixture_manifest(),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+    let position = position_from_byte_offset(
+      &source,
+      source
+        .find("profile.display_name")
+        .expect("nested template binding")
+        + "profile.".len()
+        + 2,
+    );
+
+    let edit = rename_for_document(&document, position, "name").expect("rename edit");
+    let changes = edit.changes.expect("rename changes");
+    let edits = changes.values().next().expect("rename file edits");
+
+    assert_eq!(edits.len(), 2);
+    assert!(edits.iter().all(|edit| edit.new_text == "name"));
+    assert!(edits.iter().any(|edit| edit.range.start == Position::new(7, 2)));
+    assert!(edits.iter().any(|edit| edit.range.start == Position::new(25, 19)));
+  }
+
+  #[test]
+  fn prepare_rename_for_document_uses_nested_template_symbol_segment_range() {
+    let source = fixture_route_source().to_owned();
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/profile.trs".to_owned(),
+      source: source.clone(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: fixture_manifest(),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+    let position = position_from_byte_offset(
+      &source,
+      source
+        .find("profile.display_name")
+        .expect("nested template binding")
+        + "profile.".len()
+        + 2,
+    );
+
+    let response = prepare_rename_for_document(&document, position).expect("prepare rename");
+    let PrepareRenameResponse::RangeWithPlaceholder { placeholder, range } = response else {
+      panic!("expected range-with-placeholder response");
+    };
+
+    assert_eq!(placeholder, "display_name");
+    assert_eq!(range.start, Position::new(25, 19));
+    assert_eq!(range.end, Position::new(25, 31));
+  }
+
+  #[test]
+  fn document_highlights_for_document_return_template_symbol_reads_and_write() {
+    let source = fixture_route_source().to_owned();
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/profile.trs".to_owned(),
+      source: source.clone(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: fixture_manifest(),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+    let position = position_from_byte_offset(
+      &source,
+      source.find("{{ username }}").expect("username binding") + 5,
+    );
+
+    let highlights = document_highlights_for_document(&document, position).expect("highlights");
+
+    assert_eq!(highlights.len(), 3);
+    assert_eq!(highlights[0].kind, Some(DocumentHighlightKind::WRITE));
+    assert!(highlights[1..]
+      .iter()
+      .all(|highlight| highlight.kind == Some(DocumentHighlightKind::READ)));
+  }
+
+  #[test]
+  fn linked_editing_ranges_for_document_match_nested_template_tags() {
+    let source = "<main><div><div>x</div></div></main>".to_owned();
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: source.clone(),
+      cached_artifacts: None,
+    };
+    let position = position_from_byte_offset(&source, source.find("<div><div").expect("inner div") + 7);
+    let pair = template_tag_pair_at_position(
+      &source,
+      &[thebe_parser::SourceSpan {
+        start: 0,
+        end: source.len(),
+      }],
+      position,
+    )
+    .expect("template tag pair");
+
+    let ranges = linked_editing_ranges_for_document(&document, position)
+      .expect("linked editing ranges");
+
+    assert_eq!(pair.open, ByteRange { start: 12, end: 15 });
+    assert_eq!(pair.close, ByteRange { start: 19, end: 22 });
+    assert_eq!(ranges.ranges.len(), 2);
+    assert_eq!(ranges.ranges[0], Range::new(Position::new(0, 12), Position::new(0, 15)));
+    assert_eq!(ranges.ranges[1], Range::new(Position::new(0, 19), Position::new(0, 22)));
+  }
+
+  #[test]
+  fn rename_for_document_rewrites_component_import_without_alias_and_tag_usages() {
+    let source = r#"<script setup>
+use crate::components::Card;
+
+struct Props {
+  count: i64,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props { count: 0 }
+}
+</script>
+
+<main>
+  <Card></Card>
+</main>
+"#
+    .to_owned();
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: source.clone(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: fixture_manifest(),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+    let position = position_from_byte_offset(&source, source.find("<Card>").expect("component tag") + 2);
+
+    let edit = rename_for_document(&document, position, "SummaryCard").expect("rename edit");
+    let changes = edit.changes.expect("rename changes");
+    let edits = changes.values().next().expect("rename file edits");
+
+    assert_eq!(edits.len(), 3);
+    assert!(edits.iter().any(|edit| edit.new_text == "Card as SummaryCard"));
+    assert_eq!(
+      edits
+        .iter()
+        .filter(|edit| edit.new_text == "SummaryCard")
+        .count(),
+      2
+    );
+  }
+
+  #[test]
+  fn document_highlights_for_document_include_component_import_and_tag_usages() {
+    let source = r#"<script setup>
+use crate::components::Card as SummaryCard;
+
+struct Props {
+  count: i64,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props { count: 0 }
+}
+</script>
+
+<main>
+  <SummaryCard></SummaryCard>
+</main>
+"#
+    .to_owned();
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: source.clone(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: fixture_manifest(),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+    let position = position_from_byte_offset(
+      &source,
+      source.find("SummaryCard").expect("component import alias") + 2,
+    );
+
+    let highlights = document_highlights_for_document(&document, position).expect("highlights");
+
+    assert_eq!(highlights.len(), 3);
+    assert_eq!(highlights[0].kind, Some(DocumentHighlightKind::WRITE));
+    assert!(highlights[1..]
+      .iter()
+      .all(|highlight| highlight.kind == Some(DocumentHighlightKind::READ)));
+  }
+
+  #[test]
+  fn references_for_document_return_component_prop_definition_and_other_usages() {
+    let project = TempProject::new();
+    let component_source = r#"<script>
+pub struct Props {
+  title: String,
+}
+</script>
+
+<article>{{ props.title }}</article>
+"#;
+    let route_source = r#"<script setup>
+use crate::components::Card;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <Card title=\"primary\" />
+</main>
+"#;
+    let aliased_route_source = r#"<script setup>
+use crate::components::Card as SummaryCard;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <SummaryCard :title=\"secondary\" />
+</main>
+"#;
+    project.write("src/components/Card.trs", component_source);
+    project.write("src/routes/index.trs", route_source);
+    project.write("src/routes/alias.trs", aliased_route_source);
+
+    let manifest = component_prop_fixture_manifest(
+      component_source,
+      &["src/routes/index.trs", "src/routes/alias.trs"],
+    );
+    let position = position_from_byte_offset(
+      aliased_route_source,
+      aliased_route_source.find(":title").expect("aliased prop") + 2,
+    );
+
+    let locations = references_for_document(
+      &project.root,
+      aliased_route_source,
+      &manifest,
+      "src/routes/alias.trs",
+      position,
+      true,
+    )
+    .expect("references result")
+    .expect("prop references");
+
+    assert_eq!(locations.len(), 2);
+    assert!(locations.iter().any(|location| {
+      location
+        .uri
+        .path()
+        .ends_with("/src/components/Card.trs")
+        && location.range.start == Position::new(2, 2)
+    }));
+    assert!(locations.iter().any(|location| {
+      location.uri.path().ends_with("/src/routes/index.trs")
+        && location.range.start == Position::new(12, 8)
+    }));
+  }
+
+  #[test]
+  fn references_for_document_return_component_definition_and_other_tag_usages() {
+    let project = TempProject::new();
+    let component_source = r#"<script>
+pub struct Props {
+  title: String,
+}
+</script>
+
+<article>{{ props.title }}</article>
+"#;
+    let route_source = r#"<script setup>
+use crate::components::Card;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <Card title=\"primary\" />
+</main>
+"#;
+    let aliased_route_source = r#"<script setup>
+use crate::components::Card as SummaryCard;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <SummaryCard :title=\"secondary\" />
+</main>
+"#;
+    project.write("src/components/Card.trs", component_source);
+    project.write("src/routes/index.trs", route_source);
+    project.write("src/routes/alias.trs", aliased_route_source);
+
+    let manifest = component_prop_fixture_manifest(
+      component_source,
+      &["src/routes/index.trs", "src/routes/alias.trs"],
+    );
+    let position = position_from_byte_offset(
+      aliased_route_source,
+      aliased_route_source.find("<SummaryCard").expect("aliased component tag") + 2,
+    );
+    let other_usage_start = position_from_byte_offset(
+      route_source,
+      route_source.find("<Card").expect("component tag") + 1,
+    );
+
+    let locations = references_for_document(
+      &project.root,
+      aliased_route_source,
+      &manifest,
+      "src/routes/alias.trs",
+      position,
+      true,
+    )
+    .expect("references result")
+    .expect("component references");
+
+    assert_eq!(locations.len(), 2);
+    assert!(locations.iter().any(|location| {
+      location.uri.path().ends_with("/src/components/Card.trs")
+        && location.range.start == Position::new(0, 0)
+    }));
+    assert!(locations.iter().any(|location| {
+      location.uri.path().ends_with("/src/routes/index.trs")
+        && location.range.start == other_usage_start
+    }));
+  }
+
+  #[test]
+  fn references_for_document_return_component_definition_and_tag_usages_from_import_alias() {
+    let project = TempProject::new();
+    let component_source = r#"<script>
+pub struct Props {
+  title: String,
+}
+</script>
+
+<article>{{ props.title }}</article>
+"#;
+    let route_source = r#"<script setup>
+use crate::components::Card;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <Card title=\"primary\" />
+</main>
+"#;
+    let aliased_route_source = r#"<script setup>
+use crate::components::Card as SummaryCard;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <SummaryCard :title=\"secondary\" />
+</main>
+"#;
+    project.write("src/components/Card.trs", component_source);
+    project.write("src/routes/index.trs", route_source);
+    project.write("src/routes/alias.trs", aliased_route_source);
+
+    let manifest = component_prop_fixture_manifest(
+      component_source,
+      &["src/routes/index.trs", "src/routes/alias.trs"],
+    );
+    let position = position_from_byte_offset(
+      aliased_route_source,
+      aliased_route_source.find("SummaryCard").expect("aliased import") + 2,
+    );
+    let local_usage_start = position_from_byte_offset(
+      aliased_route_source,
+      aliased_route_source.find("<SummaryCard").expect("local component tag") + 1,
+    );
+    let other_usage_start = position_from_byte_offset(
+      route_source,
+      route_source.find("<Card").expect("component tag") + 1,
+    );
+
+    let locations = references_for_document(
+      &project.root,
+      aliased_route_source,
+      &manifest,
+      "src/routes/alias.trs",
+      position,
+      true,
+    )
+    .expect("references result")
+    .expect("component references");
+
+    assert_eq!(locations.len(), 3);
+    assert!(locations.iter().any(|location| {
+      location.uri.path().ends_with("/src/components/Card.trs")
+        && location.range.start == Position::new(0, 0)
+    }));
+    assert!(locations.iter().any(|location| {
+      location.uri.path().ends_with("/src/routes/alias.trs")
+        && location.range.start == local_usage_start
+    }));
+    assert!(locations.iter().any(|location| {
+      location.uri.path().ends_with("/src/routes/index.trs")
+        && location.range.start == other_usage_start
+    }));
+  }
+
+  #[test]
+  fn definition_for_document_returns_component_file_from_import_alias() {
+    let project = TempProject::new();
+    let component_source = r#"<script>
+pub struct Props {
+  title: String,
+}
+</script>
+
+<article>{{ props.title }}</article>
+"#;
+    let aliased_route_source = r#"<script setup>
+use crate::components::Card as SummaryCard;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <SummaryCard :title=\"secondary\" />
+</main>
+"#;
+    project.write("src/components/Card.trs", component_source);
+    project.write("src/routes/alias.trs", aliased_route_source);
+
+    let manifest = component_prop_fixture_manifest(component_source, &["src/routes/alias.trs"]);
+    let position = position_from_byte_offset(
+      aliased_route_source,
+      aliased_route_source.find("SummaryCard").expect("aliased import") + 2,
+    );
+
+    let response = definition_for_document(
+      &project.root,
+      aliased_route_source,
+      &manifest,
+      "src/routes/alias.trs",
+      position,
+    )
+    .expect("definition result")
+    .expect("definition");
+    let GotoDefinitionResponse::Scalar(location) = response else {
+      panic!("expected scalar definition");
+    };
+
+    assert!(location.uri.path().ends_with("/src/components/Card.trs"));
+    assert_eq!(location.range.start, Position::new(0, 0));
+  }
+
+  #[test]
+  fn rename_for_document_updates_component_prop_definition_and_workspace_usages() {
+    let project = TempProject::new();
+    let component_source = r#"<script>
+pub struct Props {
+  title: String,
+}
+</script>
+
+<article>{{ props.title }}</article>
+"#;
+    let route_source = r#"<script setup>
+use crate::components::Card;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <Card title=\"primary\" />
+</main>
+"#;
+    let aliased_route_source = r#"<script setup>
+use crate::components::Card as SummaryCard;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <SummaryCard :title=\"secondary\" />
+</main>
+"#;
+    project.write("src/components/Card.trs", component_source);
+    project.write("src/routes/index.trs", route_source);
+    project.write("src/routes/alias.trs", aliased_route_source);
+
+    let document = DocumentContext {
+      project_root: project.root.clone(),
+      relative_path: "src/routes/alias.trs".to_owned(),
+      source: aliased_route_source.to_owned(),
+      cached_artifacts: Some(ProjectArtifacts {
+        manifest: component_prop_fixture_manifest(
+          component_source,
+          &["src/routes/index.trs", "src/routes/alias.trs"],
+        ),
+        diagnostics: ThebeDiagnosticsFile {
+          version: 1,
+          diagnostics: Vec::new(),
+        },
+      }),
+    };
+    let position = position_from_byte_offset(
+      &document.source,
+      document.source.find(":title").expect("aliased prop") + 2,
+    );
+
+    let edit = rename_for_document(&document, position, "heading").expect("rename edit");
+    let changes = edit.changes.expect("rename changes");
+
+    assert_eq!(changes.len(), 3);
+    assert!(changes.iter().any(|(uri, edits)| {
+      uri.path().ends_with("/src/components/Card.trs")
+        && edits.len() == 1
+        && edits[0].new_text == "heading"
+        && edits[0].range.start == Position::new(2, 2)
+    }));
+    assert!(changes.iter().any(|(uri, edits)| {
+      uri.path().ends_with("/src/routes/index.trs")
+        && edits.len() == 1
+        && edits[0].new_text == "heading"
+        && edits[0].range.start == Position::new(12, 8)
+    }));
+    assert!(changes.iter().any(|(uri, edits)| {
+      uri.path().ends_with("/src/routes/alias.trs")
+        && edits.len() == 1
+        && edits[0].new_text == "heading"
+        && edits[0].range.start == Position::new(12, 16)
+    }));
+  }
+
+  #[test]
   fn component_tag_completion_items_add_import_edits_for_unimported_components() {
     let source = r#"<script setup>
 use crate::components::Badge;
@@ -4078,6 +6119,99 @@ fn handler(State(state): State<crate::AppState>) -> Props {
 "#
   }
 
+  fn component_prop_fixture_manifest(
+    component_source: &str,
+    route_paths: &[&str],
+  ) -> ThebeManifest {
+    let title_field = component_source.find("title: String").expect("component prop field");
+
+    ThebeManifest {
+      version: 5,
+      server_router_path: ".thebe/server/routes.rs".to_owned(),
+      app_html: thebe_project::AppHtmlMetadata {
+        source_path: Some("app.html".to_owned()),
+        uses_default: false,
+      },
+      layouts: Vec::new(),
+      routes: route_paths
+        .iter()
+        .map(|source_path| RouteMetadata {
+          generated_client_path: None,
+          generated_server_path: format!(".thebe/server/{}.rs", source_path.replace('/', "__")),
+          generated_types_path: None,
+          handler: thebe_project::HandlerMetadata {
+            is_async: false,
+            method: "get".to_owned(),
+            name: "handler".to_owned(),
+            param_types: Vec::new(),
+            source_span: None,
+          },
+          has_client_script: false,
+          has_head: false,
+          has_style: false,
+          layout_scope_path: None,
+          layout_source_path: None,
+          module_name: source_path.replace(['/', '.'], "_"),
+          route_path: source_path.to_string(),
+          source_path: (*source_path).to_owned(),
+          state_type: None,
+          template_bindings: Vec::new(),
+          template_symbols: Vec::new(),
+          template_binding_spans: Vec::new(),
+          template_symbol_definitions: Vec::new(),
+        })
+        .collect(),
+      components: vec![ComponentMetadata {
+        has_client_script: false,
+        has_style: false,
+        module_path: "crate::components::Card".to_owned(),
+        prop_names: vec!["title".to_owned()],
+        props: vec![ComponentPropMetadata {
+          name: "title".to_owned(),
+          source_span: span_from_offsets(component_source, title_field, title_field + 5),
+          type_name: "String".to_owned(),
+        }],
+        source_path: "src/components/Card.trs".to_owned(),
+        tag_name: "Card".to_owned(),
+      }],
+    }
+  }
+
+  struct TempProject {
+    root: PathBuf,
+  }
+
+  impl TempProject {
+    fn new() -> Self {
+      let unique = format!(
+        "thebe-lsp-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+          .duration_since(std::time::UNIX_EPOCH)
+          .expect("system time")
+          .as_nanos()
+      );
+      let root = std::env::temp_dir().join(unique);
+      std::fs::create_dir_all(root.join("src/routes")).expect("create route fixture dir");
+      std::fs::create_dir_all(root.join("src/components")).expect("create component fixture dir");
+      Self { root }
+    }
+
+    fn write(&self, relative_path: &str, source: &str) {
+      let path = self.root.join(relative_path);
+      if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create fixture parent dir");
+      }
+      std::fs::write(path, source).expect("write fixture source");
+    }
+  }
+
+  impl Drop for TempProject {
+    fn drop(&mut self) {
+      let _ = std::fs::remove_dir_all(&self.root);
+    }
+  }
+
   fn span_from_offsets(source: &str, start: usize, end: usize) -> SourceSpanMetadata {
     let start = position_from_byte_offset(source, start);
     let end = position_from_byte_offset(source, end);
@@ -4128,6 +6262,149 @@ fn handler(State(state): State<crate::AppState>) -> Props {
 
     assert!(contents.value.contains("GET /profile"));
     assert!(contents.value.contains("State<crate::AppState>"));
+  }
+
+  #[test]
+  fn hover_for_document_returns_component_hover_for_import_alias() {
+    let component_source = r#"<script>
+pub struct Props {
+  title: String,
+}
+</script>
+
+<article>{{ props.title }}</article>
+"#;
+    let aliased_route_source = r#"<script setup>
+use crate::components::Card as SummaryCard;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <SummaryCard :title=\"secondary\" />
+</main>
+"#;
+    let manifest = component_prop_fixture_manifest(component_source, &["src/routes/alias.trs"]);
+    let alias_start = aliased_route_source.find("SummaryCard").expect("aliased import");
+
+    let hover = hover_for_document(
+      aliased_route_source,
+      &manifest,
+      "src/routes/alias.trs",
+      position_from_byte_offset(aliased_route_source, alias_start + 2),
+    )
+    .expect("hover");
+    let HoverContents::Markup(contents) = hover.contents else {
+      panic!("expected markdown hover");
+    };
+
+    assert!(contents.value.contains("**Component** `Card`"));
+    assert!(contents.value.contains("crate::components::Card"));
+    assert_eq!(
+      hover.range.expect("hover range").start,
+      position_from_byte_offset(aliased_route_source, alias_start),
+    );
+  }
+
+  #[test]
+  fn hover_for_document_returns_component_hover_for_tag_usage() {
+    let component_source = r#"<script>
+pub struct Props {
+  title: String,
+}
+</script>
+
+<article>{{ props.title }}</article>
+"#;
+    let aliased_route_source = r#"<script setup>
+use crate::components::Card as SummaryCard;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <SummaryCard :title=\"secondary\" />
+</main>
+"#;
+    let manifest = component_prop_fixture_manifest(component_source, &["src/routes/alias.trs"]);
+    let tag_name_start = aliased_route_source
+      .find("<SummaryCard")
+      .expect("component tag")
+      + 1;
+
+    let hover = hover_for_document(
+      aliased_route_source,
+      &manifest,
+      "src/routes/alias.trs",
+      position_from_byte_offset(aliased_route_source, tag_name_start + 1),
+    )
+    .expect("hover");
+    let HoverContents::Markup(contents) = hover.contents else {
+      panic!("expected markdown hover");
+    };
+
+    assert!(contents.value.contains("**Component** `Card`"));
+    assert_eq!(
+      hover.range.expect("hover range").start,
+      position_from_byte_offset(aliased_route_source, tag_name_start),
+    );
+  }
+
+  #[test]
+  fn hover_for_document_returns_component_prop_hover_for_prop_usage() {
+    let component_source = r#"<script>
+pub struct Props {
+  title: String,
+}
+</script>
+
+<article>{{ props.title }}</article>
+"#;
+    let aliased_route_source = r#"<script setup>
+use crate::components::Card as SummaryCard;
+
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <SummaryCard :title=\"secondary\" />
+</main>
+"#;
+    let manifest = component_prop_fixture_manifest(component_source, &["src/routes/alias.trs"]);
+    let prop_name_start = aliased_route_source.find(":title").expect("component prop") + 1;
+
+    let hover = hover_for_document(
+      aliased_route_source,
+      &manifest,
+      "src/routes/alias.trs",
+      position_from_byte_offset(aliased_route_source, prop_name_start + 1),
+    )
+    .expect("hover");
+    let HoverContents::Markup(contents) = hover.contents else {
+      panic!("expected markdown hover");
+    };
+
+    assert!(contents.value.contains("**Component prop** `title`"));
+    assert!(contents.value.contains("Component: `Card`"));
+    assert_eq!(
+      hover.range.expect("hover range").start,
+      position_from_byte_offset(aliased_route_source, prop_name_start),
+    );
   }
 
   #[test]

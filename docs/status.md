@@ -23,14 +23,14 @@ This page tracks what is actually implemented in the repository today versus wha
   - `thebe dev --watch`
   - `thebe build`
   - `thebe check`
-- `thebe-lsp` language server with diagnostics, semantic tokens, hover, document symbols, definition, references, rename, code actions, formatting, and richer completions.
+- `thebe-lsp` language server with diagnostics, semantic tokens, document highlights, linked editing, hover, document symbols, definition, references, rename, code actions, formatting, and richer completions.
 - Packaged editor assets under `packages/thebe-vscode/` and `packages/tree-sitter-thebe/`.
 
 ## Implemented, But Still Narrow
 
 - Template expressions are intentionally limited to simple identifiers and dotted field access.
-- The shipped formatter is structural and does not run embedded Rust, TypeScript, or CSS formatters.
-- Rename support is currently limited to route handlers and client event handlers.
+- The shipped formatter now does best-effort formatting for embedded Rust, TypeScript, and CSS blocks, but it still does not provide full language-service formatting semantics inside those blocks.
+- Rename support is currently limited to route handlers, route template symbols, component prop definitions/usages, local component tag/import relationships, and client event handlers.
 - The tree-sitter grammar is still an initial grammar rather than a full HTML-aware parser.
 - Production assets are emitted under `.thebe/assets` and served by generated routes rather than a standalone public dist pipeline.
 

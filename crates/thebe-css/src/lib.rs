@@ -62,6 +62,24 @@ pub fn process_style(css: &str, scope_id: &str, minify: bool) -> Result<String, 
   Ok(result.code)
 }
 
+/// Format a raw CSS block without applying Thebe scoping.
+///
+/// # Errors
+///
+/// Returns [`CssError`] on CSS parse or print failure.
+pub fn format_style_block(css: &str) -> Result<String, CssError> {
+  let stylesheet =
+    StyleSheet::parse(css, ParserOptions::default()).map_err(|e| CssError::Parse(e.to_string()))?;
+  let result = stylesheet
+    .to_css(PrinterOptions {
+      minify: false,
+      ..Default::default()
+    })
+    .map_err(|e| CssError::Print(e.to_string()))?;
+
+  Ok(result.code)
+}
+
 /// Inject `data-thebe-c-{scope_id}=""` onto every HTML opening tag in
 /// `template`.  Closing tags, comments, and doctypes are passed through
 /// unchanged.
@@ -262,7 +280,7 @@ fn scope_selector<'i>(selector: &mut Selector<'i>, attr_name: &str) {
 
 #[cfg(test)]
 mod tests {
-  use super::{add_html_attr, add_scope_attrs, process_style, scope_id};
+  use super::{add_html_attr, add_scope_attrs, format_style_block, process_style, scope_id};
 
   #[test]
   fn scope_id_is_deterministic() {
@@ -367,5 +385,16 @@ mod tests {
       out.contains(r#"<meta name="description" content="Hi" data-thebe-head="">"#),
       "output: {out}"
     );
+  }
+
+  #[test]
+  fn format_style_block_keeps_readable_output() {
+    let css = "button{color:red}.card>.title{display:block}";
+
+    let formatted = format_style_block(css).unwrap();
+
+    assert!(formatted.contains("button {"), "output: {formatted}");
+    assert!(formatted.contains("  color: red;"), "output: {formatted}");
+    assert!(formatted.contains(".card > .title {"), "output: {formatted}");
   }
 }

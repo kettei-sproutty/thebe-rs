@@ -21,15 +21,17 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
 `thebe-lsp` currently supports:
 
 - Diagnostics sourced from `.thebe/diagnostics.json`.
-- Hover for route handlers, precise nested `Props` fields inside template bindings, and component props.
+- Hover for route handlers, precise nested `Props` fields inside template bindings, component tags/import aliases, and component props.
+- Document highlights for Thebe-owned symbols in the current `.trs` file.
 - Document symbols for route handlers, template bindings, and component props.
-- Go-to-definition between `.trs` source files and generated Rust/TypeScript artifacts, plus exact nested `Props` field targets and component tag/prop targets.
-- References for route handlers, template bindings, and precise nested `Props` field paths.
+- Go-to-definition between `.trs` source files and generated Rust/TypeScript artifacts, plus exact nested `Props` field targets, component tag/prop targets, and component import aliases.
+- References for route handlers, template bindings, precise nested `Props` field paths, and component tag/prop usages across known `.trs` sources, including component import aliases as starting points.
 - Workspace symbol search across loaded Thebe project manifests for routes, handlers, template symbols, layouts, components, and component props.
 - Semantic tokens for block tags, template bindings, component tags, directives, and event attributes.
-- Rename support for route handlers and client event handlers.
+- Linked editing for matched template tag pairs.
+- Rename support for route handlers, route template symbols, component prop definitions/usages, local component tag/import relationships, and client event handlers.
 - Code actions for inserting missing top-level blocks and adding `ts-rs` when typed client routes require it.
-- Formatting support for normalizing `.trs` block layout.
+- Formatting support for normalizing `.trs` block layout, plus best-effort formatting for embedded Rust, TypeScript, and CSS blocks.
 - `.trs` completions for:
   - top-level block snippets such as `<head>`, `<script setup>`, `<script lang="ts">`, and `<style>`
   - template symbol completions from route `Props` metadata plus current unsaved source
@@ -53,8 +55,8 @@ The editor loop is not disk-only anymore.
 The editor story is broader now, but a few edges are still intentionally narrow:
 
 - The tree-sitter grammar is still initial and does not yet model full HTML-aware nesting or embedded Rust/TypeScript/CSS subgrammars.
-- Rename support is currently scoped to route handlers and client event handlers rather than arbitrary Rust or TypeScript symbols.
-- Formatting currently normalizes top-level `.trs` structure, but it does not invoke dedicated Rust, TypeScript, or CSS formatters inside embedded blocks.
+- Rename support is currently scoped to route handlers, route template symbols, component prop definitions/usages, local component tag/import relationships, and client event handlers rather than arbitrary Rust or TypeScript symbols.
+- Formatting now normalizes top-level `.trs` structure and uses best-effort block formatters for embedded Rust, TypeScript, and CSS, but it still does not provide full language-service formatting semantics inside those blocks.
 
 ## Practical Scope Today
 

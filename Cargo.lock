@@ -3067,6 +3067,7 @@ dependencies = [
  "anyhow",
  "thebe-analyzer",
  "thebe-codegen",
+ "thebe-css",
  "thebe-parser",
  "thebe-project",
  "tokio",

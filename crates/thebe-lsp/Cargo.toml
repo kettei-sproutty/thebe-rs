@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 thebe-analyzer = { path = "../thebe-analyzer", version = "0.0.1" }
+thebe-css = { path = "../thebe-css", version = "0.0.1" }
 thebe-codegen = { path = "../thebe-codegen", version = "0.0.1" }
 thebe-parser = { path = "../thebe-parser", version = "0.0.1" }
 thebe-project = { path = "../thebe-project", version = "0.0.1" }

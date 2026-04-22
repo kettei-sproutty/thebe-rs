@@ -76,6 +76,18 @@ pub fn minify_javascript(script_js: &str) -> Result<String, AnalyzerError> {
   emit_script(&script, true)
 }
 
+/// Format a `<script lang="ts">` block using SWC's parser and emitter.
+///
+/// This preserves TypeScript syntax while normalizing whitespace and layout.
+///
+/// # Errors
+///
+/// Returns [`AnalyzerError`] if the TypeScript cannot be parsed or emitted.
+pub fn format_typescript(script_ts: &str) -> Result<String, AnalyzerError> {
+  let script = parse_typescript_script(script_ts)?;
+  emit_script(&script, false)
+}
+
 fn parse_typescript_script(script_ts: &str) -> Result<Script, AnalyzerError> {
   parse_script(
     script_ts,
@@ -208,7 +220,7 @@ fn collect_top_level_function_names(script: &Script) -> Vec<String> {
 #[cfg(test)]
 mod tests {
   mod analyze {
-    use crate::analyze;
+    use crate::{analyze, format_typescript};
 
     #[test]
     fn strips_types_and_registers_top_level_functions() {
@@ -294,6 +306,17 @@ mod tests {
 
       assert!(!module.js.contains("console.log"), "output: {}", module.js);
       assert!(!module.js.contains("if(false)"), "output: {}", module.js);
+    }
+
+    #[test]
+    fn format_typescript_preserves_type_annotations() {
+      let ts = "function increment(step:number):number{\nreturn step+1\n}";
+
+      let formatted = format_typescript(ts).unwrap();
+
+      assert!(formatted.contains("function increment(step: number): number {"));
+      assert!(formatted.contains("return step + 1;"));
+      assert!(formatted.ends_with('\n'));
     }
   }
 }
