@@ -4,7 +4,7 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 /// Run `thebe dev`: refresh generated `.thebe` artifacts and hand off to `cargo run`.
-pub fn run(watch: bool) -> anyhow::Result<()> {
+pub fn run(watch: bool, hotpatch: bool) -> anyhow::Result<()> {
   let project_root = find_project_root()?;
   println!("thebe: project root at {}", project_root.display());
 
@@ -12,7 +12,7 @@ pub fn run(watch: bool) -> anyhow::Result<()> {
     .context("failed to load thebe.toml")?;
 
   if let Some(pre_build) = config.get_hook("pre_build") {
-    println!("thebe: running pre_build hook: {}", pre_build);
+    println!("thebe: running pre_build hook: {pre_build}");
     let status = Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
       .arg(if cfg!(target_os = "windows") { "/C" } else { "-c" })
       .arg(pre_build)
@@ -31,7 +31,9 @@ pub fn run(watch: bool) -> anyhow::Result<()> {
 
   run_codegen(&project_root, thebe_project::BuildMode::Dev)?;
 
-  if watch {
+  if hotpatch {
+    crate::hotpatch::orchestrator::run(&project_root)
+  } else if watch {
     run_watch(&project_root)
   } else {
     println!("thebe: running `cargo run`…");
@@ -103,7 +105,44 @@ fn run_codegen(project_root: &Path, build_mode: thebe_project::BuildMode) -> any
   Ok(())
 }
 
-fn spawn_server(project_root: &Path) -> anyhow::Result<Child> {
+pub(crate) fn rebuild_for_dev_change(project_root: &Path, refresh_codegen: bool) -> anyhow::Result<()> {
+  match thebe_project::ThebeConfig::load(project_root) {
+    Ok(config) => {
+      if let Some(on_change) = config.get_hook("on_change") {
+        println!("thebe: running on_change hook: {on_change}");
+        let status = Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
+          .arg(if cfg!(target_os = "windows") { "/C" } else { "-c" })
+          .arg(on_change)
+          .current_dir(project_root)
+          .status();
+
+        if let Err(error) = status {
+          println!("thebe: \u{1b}[31mon_change hook failed\u{1b}[0m: {error}");
+        } else if let Ok(status) = status
+          && !status.success() {
+            println!("thebe: \u{1b}[31mon_change hook failed with status {:?}\u{1b}[0m", status.code());
+        }
+      }
+
+      if refresh_codegen
+        && let Some(tailwind_config) = config.tailwind
+        && let Err(error) = crate::tailwind::ensure_and_run(project_root, &tailwind_config, thebe_project::BuildMode::Dev) {
+          println!("thebe: \u{1b}[31mtailwind error\u{1b}[0m: {error:?}");
+        }
+    }
+    Err(error) => {
+      println!("thebe: \u{1b}[31mfailed to load thebe.toml configuration\u{1b}[0m: {error}");
+    }
+  }
+
+  if refresh_codegen {
+    run_codegen(project_root, thebe_project::BuildMode::Dev)
+  } else {
+    Ok(())
+  }
+}
+
+pub(crate) fn spawn_server(project_root: &Path) -> anyhow::Result<Child> {
   println!("thebe: running `cargo run`…");
   Command::new("cargo")
     .arg("run")
@@ -112,7 +151,23 @@ fn spawn_server(project_root: &Path) -> anyhow::Result<Child> {
     .context("failed to spawn `cargo run`")
 }
 
-fn kill_server(child: &mut Child) {
+pub(crate) fn spawn_hotpatch_server(
+  project_root: &Path,
+  session_manifest_path: &Path,
+) -> anyhow::Result<Child> {
+  println!("thebe: running `cargo run`…");
+  Command::new("cargo")
+    .arg("run")
+    .current_dir(project_root)
+    .env(
+      thebe_runtime::hotpatch::HOTPATCH_SESSION_ENV,
+      session_manifest_path,
+    )
+    .spawn()
+    .context("failed to spawn `cargo run`")
+}
+
+pub(crate) fn kill_server(child: &mut Child) {
   #[cfg(unix)]
   {
     let _ = Command::new("pkill")
@@ -175,37 +230,7 @@ fn run_watch(project_root: &Path) -> anyhow::Result<()> {
     println!("thebe: change detected — rebuilding…");
     kill_server(&mut child);
 
-    match thebe_project::ThebeConfig::load(project_root) {
-      Ok(config) => {
-        if let Some(on_change) = config.get_hook("on_change") {
-          println!("thebe: running on_change hook: {}", on_change);
-          let status = Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
-            .arg(if cfg!(target_os = "windows") { "/C" } else { "-c" })
-            .arg(on_change)
-            .current_dir(project_root)
-            .status();
-
-          if let Err(e) = status {
-            println!("thebe: \u{1b}[31mon_change hook failed\u{1b}[0m: {}", e);
-          } else if let Ok(status) = status {
-            if !status.success() {
-              println!("thebe: \u{1b}[31mon_change hook failed with status {:?}\u{1b}[0m", status.code());
-            }
-          }
-        }
-
-        if let Some(tailwind_config) = config.tailwind {
-          if let Err(e) = crate::tailwind::ensure_and_run(project_root, &tailwind_config, thebe_project::BuildMode::Dev) {
-            println!("thebe: \u{1b}[31mtailwind error\u{1b}[0m: {:?}", e);
-          }
-        }
-      }
-      Err(err) => {
-        println!("thebe: \u{1b}[31mfailed to load thebe.toml configuration\u{1b}[0m: {}", err);
-      }
-    }
-
-    match run_codegen(project_root, thebe_project::BuildMode::Dev) {
+    match rebuild_for_dev_change(project_root, true) {
       Err(err) => eprintln!("thebe: codegen error: {err:#}"),
       Ok(()) => match spawn_server(project_root) {
         Ok(new_child) => child = new_child,

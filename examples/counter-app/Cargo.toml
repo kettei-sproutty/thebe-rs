@@ -10,5 +10,6 @@ tower-http = { version = "0.6", features = ["fs"] }
 minijinja = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thebe-runtime = { path = "../../crates/thebe-runtime" }
 ts-rs = "12"
 

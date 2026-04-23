@@ -69,11 +69,10 @@ fn ensure_tailwind_binary() -> anyhow::Result<PathBuf> {
         return Ok(binary_path);
     }
 
-    println!("thebe: downloading tailwindcss binary ({})…", binary_name);
+    println!("thebe: downloading tailwindcss binary ({binary_name})…");
 
     let url = format!(
-        "https://github.com/tailwindlabs/tailwindcss/releases/latest/download/{}",
-        binary_name
+        "https://github.com/tailwindlabs/tailwindcss/releases/latest/download/{binary_name}"
     );
 
     let client = Client::builder()
@@ -107,7 +106,7 @@ fn get_binary_name() -> anyhow::Result<&'static str> {
         ("linux", "x86_64") => Ok("tailwindcss-linux-x64"),
         ("windows", "x86_64") => Ok("tailwindcss-windows-x64.exe"),
         ("windows", "aarch64") => Ok("tailwindcss-windows-arm64.exe"),
-        _ => anyhow::bail!("unsupported OS or architecture for tailwindcss standalone: {}-{}", os, arch),
+        _ => anyhow::bail!("unsupported OS or architecture for tailwindcss standalone: {os}-{arch}"),
     }
 }
 

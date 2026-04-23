@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod hotpatch;
 mod tailwind;
 
 #[derive(Parser)]
@@ -19,8 +20,11 @@ enum Command {
   /// Start the development server (generate code and run `cargo run`).
   Dev {
     /// Watch `.trs` files and auto-restart the server on changes.
-    #[arg(long, short)]
+    #[arg(long, short, conflicts_with = "hotpatch")]
     watch: bool,
+    /// Experimental: start a hotpatch-managed dev loop with restart fallback.
+    #[arg(long, conflicts_with = "watch")]
+    hotpatch: bool,
   },
   /// Generate code and compile a release binary with `cargo build --release`.
   Build,
@@ -36,7 +40,7 @@ enum Command {
 fn main() -> anyhow::Result<()> {
   let cli = Cli::parse();
   match cli.command {
-    Command::Dev { watch } => commands::dev::run(watch),
+    Command::Dev { watch, hotpatch } => commands::dev::run(watch, hotpatch),
     Command::Build => commands::dev::build(),
     Command::Check => commands::dev::check(),
     Command::New { name } => commands::new::run(&name),

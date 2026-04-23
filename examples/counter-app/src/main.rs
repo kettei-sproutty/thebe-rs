@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 
 include!("../.thebe/server/routes.rs");
+include!("../.thebe/hotpatch.rs");
 
 use axum::{Json, extract::State, routing::post};
 use std::sync::{
@@ -45,6 +46,9 @@ struct CounterValue {
 
 #[tokio::main]
 async fn main() {
+  connect_thebe_hotpatch()
+    .expect("hotpatch runtime handshake should succeed when enabled");
+
   let state = AppState::new(0);
   let app = axum::Router::<AppState>::new()
     .merge(thebe_routes())

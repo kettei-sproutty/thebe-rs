@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thebe_parser::SourceSpan;
 use walkdir::WalkDir;
 
@@ -18,8 +20,11 @@ pub enum BuildMode {
 
 pub const THEBE_DIR: &str = ".thebe";
 pub const THEBE_ASSETS_DIR: &str = ".thebe/assets";
+pub const THEBE_DEV_ROUTE_ARTIFACTS_DIR: &str = ".thebe/dev/routes";
 pub const THEBE_DIAGNOSTICS_FILE: &str = ".thebe/diagnostics.json";
+pub const THEBE_HOTPATCH_FILE: &str = ".thebe/hotpatch.rs";
 pub const THEBE_MANIFEST_FILE: &str = ".thebe/manifest.json";
+pub const THEBE_SOURCE_SNAPSHOTS_DIR: &str = ".thebe/sources";
 pub const THEBE_SERVER_ROUTES_DIR: &str = ".thebe/server/routes";
 pub const THEBE_SERVER_ROUTES_FILE: &str = ".thebe/server/routes.rs";
 pub const TYPECHECK_CLIENT_DIR: &str = ".thebe/client";
@@ -359,6 +364,8 @@ pub fn generate_project_with_overlay(
   }
   prepare_generated_workspace(project_root, needs_type_bridge)?;
 
+  let dev_build_id = dev_build_id_for(build_mode);
+
   let mut route_entries = Vec::new();
   let mut generated_assets = BTreeMap::new();
 
@@ -374,6 +381,7 @@ pub fn generate_project_with_overlay(
       route.types_export_path.as_deref(),
       &component_macros,
       minify,
+      dev_build_id.as_deref(),
     )
     .with_context(|| format!("codegen error for {}", route.trs_path.display()))?;
 
@@ -391,6 +399,26 @@ pub fn generate_project_with_overlay(
     }
     std::fs::write(&rs_path, &generated.source)
       .with_context(|| format!("failed to write {}", rs_path.display()))?;
+
+    if let Some(dev_artifact) = &generated.dev_artifact {
+      let artifact_path = project_root.join(&dev_artifact.relative_path);
+      if let Some(parent) = artifact_path.parent() {
+        std::fs::create_dir_all(parent)
+          .with_context(|| format!("failed to create {}", parent.display()))?;
+      }
+      let artifact_json = serde_json::json!({
+        "head_template": dev_artifact.head_template,
+        "layout_template": dev_artifact.layout_template,
+        "style": dev_artifact.style,
+        "template": dev_artifact.template,
+        "title_template": dev_artifact.title_template,
+      });
+      std::fs::write(
+        &artifact_path,
+        serde_json::to_vec_pretty(&artifact_json).context("failed to serialize dev route artifact")?,
+      )
+      .with_context(|| format!("failed to write {}", artifact_path.display()))?;
+    }
 
     for asset in generated.assets {
       match generated_assets.get(&asset.file_name) {
@@ -446,11 +474,17 @@ pub fn generate_project_with_overlay(
   }
 
   let asset_list = generated_assets.into_values().collect::<Vec<_>>();
-  let routes_file = thebe_codegen::generate_routes_file(&route_entries, &asset_list)
+  let routes_file = thebe_codegen::generate_routes_file(&route_entries, &asset_list, dev_build_id.as_deref())
     .context("failed to generate .thebe/server/routes.rs")?;
   let routes_path = project_root.join(THEBE_SERVER_ROUTES_FILE);
   std::fs::write(&routes_path, &routes_file)
     .with_context(|| format!("failed to write {}", routes_path.display()))?;
+
+  let hotpatch_path = project_root.join(THEBE_HOTPATCH_FILE);
+  std::fs::write(&hotpatch_path, generated_hotpatch_runtime())
+    .with_context(|| format!("failed to write {}", hotpatch_path.display()))?;
+
+  write_source_snapshots(project_root, &parsed_routes, &layouts, &parsed_components)?;
 
   let manifest = build_thebe_manifest(
     project_root,
@@ -474,6 +508,18 @@ pub fn generate_project_with_overlay(
     manifest,
     diagnostics,
   })
+}
+
+fn dev_build_id_for(build_mode: BuildMode) -> Option<String> {
+  if matches!(build_mode, BuildMode::Prod) {
+    return None;
+  }
+
+  let unix_nanos = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_nanos();
+  Some(format!("{:x}-{:x}", process::id(), unix_nanos))
 }
 
 pub fn check_project(project_root: &Path) -> anyhow::Result<ThebeDiagnosticsFile> {
@@ -776,7 +822,7 @@ fn collect_project_diagnostics(
     )?);
   }
 
-  if let Err(err) = thebe_codegen::generate_routes_file(&route_entries, &[]) {
+  if let Err(err) = thebe_codegen::generate_routes_file(&route_entries, &[], None) {
     diagnostics.push(project_diagnostic(
       "project",
       "mixed-route-state-types",
@@ -955,6 +1001,7 @@ fn analyze_route_for_diagnostics(
       route.types_export_path.as_deref(),
       component_macros,
       false,
+      None,
     ) {
       diagnostics.push(codegen_error_diagnostic(
         project_root,
@@ -1285,13 +1332,81 @@ fn has_ts_rs_dependency(project_root: &Path, overlay: &ProjectOverlay) -> anyhow
   Ok(cargo_toml.contains("ts-rs"))
 }
 
+fn generated_hotpatch_runtime() -> &'static str {
+  "fn connect_thebe_hotpatch() -> Result<(), thebe_runtime::hotpatch::HotpatchConnectError> {\n  thebe_runtime::connect_hotpatch_from_env().map(|_| ())\n}\n"
+}
+
+fn write_source_snapshots(
+  project_root: &Path,
+  routes: &[ParsedRoute],
+  layouts: &HashMap<PathBuf, ParsedLayout>,
+  components: &[ParsedComponent],
+) -> anyhow::Result<()> {
+  let snapshots_dir = project_root.join(THEBE_SOURCE_SNAPSHOTS_DIR);
+  if snapshots_dir.exists() {
+    std::fs::remove_dir_all(&snapshots_dir)
+      .with_context(|| format!("failed to remove {}", snapshots_dir.display()))?;
+  }
+  std::fs::create_dir_all(&snapshots_dir)
+    .with_context(|| format!("failed to create {}", snapshots_dir.display()))?;
+
+  for route in routes {
+    write_source_snapshot(project_root, &snapshots_dir, &route.trs_path, &route.source)?;
+  }
+
+  for layout in layouts.values() {
+    write_source_snapshot(project_root, &snapshots_dir, &layout.trs_path, &layout.source)?;
+  }
+
+  for component in components {
+    write_source_snapshot(project_root, &snapshots_dir, &component.trs_path, &component.source)?;
+  }
+
+  Ok(())
+}
+
+fn write_source_snapshot(
+  project_root: &Path,
+  snapshots_dir: &Path,
+  source_path: &Path,
+  source: &str,
+) -> anyhow::Result<()> {
+  let relative_path = source_path.strip_prefix(project_root).with_context(|| {
+    format!(
+      "source {} is outside project root {}",
+      source_path.display(),
+      project_root.display()
+    )
+  })?;
+  let snapshot_path = snapshots_dir.join(relative_path);
+
+  if let Some(parent) = snapshot_path.parent() {
+    std::fs::create_dir_all(parent)
+      .with_context(|| format!("failed to create {}", parent.display()))?;
+  }
+
+  std::fs::write(&snapshot_path, source)
+    .with_context(|| format!("failed to write {}", snapshot_path.display()))
+}
+
 fn prepare_generated_workspace(project_root: &Path, typecheck_enabled: bool) -> anyhow::Result<()> {
   let thebe_dir = project_root.join(THEBE_DIR);
 
-  if thebe_dir.exists() {
-    std::fs::remove_dir_all(&thebe_dir)
-      .with_context(|| format!("failed to remove {}", thebe_dir.display()))?;
-  }
+  std::fs::create_dir_all(&thebe_dir)
+    .with_context(|| format!("failed to create {}", thebe_dir.display()))?;
+
+  reset_generated_dir(&project_root.join(THEBE_ASSETS_DIR))?;
+  reset_generated_dir(&project_root.join(THEBE_DEV_ROUTE_ARTIFACTS_DIR))?;
+  reset_generated_dir(&project_root.join(THEBE_SERVER_ROUTES_DIR))?;
+  reset_generated_dir(&project_root.join(THEBE_SOURCE_SNAPSHOTS_DIR))?;
+  reset_generated_dir(&project_root.join(TYPECHECK_CLIENT_DIR))?;
+  reset_generated_dir(&project_root.join(TYPECHECK_TYPES_DIR))?;
+  remove_generated_file(&project_root.join(THEBE_DIAGNOSTICS_FILE))?;
+  remove_generated_file(&project_root.join(THEBE_HOTPATCH_FILE))?;
+  remove_generated_file(&project_root.join(THEBE_MANIFEST_FILE))?;
+  remove_generated_file(&project_root.join(THEBE_SERVER_ROUTES_FILE))?;
+  remove_generated_file(&project_root.join(TYPECHECK_ENV_FILE))?;
+  remove_generated_file(&project_root.join(TYPECHECK_TSCONFIG_FILE))?;
 
   std::fs::create_dir_all(project_root.join(THEBE_SERVER_ROUTES_DIR)).with_context(|| {
     format!(
@@ -1334,6 +1449,24 @@ fn prepare_generated_workspace(project_root: &Path, typecheck_enabled: bool) -> 
       )
     },
   )?;
+
+  Ok(())
+}
+
+fn reset_generated_dir(path: &Path) -> anyhow::Result<()> {
+  if path.exists() {
+    std::fs::remove_dir_all(path)
+      .with_context(|| format!("failed to remove {}", path.display()))?;
+  }
+
+  Ok(())
+}
+
+fn remove_generated_file(path: &Path) -> anyhow::Result<()> {
+  if path.exists() {
+    std::fs::remove_file(path)
+      .with_context(|| format!("failed to remove {}", path.display()))?;
+  }
 
   Ok(())
 }
@@ -2111,6 +2244,39 @@ mod tests {
   }
 
   #[test]
+  fn generate_project_writes_the_hotpatch_runtime_helper() {
+    let project = TestProject::new("generated-hotpatch-runtime");
+    project.write("Cargo.toml", &fixture_cargo_toml(false));
+    project.write(
+      "src/routes/index.trs",
+      r#"<script setup>
+struct Props {
+  title: String,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {
+    title: String::from("Hello"),
+  }
+}
+</script>
+
+<main>{{ title }}</main>
+"#,
+    );
+
+    generate_project(project.path(), BuildMode::Dev)
+      .expect("project generation should succeed");
+
+    let hotpatch_runtime = fs::read_to_string(project.path().join(THEBE_HOTPATCH_FILE))
+      .expect("hotpatch runtime helper should be written");
+
+    assert!(hotpatch_runtime.contains("connect_thebe_hotpatch"));
+    assert!(hotpatch_runtime.contains("thebe_runtime::connect_hotpatch_from_env"));
+  }
+
+  #[test]
   fn refresh_project_for_editor_with_overlay_reports_unsaved_analyzer_errors() {
     let project = TestProject::new("overlay-diagnostics");
     project.write("Cargo.toml", &fixture_cargo_toml(true));
@@ -2265,6 +2431,11 @@ button {
     let generated_route_path = project.path().join(THEBE_SERVER_ROUTES_DIR).join("index.rs");
     let dev_source = fs::read_to_string(&generated_route_path)
       .expect("dev route source should be written");
+    let dev_artifact_path = project
+      .path()
+      .join(thebe_codegen::dev_route_artifact_path("/"));
+    let dev_artifact = fs::read_to_string(&dev_artifact_path)
+      .expect("dev route artifact should be written");
     let asset_dir = project.path().join(THEBE_ASSETS_DIR);
 
     assert!(!asset_dir.exists());
@@ -2285,7 +2456,7 @@ button {
     assert!(dev_source.contains("Responsibilities:"));
     assert!(dev_source.contains("console.log(\"dead\")"));
     assert!(dev_source.contains("function increment() {"));
-    assert!(dev_source.contains("color: red;"));
+    assert!(dev_artifact.contains("color: red;"));
 
     assert!(prod_source.contains("/.thebe/assets/thebe-"));
     assert!(prod_source.contains("data-thebe-runtime"));

@@ -15,6 +15,7 @@ const APP_HTML_TITLE_PLACEHOLDER: &str = "%thebe.title%";
 const APP_HTML_HEAD_PLACEHOLDER: &str = "%thebe.head%";
 const APP_HTML_BODY_PLACEHOLDER: &str = "%thebe.body%";
 const THEBE_ASSET_URL_PREFIX: &str = "/.thebe/assets";
+const THEBE_DEV_ROUTE_ARTIFACTS_DIR: &str = ".thebe/dev/routes";
 const DEFAULT_APP_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -123,10 +124,12 @@ struct ModuleLiterals<'a> {
   head_template: &'a str,
   template: &'a str,
   title_template: &'a str,
+  dev_artifact_path: &'a str,
   runtime: &'a str,
   runtime_asset_url: &'a str,
   client_script: &'a str,
   client_script_asset_url: &'a str,
+  dev_reload_script: &'a str,
   style: &'a str,
   style_asset_url: &'a str,
   route_path: &'a str,
@@ -201,7 +204,18 @@ impl StaticAsset {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedRoute {
   pub assets: Vec<StaticAsset>,
+  pub dev_artifact: Option<DevRouteArtifact>,
   pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevRouteArtifact {
+  pub head_template: String,
+  pub layout_template: Option<String>,
+  pub relative_path: String,
+  pub style: String,
+  pub template: String,
+  pub title_template: String,
 }
 
 /// Metadata the CLI provides about a discovered route file.
@@ -383,6 +397,7 @@ pub fn generate_route(
   props_types_path: Option<&str>,
   components: &[ComponentMacro],
   minify: bool,
+  dev_build_id: Option<&str>,
 ) -> Result<GeneratedRoute, CodegenError> {
   let setup = blocks
     .script_setup
@@ -483,8 +498,6 @@ pub fn generate_route(
     format!("{merged_component_styles}\n{route_style}")
   };
 
-  let template_literal = escape_rust_raw_str(&template_with_macros);
-
   // Process the optional `<script lang="ts">` block.
   let client_js = client_script_ts
     .map(|ts| thebe_analyzer::analyze(ts, minify).map(|module| module.js))
@@ -508,7 +521,7 @@ pub fn generate_route(
 
   // Build the final style literal, optional layout template literal, and
   // merged head contribution. Route titles override layout titles.
-  let (final_style, layout_template_opt, merged_head) = match layout_processed {
+  let (final_style, layout_template, merged_head) = match layout_processed {
     Some(processed_layout) => {
       let merged_style = if processed_layout.style.is_empty() {
         style.clone()
@@ -519,7 +532,7 @@ pub fn generate_route(
       };
       (
         merged_style,
-        Some(escape_rust_raw_str(&processed_layout.template)),
+        Some(processed_layout.template),
         merge_head_fragments(&processed_layout.head, &route_head),
       )
     }
@@ -532,10 +545,15 @@ pub fn generate_route(
     ));
   }
 
-  let head_literal = escape_rust_raw_str(&merged_head.html_template);
-  let title_literal =
-    escape_rust_raw_str(merged_head.title_template.as_deref().unwrap_or_default());
   let route_path_literal = escape_rust_raw_str(route_path);
+  let dev_artifact = dev_build_id.filter(|_| !minify).map(|_| DevRouteArtifact {
+    head_template: merged_head.html_template.clone(),
+    layout_template: layout_template.clone(),
+    relative_path: dev_route_artifact_relative_path(route_path),
+    style: final_style.clone(),
+    template: template_with_macros.clone(),
+    title_template: merged_head.title_template.clone().unwrap_or_default(),
+  });
 
   let mut assets = Vec::new();
   let runtime_asset_url = if minify {
@@ -566,24 +584,59 @@ pub fn generate_route(
   let runtime_literal = escape_rust_raw_str(if minify { "" } else { &runtime_str });
   let client_script_literal =
     escape_rust_raw_str(if minify { "" } else { &client_script_str });
-  let final_style_literal = escape_rust_raw_str(if minify { "" } else { &final_style });
+  let dev_artifact_path_literal = escape_rust_raw_str(
+    dev_artifact
+      .as_ref()
+      .map_or("", |artifact| artifact.relative_path.as_str()),
+  );
+  let dev_reload_script_literal = escape_rust_raw_str(
+    &dev_build_id
+      .filter(|_| !minify)
+      .map(|_| build_dev_reload_script())
+      .unwrap_or_default(),
+  );
+  let final_style_literal = escape_rust_raw_str(if minify || dev_artifact.is_some() {
+    ""
+  } else {
+    &final_style
+  });
+  let template_literal = escape_rust_raw_str(if dev_artifact.is_some() {
+    ""
+  } else {
+    &template_with_macros
+  });
+  let head_literal = escape_rust_raw_str(if dev_artifact.is_some() {
+    ""
+  } else {
+    &merged_head.html_template
+  });
+  let title_literal = escape_rust_raw_str(if dev_artifact.is_some() {
+    ""
+  } else {
+    merged_head.title_template.as_deref().unwrap_or_default()
+  });
   let runtime_asset_url_literal = escape_rust_raw_str(&runtime_asset_url);
   let client_script_asset_url_literal = escape_rust_raw_str(&client_script_asset_url);
   let style_asset_url_literal = escape_rust_raw_str(&style_asset_url);
+  let layout_template_literal = layout_template.as_deref().map(|template| {
+    escape_rust_raw_str(if dev_artifact.is_some() { "" } else { template })
+  });
 
   let literals = ModuleLiterals {
     app_html: &app_html_literal,
     head_template: &head_literal,
     template: &template_literal,
     title_template: &title_literal,
+    dev_artifact_path: &dev_artifact_path_literal,
     runtime: &runtime_literal,
     runtime_asset_url: &runtime_asset_url_literal,
     client_script: &client_script_literal,
     client_script_asset_url: &client_script_asset_url_literal,
+    dev_reload_script: &dev_reload_script_literal,
     style: &final_style_literal,
     style_asset_url: &style_asset_url_literal,
     route_path: &route_path_literal,
-    layout_template: layout_template_opt.as_deref(),
+    layout_template: layout_template_literal.as_deref(),
   };
   let wrapper = WrapperSource {
     params: &wrapper_params,
@@ -592,6 +645,7 @@ pub fn generate_route(
 
   Ok(GeneratedRoute {
     assets,
+    dev_artifact,
     source: build_route_module(
       &setup_with_serde,
       literals,
@@ -644,6 +698,12 @@ fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
   .expect("infallible");
   writeln!(
     source,
+    "const __THEBE_DEV_ROUTE_ARTIFACT_PATH: &str = {};",
+    literals.dev_artifact_path
+  )
+  .expect("infallible");
+  writeln!(
+    source,
     "const __CLIENT_RUNTIME: &str = {};",
     literals.runtime
   )
@@ -679,6 +739,12 @@ fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
     literals.client_script_asset_url
   )
   .expect("infallible");
+  writeln!(
+    source,
+    "const __DEV_RELOAD_SCRIPT: &str = {};",
+    literals.dev_reload_script
+  )
+  .expect("infallible");
   if let Some(layout_tmpl) = literals.layout_template {
     writeln!(source, "const __LAYOUT_TEMPLATE: &str = {layout_tmpl};").expect("infallible");
   }
@@ -689,11 +755,38 @@ fn write_support_fns(source: &mut String, type_bridge_enabled: bool) {
   source.push_str(
     "type __ThebeResponse = Result<axum::response::Html<String>, axum::response::Response>;\n\n",
   );
+  source.push_str("#[derive(serde::Deserialize)]\n");
+  source.push_str("struct __ThebeDevRouteArtifact {\n");
+  source.push_str("    head_template: String,\n");
+  source.push_str("    layout_template: Option<String>,\n");
+  source.push_str("    style: String,\n");
+  source.push_str("    template: String,\n");
+  source.push_str("    title_template: String,\n");
+  source.push_str("}\n\n");
+  source.push_str("fn __thebe_load_dev_route_artifact() -> Result<Option<__ThebeDevRouteArtifact>, axum::response::Response> {\n");
+  source.push_str("    if __THEBE_DEV_ROUTE_ARTIFACT_PATH.is_empty() {\n");
+  source.push_str("        return Ok(None);\n");
+  source.push_str("    }\n\n");
+  source.push_str("    let source = thebe_runtime::hotpatch::load_text_artifact(__THEBE_DEV_ROUTE_ARTIFACT_PATH)\n");
+  source.push_str("        .map_err(|err| __thebe_internal_error(\"load dev route artifact\", err))?;\n");
+  source.push_str("    serde_json::from_str(&source)\n");
+  source.push_str("        .map(Some)\n");
+  source.push_str("        .map_err(|err| __thebe_internal_error(\"parse dev route artifact\", err))\n");
+  source.push_str("}\n\n");
   source.push_str("fn __thebe_render_app_html(title: &str, head: &str, body: &str) -> String {\n");
   source.push_str("    __APP_HTML\n");
   source.push_str("        .replace(\"%thebe.title%\", title)\n");
   source.push_str("        .replace(\"%thebe.head%\", head)\n");
   source.push_str("        .replace(\"%thebe.body%\", body)\n");
+  source.push_str("}\n\n");
+  source.push_str("fn __thebe_dev_reload_script() -> String {\n");
+  source.push_str("    if __DEV_RELOAD_SCRIPT.is_empty() {\n");
+  source.push_str("        return String::new();\n");
+  source.push_str("    }\n\n");
+  source.push_str("    let Some(events_url) = thebe_runtime::hotpatch::browser_events_url_from_env() else {\n");
+  source.push_str("        return String::new();\n");
+  source.push_str("    };\n\n");
+  source.push_str("    __DEV_RELOAD_SCRIPT.replace(\"%thebe.events_url%\", &events_url)\n");
   source.push_str("}\n\n");
   source.push_str(
     "fn __thebe_render_fragment(\n        template_name: &str,\n        template_source: &str,\n        ctx: &serde_json::Value,\n        compile_stage: &str,\n        load_stage: &str,\n        render_stage: &str,\n    ) -> Result<String, axum::response::Response> {\n",
@@ -765,18 +858,23 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
     .expect("infallible");
   }
   source.push_str(wrapper.call);
+  source.push_str("    let __dev_artifact = __thebe_load_dev_route_artifact()?;\n");
+  source.push_str("    let __title_template = __dev_artifact.as_ref().map_or(__TITLE_TEMPLATE, |artifact| artifact.title_template.as_str());\n");
+  source.push_str("    let __head_template = __dev_artifact.as_ref().map_or(__HEAD_TEMPLATE, |artifact| artifact.head_template.as_str());\n");
+  source.push_str("    let __template = __dev_artifact.as_ref().map_or(__TEMPLATE, |artifact| artifact.template.as_str());\n");
+  source.push_str("    let __style = __dev_artifact.as_ref().map_or(__STYLE, |artifact| artifact.style.as_str());\n");
   source.push_str(
     "    let __ctx = serde_json::to_value(&__props)\
          .map_err(|err| __thebe_internal_error(\"serialize props\", err))?;\n",
   );
   source.push_str(
-    "    let __title = if __TITLE_TEMPLATE.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__title\",\n            __TITLE_TEMPLATE,\n            &__ctx,\n            \"compile title template\",\n            \"load title template\",\n            \"render title template\",\n        )?\n    };\n",
+    "    let __title = if __title_template.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__title\",\n            __title_template,\n            &__ctx,\n            \"compile title template\",\n            \"load title template\",\n            \"render title template\",\n        )?\n    };\n",
   );
   source.push_str(
-    "    let __head_html = if __HEAD_TEMPLATE.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__head\",\n            __HEAD_TEMPLATE,\n            &__ctx,\n            \"compile head template\",\n            \"load head template\",\n            \"render head template\",\n        )?\n    };\n",
+    "    let __head_html = if __head_template.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__head\",\n            __head_template,\n            &__ctx,\n            \"compile head template\",\n            \"load head template\",\n            \"render head template\",\n        )?\n    };\n",
   );
   source.push_str(
-    "    let __body = __thebe_render_fragment(\n        \"__page\",\n        __TEMPLATE,\n        &__ctx,\n        \"compile template\",\n        \"load template\",\n        \"render template\",\n    )?;\n",
+    "    let __body = __thebe_render_fragment(\n        \"__page\",\n        __template,\n        &__ctx,\n        \"compile template\",\n        \"load template\",\n        \"render template\",\n    )?;\n",
   );
   write_html_assembly(source);
   source.push_str("}\n\n");
@@ -793,14 +891,17 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
 fn write_html_assembly(source: &mut String) {
   source.push_str("    let __props_json = __ctx.to_string();\n");
   source.push_str(
+    "    let __dev_reload_script = __thebe_dev_reload_script();\n    let __dev_reload = if __dev_reload_script.is_empty() {\n        String::new()\n    } else {\n        format!(r#\"\n<script data-thebe-dev-reload>{reload_script}</script>\"#, reload_script = __dev_reload_script)\n    };\n",
+  );
+  source.push_str(
     r##"    let __head = if __STYLE_ASSET_URL.is_empty() {
-    if __STYLE.is_empty() {
+    if __style.is_empty() {
       __head_html
     } else if __head_html.is_empty() {
-      format!(r#"<style data-thebe-head="style">{style}</style>"#, style = __STYLE)
+      format!(r#"<style data-thebe-head="style">{style}</style>"#, style = __style)
     } else {
       format!(r#"{head}
-<style data-thebe-head="style">{style}</style>"#, head = __head_html, style = __STYLE)
+<style data-thebe-head="style">{style}</style>"#, head = __head_html, style = __style)
     }
   } else if __head_html.is_empty() {
     format!(r#"<link rel="stylesheet" href="{href}" data-thebe-head="style" />"#, href = __STYLE_ASSET_URL)
@@ -811,12 +912,14 @@ fn write_html_assembly(source: &mut String) {
     let __body_with_scripts = if __RUNTIME_ASSET_URL.is_empty() {
       format!(r#"{body}
 <script id="__thebe_props" type="application/json">{props_json}</script>
+{dev_reload}
 <script>{runtime}</script>
 <script>{user_script}</script>"#,
 "##,
   );
   source.push_str("        body = __body,\n");
   source.push_str("        props_json = __props_json,\n");
+  source.push_str("        dev_reload = __dev_reload,\n");
   source.push_str("        runtime = __CLIENT_RUNTIME,\n");
   source.push_str("        user_script = __CLIENT_SCRIPT,\n");
   source.push_str(
@@ -824,18 +927,22 @@ fn write_html_assembly(source: &mut String) {
     } else if __CLIENT_SCRIPT_ASSET_URL.is_empty() {
       format!(r#"{body}
 <script id="__thebe_props" type="application/json">{props_json}</script>
+{dev_reload}
 <script data-thebe-runtime src="{runtime_src}"></script>"#,
         body = __body,
         props_json = __props_json,
+        dev_reload = __dev_reload,
         runtime_src = __RUNTIME_ASSET_URL,
       )
     } else {
       format!(r#"{body}
 <script id="__thebe_props" type="application/json">{props_json}</script>
+{dev_reload}
 <script data-thebe-runtime src="{runtime_src}"></script>
 <script src="{user_script_src}"></script>"#,
         body = __body,
         props_json = __props_json,
+        dev_reload = __dev_reload,
         runtime_src = __RUNTIME_ASSET_URL,
         user_script_src = __CLIENT_SCRIPT_ASSET_URL,
       )
@@ -862,23 +969,29 @@ fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<
     .expect("infallible");
   }
   source.push_str(wrapper.call);
+  source.push_str("    let __dev_artifact = __thebe_load_dev_route_artifact()?;\n");
+  source.push_str("    let __title_template = __dev_artifact.as_ref().map_or(__TITLE_TEMPLATE, |artifact| artifact.title_template.as_str());\n");
+  source.push_str("    let __head_template = __dev_artifact.as_ref().map_or(__HEAD_TEMPLATE, |artifact| artifact.head_template.as_str());\n");
+  source.push_str("    let __template = __dev_artifact.as_ref().map_or(__TEMPLATE, |artifact| artifact.template.as_str());\n");
+  source.push_str("    let __style = __dev_artifact.as_ref().map_or(__STYLE, |artifact| artifact.style.as_str());\n");
+  source.push_str("    let __layout_template = __dev_artifact.as_ref().and_then(|artifact| artifact.layout_template.as_deref()).unwrap_or(__LAYOUT_TEMPLATE);\n");
   source.push_str(
     "    let __ctx = serde_json::to_value(&__props)\
          .map_err(|err| __thebe_internal_error(\"serialize props\", err))?;\n",
   );
   source.push_str(
-    "    let __title = if __TITLE_TEMPLATE.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__title\",\n            __TITLE_TEMPLATE,\n            &__ctx,\n            \"compile title template\",\n            \"load title template\",\n            \"render title template\",\n        )?\n    };\n",
+    "    let __title = if __title_template.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__title\",\n            __title_template,\n            &__ctx,\n            \"compile title template\",\n            \"load title template\",\n            \"render title template\",\n        )?\n    };\n",
   );
   source.push_str(
-    "    let __head_html = if __HEAD_TEMPLATE.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__head\",\n            __HEAD_TEMPLATE,\n            &__ctx,\n            \"compile head template\",\n            \"load head template\",\n            \"render head template\",\n        )?\n    };\n",
+    "    let __head_html = if __head_template.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__head\",\n            __head_template,\n            &__ctx,\n            \"compile head template\",\n            \"load head template\",\n            \"render head template\",\n        )?\n    };\n",
   );
   source.push_str(
-    "    let __route_body = __thebe_render_fragment(\n        \"__page\",\n        __TEMPLATE,\n        &__ctx,\n        \"compile template\",\n        \"load template\",\n        \"render template\",\n    )?;\n",
+    "    let __route_body = __thebe_render_fragment(\n        \"__page\",\n        __template,\n        &__ctx,\n        \"compile template\",\n        \"load template\",\n        \"render template\",\n    )?;\n",
   );
   // Wrap the route body inside the layout template.
   source.push_str("        let __layout_ctx = serde_json::json!({ \"__slot\": __route_body });\n");
   source.push_str(
-    "    let __body = __thebe_render_fragment(\n        \"__layout\",\n        __LAYOUT_TEMPLATE,\n        &__layout_ctx,\n        \"compile layout template\",\n        \"load layout template\",\n        \"render layout template\",\n    )?;\n",
+    "    let __body = __thebe_render_fragment(\n        \"__layout\",\n        __layout_template,\n        &__layout_ctx,\n        \"compile layout template\",\n        \"load layout template\",\n        \"render layout template\",\n    )?;\n",
   );
   write_html_assembly(source);
   source.push_str("}\n\n");
@@ -1018,6 +1131,7 @@ pub fn generate_component(
 pub fn generate_routes_file(
   routes: &[RouteEntry],
   assets: &[StaticAsset],
+  _dev_build_id: Option<&str>,
 ) -> Result<String, CodegenError> {
   let mut source = String::new();
   source.push_str("// AUTOGENERATED by thebe \u{2014} do not edit\n");
@@ -1119,6 +1233,69 @@ fn write_asset_routes(source: &mut String, assets: &[StaticAsset]) {
   }
 }
 
+fn build_dev_reload_script() -> String {
+  format!(
+    r#"(() => {{
+  if (typeof window === "undefined" || typeof window.EventSource !== "function") {{
+    return;
+  }}
+
+  const reloadSource = new window.EventSource("%thebe.events_url%");
+
+  const escapeRegex = (value) =>
+    value.replace(/[.*+?^${{}}()|[\]\\]/g, "\\$&");
+
+  const matchesRoutePattern = (pattern, pathname) => {{
+    if (!pattern) {{
+      return true;
+    }}
+
+    const source = escapeRegex(pattern).replace(/\\\{{[^/]+\\\}}/g, "[^/]+");
+    return new window.RegExp("^" + source + "$", "u").test(pathname);
+  }};
+
+  const parsePayload = (event) => {{
+    try {{
+      return JSON.parse(event.data || "{{}}");
+    }} catch (_) {{
+      return {{}};
+    }}
+  }};
+
+  reloadSource.addEventListener("style", (event) => {{
+    const payload = parsePayload(event);
+    if (!matchesRoutePattern(payload.routePattern || null, window.location.pathname)) {{
+      return;
+    }}
+
+    if (payload.css && typeof window.__thebe_dev_apply_style === "function") {{
+      window.__thebe_dev_apply_style(payload.css);
+    }}
+  }});
+
+  reloadSource.addEventListener("template", (event) => {{
+    const payload = parsePayload(event);
+    if (!matchesRoutePattern(payload.routePattern || null, window.location.pathname)) {{
+      return;
+    }}
+
+    if (typeof window.__thebe_dev_refresh === "function") {{
+      window.__thebe_dev_refresh();
+    }} else {{
+      window.location.reload();
+    }}
+  }});
+
+  reloadSource.addEventListener("reload", () => {{
+    reloadSource.close();
+    window.location.reload();
+  }});
+
+  window.addEventListener("beforeunload", () => reloadSource.close(), {{ once: true }});
+}})();"#,
+  )
+}
+
 fn asset_const_name(asset: &StaticAsset) -> String {
   format!(
     "__THEBE_ASSET_{}",
@@ -1144,11 +1321,27 @@ fn asset_ident_fragment(file_name: &str) -> String {
 }
 
 fn hash_asset_contents(kind: StaticAssetKind, contents: &str) -> String {
+  hash_text(kind.extension(), contents)
+}
+
+#[must_use]
+pub fn dev_route_artifact_path(route_path: &str) -> String {
+  dev_route_artifact_relative_path(route_path)
+}
+
+fn dev_route_artifact_relative_path(route_path: &str) -> String {
+  format!(
+    "{THEBE_DEV_ROUTE_ARTIFACTS_DIR}/thebe-route-{}.json",
+    hash_text("route", route_path)
+  )
+}
+
+fn hash_text(seed: &str, contents: &str) -> String {
   const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
   const FNV_PRIME: u64 = 1_099_511_628_211;
 
   let mut hash = FNV_OFFSET;
-  for byte in kind.extension().bytes().chain([0]).chain(contents.bytes()) {
+  for byte in seed.bytes().chain([0]).chain(contents.bytes()) {
     hash ^= u64::from(byte);
     hash = hash.wrapping_mul(FNV_PRIME);
   }
@@ -2221,6 +2414,7 @@ mod tests {
       Some("routes/index.ts"),
       &[],
       false,
+      Some("build-1"),
     )
     .unwrap();
     let src = generated.source;
@@ -2236,6 +2430,12 @@ mod tests {
     assert!(src.contains("fn __thebe_export_types"));
     assert!(src.contains("with_large_int(\"number\")"));
     assert!(src.contains("-> __ThebeResponse"));
+    assert!(src.contains("data-thebe-dev-reload"));
+    assert!(src.contains("browser_events_url_from_env"));
+    assert!(src.contains("%thebe.events_url%"));
+    assert!(src.contains("EventSource"));
+    assert!(!src.contains("setInterval(async ()"));
+    assert!(!src.contains("AbortController"));
 
     // The format! call must reference both as named args.
     assert!(src.contains("runtime = __CLIENT_RUNTIME"));
@@ -2277,6 +2477,7 @@ mod tests {
       Some("routes/index.ts"),
       &[],
       true,
+      None,
     )
     .unwrap();
 
@@ -2309,7 +2510,7 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let generated = generate_route(&blocks, "/", None, default_app_html(), None, &[], true).unwrap();
+    let generated = generate_route(&blocks, "/", None, default_app_html(), None, &[], true, None).unwrap();
     let runtime_asset = generated
       .assets
       .iter()
@@ -2345,6 +2546,7 @@ mod tests {
       Some("routes/index.ts"),
       &[],
       true,
+      None,
     )
     .unwrap_err();
 
@@ -2370,7 +2572,7 @@ mod tests {
 
     let app_html =
       "<html><head><title>%thebe.title%</title>%thebe.head%</head><body>%thebe.body%</body></html>";
-    let src = generate_route(&blocks, "/", None, app_html, None, &[], true)
+    let src = generate_route(&blocks, "/", None, app_html, None, &[], true, None)
       .unwrap()
       .source;
 
@@ -2395,7 +2597,7 @@ mod tests {
             ..SfcBlocks::default()
         };
 
-    let src = generate_route(&blocks, "/blog/:slug", None, default_app_html(), None, &[], true)
+    let src = generate_route(&blocks, "/blog/:slug", None, default_app_html(), None, &[], true, None)
       .unwrap()
       .source;
 
@@ -2420,7 +2622,7 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let src = generate_route(&blocks, "/", None, default_app_html(), None, &[], true)
+    let src = generate_route(&blocks, "/", None, default_app_html(), None, &[], true, None)
       .unwrap()
       .source;
 
@@ -2441,7 +2643,7 @@ mod tests {
         source_path: "routes/blog/[slug].rs".to_owned(),
         state_type: None,
       },
-    ], &[])
+    ], &[], None)
     .unwrap();
 
     assert!(source.contains("#[path = \"routes/index.rs\"]"));
@@ -2466,7 +2668,7 @@ mod tests {
         source_path: "routes/profile.rs".to_owned(),
         state_type: Some("AppState".to_owned()),
       },
-    ], &[])
+    ], &[], None)
     .unwrap();
 
     assert!(source.contains("pub(crate) fn thebe_routes() -> axum::Router<AppState>"));
@@ -2487,7 +2689,7 @@ mod tests {
         source_path: "routes/admin.rs".to_owned(),
         state_type: Some("AdminState".to_owned()),
       },
-    ], &[])
+    ], &[], None)
     .unwrap_err();
 
     assert!(matches!(err, CodegenError::MixedRouteStateTypes(_)));
@@ -2515,6 +2717,7 @@ mod tests {
           url_path: "/.thebe/assets/thebe-feedface.js".to_owned(),
         },
       ],
+      None,
     )
     .unwrap();
 
@@ -2523,6 +2726,23 @@ mod tests {
     assert!(source.contains("public, max-age=31536000, immutable"));
     assert!(source.contains(".route(\"/.thebe/assets/thebe-deadbeef.css\", axum::routing::get(__thebe_asset_thebe_deadbeef_css))"));
     assert!(source.contains(".route(\"/.thebe/assets/thebe-feedface.js\", axum::routing::get(__thebe_asset_thebe_feedface_js))"));
+  }
+
+  #[test]
+  fn generate_routes_file_keeps_routes_free_of_app_owned_dev_reload_endpoints() {
+    let source = generate_routes_file(
+      &[RouteEntry {
+        mod_name: "route__index".to_owned(),
+        source_path: "routes/index.rs".to_owned(),
+        state_type: None,
+      }],
+      &[],
+      Some("build-1"),
+    )
+    .unwrap();
+
+    assert!(!source.contains(".thebe/dev/events"));
+    assert!(!source.contains("axum::response::sse::Sse"));
   }
 
   #[test]
@@ -2544,7 +2764,7 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let err = generate_route(&blocks, "/", None, "<html>%thebe.head%</html>", None, &[], true).unwrap_err();
+    let err = generate_route(&blocks, "/", None, "<html>%thebe.head%</html>", None, &[], true, None).unwrap_err();
 
     assert!(matches!(err, CodegenError::InvalidAppHtml(_)));
   }
@@ -2560,7 +2780,7 @@ mod tests {
       ..SfcBlocks::default()
     };
 
-    let err = generate_route(&blocks, "/", None, default_app_html(), None, &[], true).unwrap_err();
+    let err = generate_route(&blocks, "/", None, default_app_html(), None, &[], true, None).unwrap_err();
 
     assert!(matches!(err, CodegenError::InvalidAppHtml(_)));
   }

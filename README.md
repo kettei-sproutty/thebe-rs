@@ -119,6 +119,7 @@ Thebe's design strictly bounds complexity by keeping server code, client updates
 - [Current Status](docs/status.md)
 - [Configuration & Tailwind](docs/configuration.md)
 - [Editor Tooling & LSP](docs/editor-tooling.md)
+- [Hotpatch Engine (planned)](docs/hotpatch-engine.md)
 - [Syntax & File Semantics](docs/syntax-and-semantics.md)
 - [Routing & Axum Handlers](docs/routing-and-handlers.md)
 - [State & Reactivity](docs/state-and-reactivity.md)

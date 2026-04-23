@@ -410,6 +410,27 @@
     }
   }
 
+  function _applyManagedStyle(css) {
+    var current = win.document.head.querySelectorAll(
+      '[data-thebe-head="style"]'
+    );
+    var i;
+    var style;
+
+    for (i = 0; i < current.length; i++) {
+      current[i].remove();
+    }
+
+    if (!css) {
+      return;
+    }
+
+    style = win.document.createElement("style");
+    style.setAttribute("data-thebe-head", "style");
+    style.textContent = css;
+    win.document.head.appendChild(style);
+  }
+
   function _scrollToNavigationTarget(url) {
     if (!url.hash) {
       win.scrollTo(0, 0);
@@ -433,6 +454,88 @@
     } catch (_) {
       return null;
     }
+  }
+
+  function _refreshExternalStylesheets() {
+    var links = win.document.head.querySelectorAll('link[rel~="stylesheet"]');
+    var refreshToken = String(Date.now());
+    var pending = [];
+    var i;
+    var link;
+    var href;
+    var url;
+    var clone;
+
+    for (i = 0; i < links.length; i++) {
+      link = links[i];
+
+      if (
+        link.hasAttribute("data-thebe-head") ||
+        link.hasAttribute("data-thebe-dev-refreshing") ||
+        link.hasAttribute("data-thebe-dev-refresh-pending")
+      ) {
+        continue;
+      }
+
+      href = link.getAttribute("href");
+      url = _resolveUrl(href);
+      if (!url || url.origin !== win.location.origin) {
+        continue;
+      }
+
+      link.setAttribute("data-thebe-dev-refreshing", "");
+      url.searchParams.set("__thebe_dev_refresh", refreshToken + "-" + i);
+      clone = link.cloneNode(true);
+      clone.removeAttribute("data-thebe-dev-refreshing");
+      clone.setAttribute("data-thebe-dev-refresh-pending", "");
+      clone.href = url.href;
+
+      pending.push(
+        new win.Promise(function (resolve) {
+          var settled = false;
+
+          function finish() {
+            if (settled) {
+              return;
+            }
+
+            settled = true;
+            resolve();
+          }
+
+          clone.addEventListener(
+            "load",
+            function () {
+              clone.removeAttribute("data-thebe-dev-refresh-pending");
+              clone.removeAttribute("data-thebe-dev-refreshing");
+              if (link.parentNode) {
+                link.parentNode.removeChild(link);
+              }
+              finish();
+            },
+            { once: true }
+          );
+
+          clone.addEventListener(
+            "error",
+            function () {
+              link.removeAttribute("data-thebe-dev-refreshing");
+              if (clone.parentNode) {
+                clone.parentNode.removeChild(clone);
+              }
+              finish();
+            },
+            { once: true }
+          );
+        })
+      );
+
+      if (link.parentNode) {
+        link.parentNode.insertBefore(clone, link.nextSibling);
+      }
+    }
+
+    return win.Promise.all(pending);
   }
 
   /**
@@ -489,8 +592,11 @@
     var requestPath = url.pathname + url.search;
     var historyPath = requestPath + url.hash;
 
-    win
-      .fetch(requestPath, { headers: { Accept: "text/html" } })
+    return win
+      .fetch(requestPath, {
+        cache: "no-store",
+        headers: { Accept: "text/html" }
+      })
       .then(function (r) {
         return r.text();
       })
@@ -525,8 +631,14 @@
       })
       .catch(function () {
         // On network error fall back to a full navigation.
-        win.location.href = href;
+        win.location.href = url.href;
       });
+  }
+
+  function _refreshCurrentPage() {
+    return _navigate(new win.URL(win.location.href), false).then(function () {
+      return _refreshExternalStylesheets();
+    });
   }
 
   /**
@@ -603,4 +715,6 @@
   // Expose public API on `window`.
   win.getProps = getProps;
   win.__thebe_register = __thebe_register;
+  win.__thebe_dev_apply_style = _applyManagedStyle;
+  win.__thebe_dev_refresh = _refreshCurrentPage;
 })(window);
