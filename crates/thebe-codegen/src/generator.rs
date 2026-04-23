@@ -446,19 +446,25 @@ pub fn generate_route(
     format!("    let __props = {}({call_args});\n", handler.name)
   };
 
-  // Compute a deterministic scope ID and apply CSS scoping.
+  // Compute a deterministic scope ID for route-local scoped CSS.
   let scope = thebe_css::scope_id(route_path);
+  let route_style_source = blocks.style.as_deref().filter(|style| !style.trim().is_empty());
 
   // Expand component tags (<Card />) into Jinja {% call %} blocks, then
   // transform `:attr="key"` bindings, then inject hydration markers, then apply
-  // CSS scoping — in that order so markers and scope attrs are not added to
-  // Jinja control-flow tokens.
+  // CSS scoping when this route has a non-empty `<style>` block — in that
+  // order so markers and scope attrs are not added to Jinja control-flow
+  // tokens.
   let known_component_names: Vec<&str> = components.iter().map(|c| c.name.as_str()).collect();
   let template_expanded =
     template::expand_component_tags(&blocks.template, &known_component_names);
   let template_attr_bound = template::inject_attr_bindings(&template_expanded);
   let template_hydrated = template::inject_hydration_markers(&template_attr_bound);
-  let template_scoped = thebe_css::add_scope_attrs(&template_hydrated, &scope);
+  let template_scoped = if route_style_source.is_some() {
+    thebe_css::add_scope_attrs(&template_hydrated, &scope)
+  } else {
+    template_hydrated
+  };
 
   // Prepend compiled component macro sources (already scoped with component
   // scope IDs) before the route template body.
@@ -476,11 +482,8 @@ pub fn generate_route(
   let app_html_literal = escape_rust_raw_str(app_html);
 
   // Merge component styles into the route style.
-  let route_style = blocks
-    .style
-    .as_deref()
-    .filter(|s| !s.trim().is_empty())
-    .map(|s| thebe_css::process_style(s, &scope, minify))
+  let route_style = route_style_source
+    .map(|style| thebe_css::process_style(style, &scope, minify))
     .transpose()
     .map_err(|e| CodegenError::CssError(e.to_string()))?
     .unwrap_or_default();
@@ -1105,16 +1108,22 @@ pub fn generate_component(
   let macro_name = format!("__comp_{}", component_name.to_lowercase());
 
   // Replace <slot /> with {{ caller() }}, transform `:attr` bindings, then
-  // apply CSS scope attributes.
+  // apply CSS scope attributes only when this component has a non-empty
+  // `<style>` block.
+  let component_style_source = blocks.style.as_deref().filter(|style| !style.trim().is_empty());
   let template_slot_expanded = crate::template::expand_slot(&blocks.template);
   let template_attr_bound = crate::template::inject_attr_bindings(&template_slot_expanded);
-  let template_scoped = thebe_css::add_scope_attrs(&template_attr_bound, &scope);
+  let template_scoped = if component_style_source.is_some() {
+    thebe_css::add_scope_attrs(&template_attr_bound, &scope)
+  } else {
+    template_attr_bound
+  };
 
   let jinja_macro = format!(
     "{{% macro {macro_name}(props) %}}\n{template_scoped}\n{{% endmacro %}}",
   );
 
-  let style = if let Some(css) = &blocks.style {
+  let style = if let Some(css) = component_style_source {
     thebe_css::process_style(css, &scope, minify).map_err(|e| CodegenError::CssError(e.to_string()))?
   } else {
     String::new()
@@ -1470,16 +1479,20 @@ fn process_layout(
   let with_slot = replace_slot(&layout_blocks.template);
   template::parse_template(&with_slot)?;
 
-  // Apply CSS scoping to the layout template elements.
   let layout_scope = thebe_css::scope_id(layout_scope_path);
-  let scoped_template = thebe_css::add_scope_attrs(&with_slot, &layout_scope);
-
-  // Process the layout's optional `<style>` block.
-  let layout_style = layout_blocks
+  let layout_style_source = layout_blocks
     .style
     .as_deref()
-    .filter(|s| !s.trim().is_empty())
-    .map(|s| thebe_css::process_style(s, &layout_scope, minify))
+    .filter(|style| !style.trim().is_empty());
+  let scoped_template = if layout_style_source.is_some() {
+    thebe_css::add_scope_attrs(&with_slot, &layout_scope)
+  } else {
+    with_slot
+  };
+
+  // Process the layout's optional `<style>` block.
+  let layout_style = layout_style_source
+    .map(|style| thebe_css::process_style(style, &layout_scope, minify))
     .transpose()
     .map_err(|e| CodegenError::CssError(e.to_string()))?
     .unwrap_or_default();
@@ -2495,6 +2508,50 @@ mod tests {
       .assets
       .iter()
       .any(|asset| asset.kind == StaticAssetKind::Js && asset.contents.contains("props.counter+=1")));
+  }
+
+  #[test]
+  fn generate_route_without_style_skips_scope_attrs() {
+    let blocks = SfcBlocks {
+      script_setup: Some(
+        "struct Props { title: String }\n\n#[thebe::get]\npub fn handler() -> Props { Props { title: \"Counter\".to_owned() } }"
+          .to_owned(),
+      ),
+      template: "<h1>{{ title }}</h1>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let src = generate_route(&blocks, "/", None, default_app_html(), None, &[], true, None)
+      .unwrap()
+      .source;
+
+    assert!(!src.contains("data-thebe-c-"));
+  }
+
+  #[test]
+  fn generate_component_without_style_skips_scope_attrs() {
+    let blocks = SfcBlocks {
+      template: "<span>{{ props.title }}</span>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let component = generate_component(&blocks, "Badge", false).unwrap();
+
+    assert!(component.style.is_empty());
+    assert!(!component.jinja_macro.contains("data-thebe-c-"));
+  }
+
+  #[test]
+  fn process_layout_without_style_skips_scope_attrs() {
+    let blocks = SfcBlocks {
+      template: "<div><slot /></div>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let processed = process_layout(&blocks, "src/routes/_layout.trs", false).unwrap();
+
+    assert!(processed.style.is_empty());
+    assert!(!processed.template.contains("data-thebe-c-"));
   }
 
   #[test]
