@@ -4,7 +4,7 @@ High-signal guidance for OpenCode agents working on Thebe.
 
 ## Project Status
 
-**Early design phase.** Moving towards Milestone 1 (server-only SSR). No crates exist yet. See README.md:462-480 for the MVP implementation plan.
+Core route/layout/component compilation, generated `.thebe` tooling artifacts, the initial LSP/editor packages, and an experimental hotpatch path are already implemented. Named slots, deeper editor polish, and hotpatch graduation are still pending.
 
 ## What Thebe Is
 
@@ -18,18 +18,19 @@ Compiles to `axum::Router` with SSR + fine-grained client hydration. Zero virtua
 
 ## Workspace Structure
 
-Cargo workspace with resolver="3". Future crates (not yet created):
+Cargo workspace with resolver="3". Current crates:
 - `crates/thebe-parser/` — `.trs` → SFC AST (HTML-aware tokenizer, not regex)
-- `crates/thebe-analyzer/` — Reactive variable analysis from TS
-- `crates/thebe-template/` — Template → SSR string + hydration markers
+- `crates/thebe-analyzer/` — client script analysis, handler discovery, JS minification
 - `crates/thebe-codegen/` — Rust handler + Axum route generation
 - `crates/thebe-css/` — LightningCSS transform + style scoping
-- `crates/thebe-macros/` — `#[thebe::get]`, `#[thebe::post]`, etc.
-- `crates/thebe-runtime/` — SSR render, Props injection, Axum re-exports
-- `crates/thebe-cli/` — `thebe dev`, `thebe build`, FS scanner
-- `packages/thebe-client/` — npm package: signals, hydration runtime
+- `crates/thebe-project/` — shared `.thebe` manifest/diagnostics generation and overlay refresh APIs
+- `crates/thebe-runtime/` — SSR render, app shell assembly, hotpatch runtime bridge
+- `crates/thebe-cli/` — `thebe new`, `thebe dev`, `thebe build`, `thebe check`, hotpatch/watch orchestration
+- `crates/thebe-lsp/` — `tower-lsp` server over `.thebe` artifacts and overlays
+- `packages/thebe-vscode/` — packaged VS Code extension
+- `packages/tree-sitter-thebe/` — initial tree-sitter grammar
 
-See README.md:391-410 for full structure.
+See README.md for the current workspace layout.
 
 ## Code Style
 
@@ -70,14 +71,12 @@ See README.md:112-149.
 
 Thebe compiles to standard `axum::Router`. All Axum extractors work (State, Path, Query, Json, etc.). Tower middleware, WebSockets, streaming supported. See README.md:362-388.
 
-## Milestone 1 Goals
+## Current Focus
 
-Server-only SSR. Build:
-1. `thebe-parser`: Basic block extraction from `.trs`
-2. `thebe-codegen`: Wrap `<script setup>` into async Axum handler
-3. **Goal:** Run `thebe dev` and see static Rust-generated HTML in browser
-
-See README.md:462-464 for full milestone breakdown.
+1. Keep routes, layouts, components, hydration, and generated tooling stable.
+2. Finish the missing named-slot composition surface.
+3. Continue polishing LSP/editor behavior.
+4. Graduate the experimental hotpatch path once the patch/restart boundary is solid.
 
 ## Non-Goals for v0
 

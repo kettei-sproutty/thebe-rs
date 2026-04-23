@@ -38,7 +38,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
   - event-handler name completions from the current `<script lang="ts">` block
   - component tag completions, including missing component import insertion when a matching Rust block is present
   - component prop completions
-  - template attribute completions for directives and bound attributes such as `:if`, `:class`, generic `:attr`, and common `on*` handlers
+  - template attribute completions for bound attributes such as `:class`, generic `:attr`, and common `on*` handlers
 
 ## Editor Behavior Already Implemented
 

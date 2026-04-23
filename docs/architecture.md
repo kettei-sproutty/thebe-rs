@@ -17,20 +17,30 @@ Thebe is a compiler-driven framework that bridges Rust (server) and TypeScript (
   │     ├── <script setup> / <script> → Rust code
   │     ├── <style> → LightningCSS
   │     ├── <script lang="ts"> → swc
-  │     └── Template → HTML AST
+  │     └── Template → tokenized template structure
   │
   ├── thebe-analyzer
-  │     └── Identifies reactive bindings vs static DOM
-  │
-  ├── thebe-template
-  │     └── Emits SSR render functions & Hydration Anchor Matrix
+  │     └── Analyzes client script handlers and emits typed mirror JS
   │
   ├── thebe-codegen
-  │     ├── Server: Generates Rust modules, handlers, and Axum routing code
-  │     └── Client: Generates TS signals, proxies, and hydration logic
+  │     ├── Expands components and default slots
+  │     ├── Injects hydration markers and dynamic attribute bindings
+  │     └── Generates Rust route modules, asset handlers, and dev artifacts
   │
-  └── thebe-cli
-        └── Orchestrates the build, watches files, and serves local dev
+  ├── thebe-css
+  │     └── Scopes CSS and injects scope attributes
+  │
+  ├── thebe-runtime
+  │     └── Renders templates, assembles the HTML shell, and serves hotpatch runtime glue
+  │
+  ├── thebe-project
+  │     └── Writes `.thebe/manifest.json`, `.thebe/diagnostics.json`, `.thebe/client/**`, and `.thebe/types/**`
+  │
+  ├── thebe-cli
+  │     └── Orchestrates build, watch, hotpatch, and project refresh
+  │
+  └── thebe-lsp
+        └── Consumes `.thebe` artifacts plus unsaved overlays for tooling
 ```
 
 ## Parsing Strategy

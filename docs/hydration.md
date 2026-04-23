@@ -18,7 +18,7 @@ To prevent this, Thebe generates a **Hydration Anchor Matrix** based on the spec
    *Example Approach:* The nearest valid parent element receives a `data-thebe-bind="key"` attribute, and the runtime hydrates the specific child node relative to that anchor.
 
 3. **Attributes and Events:**
-   Dynamic attributes (`:class="props.active"`) and events (`onclick="fn"`) are natively attached to the element they decorate via `data-thebe-*` attributes during SSR, which the `thebe-client` runtime consumes and cleans up during initialization.
+   Dynamic attributes (`:class="theme"`, `:href="user.profile_url"`) are emitted as real HTML attributes plus a `data-thebe-attr` index that the runtime uses for later updates. Event handlers stay as raw `on*` attributes in the SSR HTML; the runtime scans them on mount, installs real listeners, and removes the source attributes afterward.
 
 ## Predictability
 By formalizing the hydration fallback rules based on DOM context, Thebe ensures that:

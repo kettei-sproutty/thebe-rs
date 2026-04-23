@@ -6,6 +6,7 @@ This page tracks what is actually implemented in the repository today versus wha
 
 - HTML-aware `.trs` parsing in `crates/thebe-parser`.
 - Route compilation in `crates/thebe-codegen`.
+- Standalone component compilation in `src/components/**/*.trs`.
 - SSR rendering through `crates/thebe-runtime`.
 - Scoped CSS through `crates/thebe-css`.
 - File-system routing for `src/routes/**/*.trs`.
@@ -13,6 +14,7 @@ This page tracks what is actually implemented in the repository today versus wha
 - `app.html` shell support with `%thebe.head%`, `%thebe.body%`, and optional `%thebe.title%`.
 - `<head>` support in routes and layouts.
 - Fine-grained hydration markers for reactive template bindings.
+- Template attribute support for dynamic `:class` and generic `:attr` bindings.
 - Client `getProps<Props>()` bridge with `ts-rs`-generated types for client routes.
 - Event-handler discovery and client runtime wiring for `on*` attributes.
 - Generated `.thebe/` workspace artifacts through `crates/thebe-project`.
@@ -21,6 +23,7 @@ This page tracks what is actually implemented in the repository today versus wha
   - `thebe new`
   - `thebe dev`
   - `thebe dev --watch`
+  - `thebe dev --hotpatch` (experimental)
   - `thebe build`
   - `thebe check`
 - `thebe-lsp` language server with diagnostics, semantic tokens, document highlights, linked editing, hover, document symbols, definition, references, rename, code actions, formatting, and richer completions.
@@ -36,13 +39,13 @@ This page tracks what is actually implemented in the repository today versus wha
 
 ## Planned Or Missing
 
-- General `src/components/**/*.trs` compilation is still planned. The shipped compiler path currently covers routes and `_layout.trs`, not standalone components.
 - Named slot composition outside route layouts is still planned.
-- Template attribute support for dynamic `:class` and generic `:attr` bindings.
+- Hotpatch remains experimental even though `thebe dev --hotpatch` now exists.
 
 ## Reading The Docs Safely
 
 Some pages in this doc set describe the intended Thebe model, not only the shipped implementation. When in doubt:
 
 - routes, layouts, SSR, hydration, scoped CSS, `.thebe` artifacts, the current LSP, and the initial editor extension assets are real
-- generic standalone component compilation and runtime dynamic attribute support are not shipped yet
+- standalone component compilation and runtime dynamic attribute support are shipped
+- named slots and a fully graduated hotpatch workflow are not shipped yet

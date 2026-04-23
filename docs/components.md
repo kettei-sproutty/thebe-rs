@@ -1,6 +1,6 @@
 # Components
 
-> Status: general `src/components/**/*.trs` compilation is still planned. The shipped compiler path currently covers routes and `_layout.trs`. This page describes the intended component model, not a fully implemented feature.
+> Status: standalone `src/components/**/*.trs` compilation is shipped. Components support typed `Props`, explicit Rust imports, scoped CSS, PascalCase tag expansion, and a default `<slot />`. Named slots are still planned.
 
 Components are reusable `.trs` files that live in the `src/components/` directory. They possess similar capabilities to route files but operate with stricter constraints to maintain application hygiene.
 
@@ -15,7 +15,7 @@ Unlike routes (which use `<script setup>`), components use a `<script>` block. T
 // Compiled into the server-side module for `crate::components::Card`
 pub struct Props {
     pub title: String,
-    pub active: bool,
+    pub active_class: String,
 }
 </script>
 
@@ -23,7 +23,7 @@ pub struct Props {
   let props = getProps<Props>();
 </script>
 
-<div class="card" :class="{ 'is-active': props.active }">
+<div class="card" :class="props.active_class">
   <h2>{{ props.title }}</h2>
   <slot /> <!-- Renders children passed from the parent -->
 </div>
@@ -41,7 +41,7 @@ use crate::components::Card;
 pub async fn handler() -> Props { /* ... */ }
 </script>
 
-<Card :title="props.item_title" :active="true">
+<Card :title="item_title" :active_class="card_kind">
   <p>Inside the default slot!</p>
 </Card>
 ```
@@ -49,4 +49,4 @@ pub async fn handler() -> Props { /* ... */ }
 ## Slots
 Slots allow parents to pass HTML fragments into children.
 - **Scope Ownership:** Slot content fundamentally belongs to the **parent's** reactivity scope. Any bindings within the passed slot resolve against the parent's `getProps()`, not the child's.
-- **Named Slots:** Use standard `<thebe:slot name="footer">` tags to target specific regions in a layout.
+- **Named Slots:** Still planned. Today the shipped component slot surface is the default `<slot />` only.

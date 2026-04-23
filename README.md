@@ -12,7 +12,7 @@ The goal is not to replace Axum with a separate platform. The goal is to keep Ru
 
 Thebe is past the server-only proof-of-concept stage. The repository already ships the core route pipeline: `.trs` parsing, SSR, scoped CSS, client hydration, generated `.thebe/` tooling artifacts, a compiler-backed LSP, and initial editor packages for VS Code and tree-sitter.
 
-What is still missing is the rest of the runtime and product surface: dynamic attribute bindings, general component compilation, and deeper polish on the initial editor packages.
+What is still missing is the remaining narrower surface: named slots, deeper editor/tree-sitter polish, and graduating the experimental hotpatch path.
 
 For a repo-accurate view of shipped versus planned work, see [docs/status.md](docs/status.md) and [docs/editor-tooling.md](docs/editor-tooling.md).
 
@@ -103,9 +103,16 @@ pub async fn handler() -> Props {
 `main.rs`:
 
 ```rust
+include!("../.thebe/server/routes.rs");
+
 #[tokio::main]
 async fn main() {
-    thebe::run().await;
+  let app = axum::Router::new().merge(thebe_routes());
+
+  axum::serve(
+    tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap(),
+    app,
+  ).await.unwrap();
 }
 ```
 
@@ -120,12 +127,12 @@ Thebe's design strictly bounds complexity by keeping server code, client updates
 - [Configuration & Tailwind](docs/configuration.md)
 - [Editor Tooling & LSP](docs/editor-tooling.md)
 - [Performance Benchmarks](docs/performance.md)
-- [Hotpatch Engine (planned)](docs/hotpatch-engine.md)
+- [Hotpatch Engine](docs/hotpatch-engine.md)
 - [Syntax & File Semantics](docs/syntax-and-semantics.md)
 - [Routing & Axum Handlers](docs/routing-and-handlers.md)
 - [State & Reactivity](docs/state-and-reactivity.md)
 - [Forms & Server Mutations](docs/forms-and-mutations.md)
-- [Components & Slots (planned)](docs/components.md)
+- [Components & Slots](docs/components.md)
 - [Context-Aware Hydration](docs/hydration.md)
 
 ---
@@ -145,7 +152,7 @@ my-app/
 │   │   └── blog/
 │   │       ├── index.trs        →  GET /blog
 │   │       └── [slug].trs       →  GET /blog/:slug
-│   └── components/      # planned reusable components (not implemented yet)
+│   └── components/      # reusable components
 │       ├── Button.trs
 │       ├── Card.trs
 │       └── layout/
@@ -290,7 +297,7 @@ The client runtime locates these markers and creates a text node driven by the s
 ### Attributes and Event Handlers
 
 **Dynamic Attributes:**
-Use a colon `:` prefix to bind an attribute to a JavaScript expression. Do not use `{{ }}` inside attribute strings.
+Use a colon `:` prefix to bind an attribute to a template binding key or dotted path. Do not use `{{ }}` inside attribute strings.
 ```html
 <!-- Good -->
 <Card :title="post.title" />
@@ -302,17 +309,18 @@ Use a colon `:` prefix to bind an attribute to a JavaScript expression. Do not u
 **Event Handlers:**
 ```html
 <button onclick="increment">+1</button>
+<input oninput="setQuery(this.value)" />
 ```
 
-`onclick="fnName"` compiles to `data-thebe-on="click:increment"`. The client runtime attaches real event listeners after hydration. V0 only supports passing a function identifier (no inline arguments or modifiers like `.prevent`).
+The client runtime scans raw `on*` attributes after mount, attaches real event listeners, and removes the original DOM attributes. Supported forms today are a bare handler name or a simple call such as `setQuery(this.value)` or `setQuery(event.target.value)`. Modifiers like `.prevent` and inline arrow functions are still out of scope.
 
 ---
 
-## Components (Planned)
+## Components
 
-General `src/components/**/*.trs` compilation is part of the intended Thebe model, but it is not implemented in the current compiler yet. Today the shipped composition primitive is route layouts via `_layout.trs`.
+General `src/components/**/*.trs` compilation is part of the current compiler. Components compile into server-side modules, expand into Minijinja macros during route generation, support typed `Props`, and support a default `<slot />` for child content.
 
-The syntax below describes the target component model rather than a feature you can rely on today.
+Named slots are still planned and are not part of the shipped compiler surface today.
 
 ### Component Props (The `Props` trait)
 To define what a component accepts, declare a generic `Props` struct in a standard `<script>` block. This code is compiled into the server-side module for the component.
@@ -362,6 +370,8 @@ use crate::components::Card;
 
 **Named slots:**
 
+Planned, not shipped yet.
+
 ```html
 <Layout>
   <thebe:slot name="header">
@@ -376,7 +386,7 @@ use crate::components::Card;
 </Layout>
 ```
 
-`<thebe:slot>` is a compile-time construct — it emits no DOM element. Slot content belongs to the **parent's reactivity scope**: reactive variables from the parent are available inside slot content.
+Default slot content belongs to the **parent's reactivity scope**: reactive variables from the parent are available inside slot content.
 
 ---
 
@@ -398,21 +408,28 @@ h1[data-thebe-c-abc123] { color: #00f; }
 
 ## Axum Integration
 
-Thebe is built on top of Axum, not alongside it. `thebe::run()` is just Axum under the hood. You can drop down to raw Axum at any point, ensuring you can inject custom App State (like database pools) cleanly into the file-system router:
+Thebe is built on top of Axum, not alongside it. The generated file-system router is a plain `axum::Router`, so you can compose it with your own routes, middleware, and app state in `src/main.rs`:
 
 ```rust
-use axum::{routing::get, Router};
+include!("../.thebe/server/routes.rs");
+
+use axum::{extract::State, routing::get, Router};
+
+#[derive(Clone)]
+struct Db;
+
+async fn health(State(_db): State<Db>) {}
 
 #[tokio::main]
 async fn main() {
-    let db = Db::new();
+  let db = Db;
 
-    // thebe::router() accepts your generic state type S to wire up your extractors
-    let app = thebe::router::<Db>()
-        .with_state(db)
+  let app = Router::<Db>::new()
+    .merge(thebe_routes())
         .route("/api/health", get(health))  // raw axum route
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(tower_http::compression::CompressionLayer::new());
+    .layer(tower_http::compression::CompressionLayer::new())
+    .with_state(db);
 
     axum::serve(
         tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap(),
@@ -430,17 +447,19 @@ Because the router is a plain `axum::Router`, Tower middleware, WebSockets, stre
 ```
 thebe/
 ├── crates/
-│   ├── thebe-parser/       # .trs → SFC AST (block splitter)
+│   ├── thebe-parser/       # .trs block extraction and template tokenization
 │   ├── thebe-analyzer/     # SWC-based client script analysis and event discovery
 │   ├── thebe-codegen/      # Rust handler generation, template metadata, typed props export glue
 │   ├── thebe-css/          # LightningCSS transform + style scoping
 │   ├── thebe-project/      # shared manifest/diagnostics generation + .thebe workspace refresh
 │   ├── thebe-runtime/      # SSR render and app shell assembly
-│   ├── thebe-cli/          # `thebe new`, `thebe dev`, `thebe check`
+│   ├── thebe-cli/          # `thebe new`, `thebe dev`, `thebe build`, `thebe check`
 │   └── thebe-lsp/          # `tower-lsp` server over `.thebe` manifest + diagnostics artifacts
-└── packages/
-  └── thebe-client/       # browser runtime bundle embedded by codegen
-    └── runtime.js
+├── packages/
+│   ├── thebe-vscode/       # packaged VS Code extension
+│   └── tree-sitter-thebe/  # initial tree-sitter grammar
+└── examples/
+    └── counter-app/        # example app using generated routes/components
 ```
 
 ---
@@ -459,7 +478,7 @@ thebe/
   └── thebe-lsp       →  diagnostics, navigation, and completions over those artifacts plus unsaved overlays
 ```
 
-Current compilation support is route- and layout-focused. General component compilation and editor grammar tooling are still pending.
+Current compilation support includes routes, layouts, standalone components, dynamic attribute bindings, generated tooling artifacts, and the initial editor/runtime story.
 
   ## Key Compiler Constraints
 
@@ -506,17 +525,17 @@ Current compilation support is route- and layout-focused. General component comp
 
 Shipped today:
 
-- `.trs` parsing, SSR rendering, scoped CSS, layouts, app shells, and hydration markers.
+- `.trs` parsing, SSR rendering, scoped CSS, layouts, components, app shells, hydration markers, and dynamic attribute bindings.
 - Client `Props` bridging and generated TypeScript mirrors under `.thebe/`.
-- CLI flows for `thebe new`, `thebe dev`, `thebe dev --watch`, and `thebe check`.
+- CLI flows for `thebe new`, `thebe dev`, `thebe dev --watch`, `thebe dev --hotpatch`, `thebe build`, and `thebe check`.
 - `thebe-lsp` diagnostics, semantic tokens, hover, document symbols, definition, references, rename, code actions, formatting, and richer completions.
 - Packaged editor assets under `packages/thebe-vscode/` and `packages/tree-sitter-thebe/`.
 
 Still missing:
 
-- Dynamic `:class` and generic `:attr` bindings.
-- General standalone component compilation in `src/components/**`.
+- Named slot composition in components.
 - Deeper polish on the initial formatter, rename surface, and tree-sitter grammar.
+- Graduating the experimental hotpatch path into the default supported dev surface.
 
 The detailed breakdown lives in [docs/status.md](docs/status.md) and [docs/editor-tooling.md](docs/editor-tooling.md).
 

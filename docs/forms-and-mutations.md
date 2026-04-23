@@ -40,7 +40,7 @@ pub async fn create(Form(data): Form<CreatePost>) -> Result<Redirect, Props> {
 <form method="post">
   <input type="text" name="title" />
   <button type="submit">Create</button>
-  <span class="err" :if="props.error">{{ props.error }}</span>
+    <p class="err">{{ error }}</p>
 </form>
 ```
 

@@ -45,7 +45,7 @@ To keep parsing and hydration reliable, Thebe restricts template expressions to 
 - Simple bindings: `{{ ident }}` or `{{ ident.prop.deep }}`
 - Dynamic attributes: `:attr="ident.prop"`
 - Event bindings: `on*="fnName"` or simple calls like `oninput="fnName(this.value)"`
-- Slots: `<slot />` and `<thebe:slot name="...">`
+- Slots: `<slot />`
 
 **Not Supported (Use `derived()` instead):**
 - Inline arithmetic (`{{ a + b }}`)
