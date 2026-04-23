@@ -1,0 +1,9 @@
+{
+  "name": "thebe-perf",
+  "private": true,
+  "description": "Local performance runner for Thebe",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.54.2"
+  }
+}

@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Thebe perf matrix</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f3efe7;
+        --panel: rgba(255, 252, 246, 0.9);
+        --panel-strong: rgba(255, 255, 255, 0.94);
+        --text: #1f1a14;
+        --muted: #6b6255;
+        --border: rgba(44, 36, 22, 0.12);
+        --shadow: 0 28px 68px rgba(52, 41, 18, 0.12);
+        --accent: #a24a24;
+        --accent-soft: rgba(162, 74, 36, 0.12);
+        --teal: #0f6d67;
+        --teal-soft: rgba(15, 109, 103, 0.12);
+        --blue: #2756b5;
+        --blue-soft: rgba(39, 86, 181, 0.12);
+        --gold: #9c6d1f;
+        --gold-soft: rgba(156, 109, 31, 0.12);
+        --good: #146c2e;
+        --bad: #a12d2d;
+        --good-bg: rgba(20, 108, 46, 0.12);
+        --bad-bg: rgba(161, 45, 45, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(162, 74, 36, 0.16), transparent 28%),
+          radial-gradient(circle at top right, rgba(15, 109, 103, 0.14), transparent 24%),
+          linear-gradient(180deg, #f8f4ec 0%, var(--bg) 100%);
+      }
+
+      main {
+        width: min(1320px, calc(100vw - 28px));
+        margin: 0 auto;
+        padding: 34px 0 56px;
+      }
+
+      .hero,
+      .panel,
+      .summary-card,
+      .meta-card {
+        border: 1px solid var(--border);
+        border-radius: 26px;
+        box-shadow: var(--shadow);
+      }
+
+      .hero {
+        padding: 30px 30px 24px;
+        margin-bottom: 18px;
+        background:
+          linear-gradient(140deg, rgba(255, 250, 242, 0.96), rgba(245, 239, 228, 0.92)),
+          var(--panel-strong);
+      }
+
+      .eyebrow {
+        margin: 0 0 8px;
+        font-size: 0.72rem;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        font-family: "Iowan Old Style", "Palatino Linotype", serif;
+        font-size: clamp(2.5rem, 5vw, 4.4rem);
+        line-height: 0.96;
+        letter-spacing: -0.045em;
+      }
+
+      .subtitle {
+        margin-top: 12px;
+        max-width: 64rem;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      .meta-grid,
+      .summary-grid {
+        display: grid;
+        gap: 16px;
+      }
+
+      .meta-grid {
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        margin-top: 20px;
+      }
+
+      .summary-grid {
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        margin-bottom: 18px;
+      }
+
+      .meta-card,
+      .summary-card,
+      .panel {
+        background: var(--panel);
+        backdrop-filter: blur(10px);
+      }
+
+      .meta-card,
+      .summary-card {
+        padding: 18px 18px 20px;
+      }
+
+      .meta-card dt,
+      .summary-card .label,
+      .metric-note,
+      .mini-label {
+        font-size: 0.76rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+      }
+
+      .meta-card dd {
+        margin: 8px 0 0;
+        font-size: 1rem;
+        line-height: 1.45;
+      }
+
+      .summary-card .value {
+        display: block;
+        margin-top: 10px;
+        font-size: 1.8rem;
+        font-weight: 700;
+        letter-spacing: -0.04em;
+      }
+
+      .summary-card.accent .value { color: var(--accent); }
+      .summary-card.teal .value { color: var(--teal); }
+      .summary-card.blue .value { color: var(--blue); }
+      .summary-card.gold .value { color: var(--gold); }
+
+      .summary-card .caption {
+        margin-top: 8px;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+
+      .panel {
+        padding: 22px;
+        margin-bottom: 18px;
+      }
+
+      .panel-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: start;
+        gap: 14px;
+        margin-bottom: 14px;
+      }
+
+      h2 {
+        font-size: 1.2rem;
+        letter-spacing: -0.03em;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th,
+      td {
+        padding: 14px 10px;
+        text-align: left;
+        border-top: 1px solid rgba(42, 34, 22, 0.08);
+        vertical-align: top;
+      }
+
+      th {
+        padding-top: 0;
+        font-size: 0.76rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        border-top: none;
+      }
+
+      td:first-child,
+      th:first-child {
+        padding-left: 0;
+      }
+
+      td:last-child,
+      th:last-child {
+        padding-right: 0;
+      }
+
+      .rank {
+        display: inline-flex;
+        min-width: 38px;
+        height: 38px;
+        align-items: center;
+        justify-content: center;
+        border-radius: 999px;
+        font-weight: 700;
+        background: var(--accent-soft);
+        color: var(--accent);
+      }
+
+      .framework-name {
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+
+      .framework-meta {
+        margin-top: 4px;
+        color: var(--muted);
+        line-height: 1.4;
+      }
+
+      .metric-value {
+        font-weight: 700;
+        letter-spacing: -0.03em;
+      }
+
+      .metric-note {
+        display: block;
+        margin-top: 6px;
+      }
+
+      .pill,
+      .status {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 999px;
+        font-size: 0.76rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+
+      .pill {
+        margin-top: 6px;
+        padding: 5px 10px;
+        color: var(--gold);
+        background: var(--gold-soft);
+      }
+
+      .status {
+        min-width: 112px;
+        padding: 6px 10px;
+      }
+
+      .status.improved {
+        color: var(--good);
+        background: var(--good-bg);
+      }
+
+      .status.regressed {
+        color: var(--bad);
+        background: var(--bad-bg);
+      }
+
+      .empty-state,
+      .footer-note {
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      code {
+        font-family: "SFMono-Regular", "Consolas", monospace;
+        font-size: 0.9em;
+      }
+
+      @media (max-width: 900px) {
+        main {
+          width: min(100vw - 18px, 1320px);
+          padding-top: 20px;
+        }
+
+        .hero,
+        .panel,
+        .summary-card,
+        .meta-card {
+          border-radius: 22px;
+        }
+
+        table,
+        thead,
+        tbody,
+        tr,
+        th,
+        td {
+          display: block;
+        }
+
+        thead {
+          display: none;
+        }
+
+        tbody tr {
+          padding: 12px 0;
+          border-top: 1px solid rgba(42, 34, 22, 0.08);
+        }
+
+        tbody tr:first-child {
+          border-top: none;
+        }
+
+        td {
+          border-top: none;
+          padding: 6px 0;
+        }
+
+        td::before {
+          content: attr(data-label);
+          display: block;
+          margin-bottom: 4px;
+          font-size: 0.72rem;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: var(--muted);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <p class="eyebrow">Thebe performance harness</p>
+        <h1>Framework matrix</h1>
+        <p class="subtitle">One HTML view for the latest benchmark result from every configured target. Each row comes from that target's latest local JSON report, and any row that was run with <code>--compare-to</code> also carries its saved-baseline delta.</p>
+        <dl class="meta-grid">
+          <div class="meta-card">
+            <dt>Targets included</dt>
+            <dd>5 / 5</dd>
+          </div>
+          <div class="meta-card">
+            <dt>Generated</dt>
+            <dd>2026-04-23T21:46:20.319Z</dd>
+          </div>
+          <div class="meta-card">
+            <dt>Missing targets</dt>
+            <dd>none</dd>
+          </div>
+          <div class="meta-card">
+            <dt>Source</dt>
+            <dd><code>benchmarks/results/latest-*.json</code></dd>
+          </div>
+        </dl>
+        <p class="footer-note">All configured targets currently have a latest report in the matrix.</p>
+      </section>
+
+      <section class="summary-grid">
+        
+    <article class="summary-card accent">
+      <span class="label">Targets included</span>
+      <strong class="value">5 / 5</strong>
+      <p class="caption">The matrix refreshes every time a target report is written.</p>
+    </article>
+  
+        
+    <article class="summary-card teal">
+      <span class="label">Fastest SSR</span>
+      <strong class="value">20,683.45 req/s</strong>
+      <p class="caption">Thebe counter app leads current throughput.</p>
+    </article>
+  
+        
+    <article class="summary-card blue">
+      <span class="label">Lowest bootstrap p95</span>
+      <strong class="value">0.66 ms</strong>
+      <p class="caption">Thebe counter app reaches interactivity fastest.</p>
+    </article>
+  
+        
+    <article class="summary-card gold">
+      <span class="label">Lowest DOM patch p95</span>
+      <strong class="value">2.565 us</strong>
+      <p class="caption">SolidStart counter leads bound-value patch latency.</p>
+    </article>
+  
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <p class="eyebrow">Current metrics</p>
+            <h2>Latest target runs</h2>
+          </div>
+        </div>
+        
+        <table>
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Framework</th>
+              <th>SSR req/s</th>
+              <th>SSR p95</th>
+              <th>Bootstrap p95</th>
+              <th>DOM patch p95</th>
+              <th>Generated</th>
+            </tr>
+          </thead>
+          <tbody>
+            
+                  <tr>
+                    <td data-label="Rank"><span class="rank">1</span></td>
+                    <td data-label="Framework">
+                      <div class="framework-name">thebe</div>
+                      <div class="framework-meta">Thebe counter app<br />thebe-counter</div>
+                    </td>
+                    <td data-label="SSR req/s">
+    <div class="metric-value">20,683.45 req/s</div>
+    <span class="pill">best</span>
+  </td>
+                    <td data-label="SSR p95">
+    <div class="metric-value">0.538 ms</div>
+    
+  </td>
+                    <td data-label="Bootstrap p95">
+    <div class="metric-value">0.66 ms</div>
+    <span class="pill">best</span>
+  </td>
+                    <td data-label="DOM patch p95">
+    <div class="metric-value">3.32 us</div>
+    <span class="metric-note">1.29x leader</span>
+  </td>
+                    <td data-label="Generated">
+                      <div class="metric-value">2026-04-23T21:45:26.313Z</div>
+                      <span class="metric-note">HTML latest-thebe-counter.html</span>
+                    </td>
+                  </tr>
+                
+                  <tr>
+                    <td data-label="Rank"><span class="rank">2</span></td>
+                    <td data-label="Framework">
+                      <div class="framework-name">sveltekit</div>
+                      <div class="framework-meta">SvelteKit counter<br />sveltekit-counter</div>
+                    </td>
+                    <td data-label="SSR req/s">
+    <div class="metric-value">10,252.99 req/s</div>
+    <span class="metric-note">49.57% of leader</span>
+  </td>
+                    <td data-label="SSR p95">
+    <div class="metric-value">1.549 ms</div>
+    
+  </td>
+                    <td data-label="Bootstrap p95">
+    <div class="metric-value">0.895 ms</div>
+    <span class="metric-note">1.36x leader</span>
+  </td>
+                    <td data-label="DOM patch p95">
+    <div class="metric-value">4.695 us</div>
+    <span class="metric-note">1.83x leader</span>
+  </td>
+                    <td data-label="Generated">
+                      <div class="metric-value">2026-04-23T21:46:05.262Z</div>
+                      <span class="metric-note">HTML latest-sveltekit-counter.html</span>
+                    </td>
+                  </tr>
+                
+                  <tr>
+                    <td data-label="Rank"><span class="rank">3</span></td>
+                    <td data-label="Framework">
+                      <div class="framework-name">solidstart</div>
+                      <div class="framework-meta">SolidStart counter<br />solidstart-counter</div>
+                    </td>
+                    <td data-label="SSR req/s">
+    <div class="metric-value">4,438.59 req/s</div>
+    <span class="metric-note">21.46% of leader</span>
+  </td>
+                    <td data-label="SSR p95">
+    <div class="metric-value">4.019 ms</div>
+    
+  </td>
+                    <td data-label="Bootstrap p95">
+    <div class="metric-value">14.265 ms</div>
+    <span class="metric-note">21.61x leader</span>
+  </td>
+                    <td data-label="DOM patch p95">
+    <div class="metric-value">2.565 us</div>
+    <span class="pill">best</span>
+  </td>
+                    <td data-label="Generated">
+                      <div class="metric-value">2026-04-23T21:46:20.319Z</div>
+                      <span class="metric-note">HTML latest-solidstart-counter.html</span>
+                    </td>
+                  </tr>
+                
+                  <tr>
+                    <td data-label="Rank"><span class="rank">4</span></td>
+                    <td data-label="Framework">
+                      <div class="framework-name">nextjs</div>
+                      <div class="framework-meta">Next.js App Router counter<br />next-counter</div>
+                    </td>
+                    <td data-label="SSR req/s">
+    <div class="metric-value">3,144.02 req/s</div>
+    <span class="metric-note">15.2% of leader</span>
+  </td>
+                    <td data-label="SSR p95">
+    <div class="metric-value">3.941 ms</div>
+    
+  </td>
+                    <td data-label="Bootstrap p95">
+    <div class="metric-value">2.75 ms</div>
+    <span class="metric-note">4.17x leader</span>
+  </td>
+                    <td data-label="DOM patch p95">
+    <div class="metric-value">30.955 us</div>
+    <span class="metric-note">12.07x leader</span>
+  </td>
+                    <td data-label="Generated">
+                      <div class="metric-value">2026-04-23T21:45:38.854Z</div>
+                      <span class="metric-note">HTML latest-next-counter.html</span>
+                    </td>
+                  </tr>
+                
+                  <tr>
+                    <td data-label="Rank"><span class="rank">5</span></td>
+                    <td data-label="Framework">
+                      <div class="framework-name">nuxt</div>
+                      <div class="framework-meta">Nuxt counter<br />nuxt-counter</div>
+                    </td>
+                    <td data-label="SSR req/s">
+    <div class="metric-value">2,368.94 req/s</div>
+    <span class="metric-note">11.45% of leader</span>
+  </td>
+                    <td data-label="SSR p95">
+    <div class="metric-value">7.33 ms</div>
+    
+  </td>
+                    <td data-label="Bootstrap p95">
+    <div class="metric-value">1.795 ms</div>
+    <span class="metric-note">2.72x leader</span>
+  </td>
+                    <td data-label="DOM patch p95">
+    <div class="metric-value">5.7 us</div>
+    <span class="metric-note">2.22x leader</span>
+  </td>
+                    <td data-label="Generated">
+                      <div class="metric-value">2026-04-23T21:45:53.531Z</div>
+                      <span class="metric-note">HTML latest-nuxt-counter.html</span>
+                    </td>
+                  </tr>
+                
+          </tbody>
+        </table>
+      </section>
+
+      
+    </main>
+  </body>
+</html>

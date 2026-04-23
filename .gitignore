@@ -1,2 +1,17 @@
 /target
 /.thebe
+
+# Benchmark artifacts
+/scripts/perf/node_modules
+/benchmarks/results/*
+!/benchmarks/results/latest-matrix.html
+/benchmarks/fixtures/**/node_modules
+/benchmarks/fixtures/**/.next
+/benchmarks/fixtures/**/.nuxt
+/benchmarks/fixtures/**/.output
+/benchmarks/fixtures/**/.svelte-kit
+/benchmarks/fixtures/**/.vinxi
+/benchmarks/fixtures/**/build
+
+# Misc
+.DS_Store

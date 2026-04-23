@@ -1,0 +1,9 @@
+{
+  "name": "nuxt-counter-bench",
+  "private": true,
+  "type": "module",
+  "description": "Benchmark fixture for comparing Thebe against Nuxt",
+  "dependencies": {
+    "nuxt": "4.4.2"
+  }
+}

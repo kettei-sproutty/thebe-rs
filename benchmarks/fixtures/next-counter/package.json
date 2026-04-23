@@ -1,0 +1,10 @@
+{
+  "name": "next-counter-bench",
+  "private": true,
+  "description": "Benchmark fixture for comparing Thebe against Next.js",
+  "dependencies": {
+    "next": "16.0.3",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  }
+}

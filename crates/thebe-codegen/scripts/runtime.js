@@ -15,6 +15,31 @@
 (function (win) {
   "use strict";
 
+  function _safePerfMark(name) {
+    var perf = win.performance;
+    if (perf && typeof perf.mark === "function") {
+      perf.mark(name);
+    }
+  }
+
+  function _safePerfMeasure(name, startMark, endMark) {
+    var perf = win.performance;
+    if (perf && typeof perf.measure === "function") {
+      perf.measure(name, startMark, endMark);
+    }
+  }
+
+  function _markRuntimeReady() {
+    _safePerfMark("thebe:runtime:ready");
+    _safePerfMeasure(
+      "thebe:runtime:bootstrap",
+      "thebe:runtime:start",
+      "thebe:runtime:ready"
+    );
+  }
+
+  _safePerfMark("thebe:runtime:start");
+
   /** Registry filled by `__thebe_register` calls in the user script. */
   var _handlers = {};
 
@@ -705,11 +730,13 @@
       _wireEvents();
       _buildAttrIndex();
       _initRouter();
+      _markRuntimeReady();
     });
   } else {
     _wireEvents();
     _buildAttrIndex();
     _initRouter();
+    _markRuntimeReady();
   }
 
   // Expose public API on `window`.

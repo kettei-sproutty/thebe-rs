@@ -21,7 +21,43 @@ pub fn handler(State(state): State<crate::AppState>) -> Props {
 </head>
 
 <script lang="ts">
+performance.mark("framework-bench:bootstrap:start");
+
+type FrameworkBench = {
+    framework: string,
+    writeCount(value: number): void | Promise<void>,
+    readCount(): string | null | Promise<string | null>,
+}
+
 let props = getProps<Props>();
+
+let benchWindow = window as Window & {
+    __frameworkBench?: FrameworkBench,
+};
+
+function readRenderedCount() {
+    let el = document.querySelector("[data-framework-bench-counter]");
+    return el ? el.textContent?.trim() ?? null : null;
+}
+
+benchWindow.__frameworkBench = {
+    framework: "thebe",
+    writeCount(value) {
+        props.count = value;
+    },
+    readCount() {
+        return readRenderedCount();
+    }
+};
+
+queueMicrotask(() => {
+    performance.mark("framework-bench:bootstrap:ready");
+    performance.measure(
+        "framework-bench:bootstrap",
+        "framework-bench:bootstrap:start",
+        "framework-bench:bootstrap:ready"
+    );
+});
 
 async function requestCount(path) {
     try {
@@ -58,7 +94,7 @@ function reset() {
     </p>
 
     <div class="bg-white px-12 py-10 rounded-2xl shadow-sm border border-slate-200 flex flex-col items-center">
-        <p class="text-7xl font-extrabold text-indigo-600 mb-8 tracking-tighter">{{ count }}</p>
+        <p data-framework-bench-counter class="text-7xl font-extrabold text-indigo-600 mb-8 tracking-tighter">{{ count }}</p>
 
         <div class="flex gap-4">
             <button onclick="decrement" class="h-12 w-16 text-2xl font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 hover:text-slate-900 rounded-xl transition-all shadow-sm active:scale-95">−</button>

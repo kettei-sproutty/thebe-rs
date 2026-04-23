@@ -1,0 +1,72 @@
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  background: #f3f4f6;
+  color: #0f172a;
+}
+
+body {
+  min-height: 100vh;
+}
+
+.page-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem 1.5rem;
+}
+
+.panel {
+  width: min(32rem, 100%);
+  text-align: center;
+}
+
+.title {
+  margin: 0 0 1rem;
+  font-size: 2.5rem;
+}
+
+.subtitle {
+  margin: 0 0 2rem;
+  color: #475569;
+  line-height: 1.6;
+}
+
+.card {
+  background: white;
+  border-radius: 1.25rem;
+  border: 1px solid #cbd5e1;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+  padding: 2rem;
+}
+
+.count {
+  margin: 0 0 1.5rem;
+  font-size: 4.5rem;
+  font-weight: 800;
+  color: #4338ca;
+}
+
+.actions {
+  display: flex;
+  justify-content: center;
+  gap: 1rem;
+}
+
+.actions button {
+  border: none;
+  border-radius: 0.85rem;
+  background: #e2e8f0;
+  color: #0f172a;
+  padding: 0.85rem 1.1rem;
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.actions button:hover {
+  background: #cbd5e1;
+}

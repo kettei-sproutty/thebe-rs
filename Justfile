@@ -20,6 +20,42 @@ lint:
 fmt:
     cargo fmt
 
+# Install local dependencies for the perf runner
+perf-install:
+    npm install --prefix scripts/perf
+
+# List all configured perf targets
+perf-list:
+    node scripts/perf/run.cjs --list-targets
+
+# Run the local perf harness against the counter-app example
+perf:
+    node scripts/perf/run.cjs
+
+# Run the local perf harness against a specific configured target
+perf-target target:
+    node scripts/perf/run.cjs --target {{target}}
+
+# Run the local perf harness without rebuilding the example first
+perf-quick:
+    node scripts/perf/run.cjs --skip-build
+
+# Run the local perf harness against a specific target without rebuilding it first
+perf-target-quick target:
+    node scripts/perf/run.cjs --target {{target}} --skip-build
+
+# Save the current run as a named local baseline under benchmarks/results/baselines/
+perf-baseline name:
+    node scripts/perf/run.cjs --save-baseline {{name}}
+
+# Compare the current run against a named local baseline
+perf-compare name:
+    node scripts/perf/run.cjs --compare-to {{name}}
+
+# Compare a specific target against a named local baseline
+perf-target-compare target name:
+    node scripts/perf/run.cjs --target {{target}} --compare-to {{name}}
+
 # Start the counter-app example with the locally-built CLI
 dev-example:
     cargo build -p thebe-cli

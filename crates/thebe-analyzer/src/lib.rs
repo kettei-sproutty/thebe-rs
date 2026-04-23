@@ -73,7 +73,16 @@ pub fn minify_javascript(script_js: &str) -> Result<String, AnalyzerError> {
     CLIENT_JAVASCRIPT_FILENAME,
   )?;
   let script = compress_script(script)?;
-  emit_script(&script, true)
+  let minified = emit_script(&script, true)?;
+
+  match parse_script(
+    &minified,
+    Syntax::Es(EsSyntax::default()),
+    CLIENT_JAVASCRIPT_FILENAME,
+  ) {
+    Ok(_) => Ok(minified),
+    Err(_) => Ok(script_js.to_owned()),
+  }
 }
 
 /// Format a `<script lang="ts">` block using SWC's parser and emitter.
@@ -221,6 +230,7 @@ fn collect_top_level_function_names(script: &Script) -> Vec<String> {
 mod tests {
   mod analyze {
     use crate::{analyze, format_typescript};
+    use swc_ecma_parser::{EsSyntax, Syntax};
 
     #[test]
     fn strips_types_and_registers_top_level_functions() {
@@ -306,6 +316,25 @@ mod tests {
 
       assert!(!module.js.contains("console.log"), "output: {}", module.js);
       assert!(!module.js.contains("if(false)"), "output: {}", module.js);
+    }
+
+    #[test]
+    fn minify_javascript_keeps_thebe_runtime_parseable() {
+      let runtime = include_str!("../../thebe-codegen/scripts/runtime.js");
+
+      let output = super::super::minify_javascript(runtime).unwrap();
+
+      assert!(output.contains("__thebe_runtime"), "output: {}", output);
+      assert!(
+        super::super::parse_script(
+          &output,
+          Syntax::Es(EsSyntax::default()),
+          super::super::CLIENT_JAVASCRIPT_FILENAME,
+        )
+        .is_ok(),
+        "output: {}",
+        output
+      );
     }
 
     #[test]
