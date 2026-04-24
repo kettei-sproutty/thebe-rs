@@ -370,6 +370,303 @@ fn head_only_layout_edit_should_emit_template_event_for_affected_route_without_r
 }
 
 #[test]
+fn style_only_route_edit_should_update_live_browser_styles_without_page_reload() {
+  let _guard = hotpatch_test_guard();
+  if !playwright_probe_supported() {
+    eprintln!("skipping Playwright hotpatch browser test: local Playwright runtime is unavailable");
+    return;
+  }
+
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("style-browser-patch");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", initial_route_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("Hello hotpatch"));
+
+  let probe = spawn_playwright_probe(
+    &style_hotpatch_probe_script(fixture_port),
+    &fixture.root().join("src/routes/index.trs"),
+    updated_route_source(),
+  );
+  let probe_output = probe
+    .wait_with_output()
+    .expect("Playwright style probe should complete");
+  assert_playwright_probe_success(&probe_output, &output, "style hotpatch browser probe");
+
+  let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
+  assert!(probe_stdout.contains(r#""beforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""managedStyleCount":1"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("style-hotpatch-probe"), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("blue") || probe_stdout.contains("0, 0, 255"), "unexpected probe output: {probe_stdout}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn head_only_layout_edit_should_sync_live_browser_head_without_page_reload() {
+  let _guard = hotpatch_test_guard();
+  if !playwright_probe_supported() {
+    eprintln!("skipping Playwright hotpatch browser test: local Playwright runtime is unavailable");
+    return;
+  }
+
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("layout-head-browser-patch");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/_layout.trs", initial_layout_source());
+  fixture.write("src/routes/index.trs", layout_body_route_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("Layout before"));
+
+  let probe = spawn_playwright_probe(
+    &layout_head_hotpatch_probe_script(fixture_port),
+    &fixture.root().join("src/routes/_layout.trs"),
+    updated_layout_head_source(),
+  );
+  let probe_output = probe
+    .wait_with_output()
+    .expect("Playwright layout head probe should complete");
+  assert_playwright_probe_success(&probe_output, &output, "layout head hotpatch browser probe");
+
+  let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
+  assert!(probe_stdout.contains(r#""beforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""metaContent":"Layout after""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("layout-head-hotpatch-probe"), "unexpected probe output: {probe_stdout}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn template_only_route_edit_should_refresh_live_browser_without_page_reload() {
+  let _guard = hotpatch_test_guard();
+  if !playwright_probe_supported() {
+    eprintln!("skipping Playwright hotpatch browser test: local Playwright runtime is unavailable");
+    return;
+  }
+
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("template-browser-patch");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", initial_template_route_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("Template before"));
+
+  let probe = spawn_playwright_probe(
+    &route_template_hotpatch_probe_script(fixture_port),
+    &fixture.root().join("src/routes/index.trs"),
+    updated_template_route_source(),
+  );
+  let probe_output = probe
+    .wait_with_output()
+    .expect("Playwright route template probe should complete");
+  assert_playwright_probe_success(&probe_output, &output, "route template hotpatch browser probe");
+
+  let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
+  assert!(probe_stdout.contains(r#""beforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""refreshCount":1"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""templateSeen":true"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("template-route-hotpatch-probe"), "unexpected probe output: {probe_stdout}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn style_only_component_edit_should_update_affected_live_route_and_ignore_unaffected_browser_route() {
+  let _guard = hotpatch_test_guard();
+  if !playwright_probe_supported() {
+    eprintln!("skipping Playwright hotpatch browser test: local Playwright runtime is unavailable");
+    return;
+  }
+
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("component-style-browser-patch");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", route_using_card_source());
+  fixture.write("src/routes/about.trs", plain_about_route_source());
+  fixture.write("src/components/Card.trs", initial_card_component_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("Component before"));
+  assert!(fetch_page(fixture_port, "/about").contains("About page"));
+
+  let probe = spawn_playwright_probe(
+    &component_style_hotpatch_probe_script(fixture_port),
+    &fixture.root().join("src/components/Card.trs"),
+    updated_card_component_style_source(),
+  );
+  let probe_output = probe
+    .wait_with_output()
+    .expect("Playwright component style probe should complete");
+  assert_playwright_probe_success(&probe_output, &output, "component style hotpatch browser probe");
+
+  let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
+  assert!(probe_stdout.contains(r#""affectedBeforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""affectedApplyCount":1"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""unaffectedBeforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""unaffectedApplyCount":0"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""unaffectedStillAbout":true"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("component-style-affected-probe"), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("component-style-unaffected-probe"), "unexpected probe output: {probe_stdout}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn template_only_component_edit_should_refresh_affected_live_route_and_ignore_unaffected_browser_route() {
+  let _guard = hotpatch_test_guard();
+  if !playwright_probe_supported() {
+    eprintln!("skipping Playwright hotpatch browser test: local Playwright runtime is unavailable");
+    return;
+  }
+
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("component-template-browser-patch");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", route_using_card_source());
+  fixture.write("src/routes/about.trs", plain_about_route_source());
+  fixture.write("src/components/Card.trs", initial_card_component_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("Component before"));
+  assert!(fetch_page(fixture_port, "/about").contains("About page"));
+
+  let probe = spawn_playwright_probe(
+    &component_template_hotpatch_probe_script(fixture_port),
+    &fixture.root().join("src/components/Card.trs"),
+    updated_card_component_template_source(),
+  );
+  let probe_output = probe
+    .wait_with_output()
+    .expect("Playwright component template probe should complete");
+  assert_playwright_probe_success(&probe_output, &output, "component template hotpatch browser probe");
+
+  let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
+  assert!(probe_stdout.contains(r#""affectedBeforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""affectedRefreshCount":1"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""affectedTemplateSeen":true"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""unaffectedBeforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""unaffectedRefreshCount":0"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""unaffectedStillAbout":true"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("component-template-affected-probe"), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("component-template-unaffected-probe"), "unexpected probe output: {probe_stdout}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn unused_layout_edit_should_leave_live_browser_untouched() {
+  let _guard = hotpatch_test_guard();
+  if !playwright_probe_supported() {
+    eprintln!("skipping Playwright hotpatch browser test: local Playwright runtime is unavailable");
+    return;
+  }
+
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("unused-layout-browser-noop");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", initial_template_route_source());
+  fixture.write("src/routes/admin/_layout.trs", initial_unused_layout_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("Template before"));
+
+  let probe = spawn_playwright_probe(
+    &noop_hotpatch_probe_script(fixture_port),
+    &fixture.root().join("src/routes/admin/_layout.trs"),
+    updated_unused_layout_source(),
+  );
+  wait_for_output_line(
+    &output,
+    |line| line.contains("refreshing hotpatch state"),
+    Duration::from_secs(20),
+  )
+  .unwrap();
+  let probe_output = probe
+    .wait_with_output()
+    .expect("Playwright no-op probe should complete");
+  assert_playwright_probe_success(&probe_output, &output, "unused layout hotpatch browser probe");
+
+  let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
+  assert!(probe_stdout.contains(r#""beforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""refreshCount":0"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""applyStyleCount":0"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""templateBeforeStillVisible":true"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("noop-hotpatch-probe"), "unexpected probe output: {probe_stdout}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
 fn unused_layout_edit_should_not_emit_browser_event_or_restart_runtime() {
   let _guard = hotpatch_test_guard();
   let fixture_port = reserve_port();
@@ -865,6 +1162,642 @@ pub fn index() -> Props {{
 <h1>{{{{ title }}}}</h1>
 "#,
   )
+}
+
+const STYLE_HOTPATCH_PROBE_SCRIPT: &str = r##"
+const fs = require("node:fs");
+const { chromium } = require("playwright");
+
+const targetUrl = "__TARGET_URL__";
+const patchFile = process.env.THEBE_HOTPATCH_FILE;
+const patchSource = process.env.THEBE_HOTPATCH_SOURCE;
+const beforeUnloadKey = "__thebe_style_beforeunload__";
+
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  try {
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      () => typeof window.__thebe_dev_apply_style === "function",
+      null,
+      { timeout: 30000 }
+    );
+    await page.locator("h1").waitFor({ state: "attached", timeout: 30000 });
+    await page.evaluate((key) => {
+      window.sessionStorage.removeItem(key);
+      window.addEventListener("beforeunload", () => {
+        const count = Number(window.sessionStorage.getItem(key) || "0");
+        window.sessionStorage.setItem(key, String(count + 1));
+      });
+      window.__thebeStyleProbeToken = "style-hotpatch-probe";
+    }, beforeUnloadKey);
+
+    const initialColor = await page.locator("h1").evaluate((el) => getComputedStyle(el).color);
+    fs.writeFileSync(patchFile, patchSource);
+
+    await page.waitForFunction(
+      ({ initialColor, beforeUnloadKey }) => {
+        const heading = document.querySelector("h1");
+        const managedStyles = Array.from(
+          document.head.querySelectorAll('[data-thebe-head="style"]')
+        );
+
+        return Boolean(
+          heading &&
+            getComputedStyle(heading).color !== initialColor &&
+            window.__thebeStyleProbeToken === "style-hotpatch-probe" &&
+            (window.sessionStorage.getItem(beforeUnloadKey) || "0") === "0" &&
+            managedStyles.length === 1 &&
+            managedStyles.some((style) => {
+              const text = style.textContent || "";
+              return text.includes("blue") || text.includes("#00f") || text.includes("#0000ff");
+            })
+        );
+      },
+      { initialColor, beforeUnloadKey },
+      { timeout: 30000 }
+    );
+
+    const result = await page.evaluate((key) => {
+      const heading = document.querySelector("h1");
+      const managedStyles = Array.from(
+        document.head.querySelectorAll('[data-thebe-head="style"]')
+      );
+
+      return {
+        beforeUnloadCount: window.sessionStorage.getItem(key) || "0",
+        color: heading ? getComputedStyle(heading).color : null,
+        probeToken: window.__thebeStyleProbeToken || null,
+        managedStyleCount: managedStyles.length,
+        managedStyleText: managedStyles.map((style) => style.textContent || "").join("\n")
+      };
+    }, beforeUnloadKey);
+
+    console.log(JSON.stringify(result));
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exitCode = 1;
+  } finally {
+    await browser.close();
+  }
+})();
+"##;
+
+const LAYOUT_HEAD_HOTPATCH_PROBE_SCRIPT: &str = r#"
+const fs = require("node:fs");
+const { chromium } = require("playwright");
+
+const targetUrl = "__TARGET_URL__";
+const patchFile = process.env.THEBE_HOTPATCH_FILE;
+const patchSource = process.env.THEBE_HOTPATCH_SOURCE;
+const beforeUnloadKey = "__thebe_layout_head_beforeunload__";
+
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  try {
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      () => typeof window.__thebe_dev_refresh === "function",
+      null,
+      { timeout: 30000 }
+    );
+    await page.waitForFunction(
+      () => {
+        const meta = document.head.querySelector('meta[name="layout-probe"]');
+        return meta && meta.getAttribute("content") === "Layout before";
+      },
+      null,
+      { timeout: 30000 }
+    );
+    await page.evaluate((key) => {
+      window.sessionStorage.removeItem(key);
+      window.addEventListener("beforeunload", () => {
+        const count = Number(window.sessionStorage.getItem(key) || "0");
+        window.sessionStorage.setItem(key, String(count + 1));
+      });
+      window.__thebeLayoutHeadProbeToken = "layout-head-hotpatch-probe";
+    }, beforeUnloadKey);
+
+    fs.writeFileSync(patchFile, patchSource);
+
+    await page.waitForFunction(
+      (beforeUnloadKey) => {
+        const meta = document.head.querySelector('meta[name="layout-probe"]');
+
+        return Boolean(
+          meta &&
+            meta.getAttribute("content") === "Layout after" &&
+            window.__thebeLayoutHeadProbeToken === "layout-head-hotpatch-probe" &&
+            (window.sessionStorage.getItem(beforeUnloadKey) || "0") === "0" &&
+            document.body.textContent.includes("Layout route body")
+        );
+      },
+      beforeUnloadKey,
+      { timeout: 30000 }
+    );
+
+    const result = await page.evaluate((key) => {
+      const meta = document.head.querySelector('meta[name="layout-probe"]');
+
+      return {
+        beforeUnloadCount: window.sessionStorage.getItem(key) || "0",
+        metaContent: meta ? meta.getAttribute("content") : null,
+        probeToken: window.__thebeLayoutHeadProbeToken || null
+      };
+    }, beforeUnloadKey);
+
+    console.log(JSON.stringify(result));
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exitCode = 1;
+  } finally {
+    await browser.close();
+  }
+})();
+"#;
+
+const ROUTE_TEMPLATE_HOTPATCH_PROBE_SCRIPT: &str = r#"
+const fs = require("node:fs");
+const { chromium } = require("playwright");
+
+const targetUrl = "__TARGET_URL__";
+const patchFile = process.env.THEBE_HOTPATCH_FILE;
+const patchSource = process.env.THEBE_HOTPATCH_SOURCE;
+const beforeUnloadKey = "__thebe_template_route_beforeunload__";
+
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  try {
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      () => typeof window.__thebe_dev_refresh === "function",
+      null,
+      { timeout: 30000 }
+    );
+    await page.waitForFunction(
+      () => document.body.textContent.includes("Template before"),
+      null,
+      { timeout: 30000 }
+    );
+    await page.evaluate((key) => {
+      const originalRefresh = window.__thebe_dev_refresh;
+      window.sessionStorage.removeItem(key);
+      window.__thebeTemplateRouteRefreshCount = 0;
+      window.addEventListener("beforeunload", () => {
+        const count = Number(window.sessionStorage.getItem(key) || "0");
+        window.sessionStorage.setItem(key, String(count + 1));
+      });
+      window.__thebe_dev_refresh = function (...args) {
+        window.__thebeTemplateRouteRefreshCount += 1;
+        return originalRefresh.apply(this, args);
+      };
+      window.__thebeTemplateRouteProbeToken = "template-route-hotpatch-probe";
+    }, beforeUnloadKey);
+
+    fs.writeFileSync(patchFile, patchSource);
+
+    await page.waitForFunction(
+      (beforeUnloadKey) =>
+        document.body.textContent.includes("Template after") &&
+        window.__thebeTemplateRouteProbeToken === "template-route-hotpatch-probe" &&
+        (window.sessionStorage.getItem(beforeUnloadKey) || "0") === "0" &&
+        (window.__thebeTemplateRouteRefreshCount || 0) >= 1,
+      beforeUnloadKey,
+      { timeout: 30000 }
+    );
+
+    const result = await page.evaluate((key) => ({
+      beforeUnloadCount: window.sessionStorage.getItem(key) || "0",
+      refreshCount: window.__thebeTemplateRouteRefreshCount || 0,
+      templateSeen: document.body.textContent.includes("Template after"),
+      probeToken: window.__thebeTemplateRouteProbeToken || null
+    }), beforeUnloadKey);
+
+    console.log(JSON.stringify(result));
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exitCode = 1;
+  } finally {
+    await browser.close();
+  }
+})();
+"#;
+
+const COMPONENT_STYLE_HOTPATCH_PROBE_SCRIPT: &str = r#"
+const fs = require("node:fs");
+const { chromium } = require("playwright");
+
+const affectedUrl = "__AFFECTED_URL__";
+const unaffectedUrl = "__UNAFFECTED_URL__";
+const patchFile = process.env.THEBE_HOTPATCH_FILE;
+const patchSource = process.env.THEBE_HOTPATCH_SOURCE;
+const affectedBeforeUnloadKey = "__thebe_component_style_affected_beforeunload__";
+const unaffectedBeforeUnloadKey = "__thebe_component_style_unaffected_beforeunload__";
+
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext();
+  const affectedPage = await context.newPage();
+  const unaffectedPage = await context.newPage();
+
+  try {
+    await Promise.all([
+      affectedPage.goto(affectedUrl, { waitUntil: "domcontentloaded" }),
+      unaffectedPage.goto(unaffectedUrl, { waitUntil: "domcontentloaded" })
+    ]);
+    await Promise.all([
+      affectedPage.waitForFunction(
+        () => typeof window.__thebe_dev_apply_style === "function",
+        null,
+        { timeout: 30000 }
+      ),
+      unaffectedPage.waitForFunction(
+        () => typeof window.__thebe_dev_apply_style === "function",
+        null,
+        { timeout: 30000 }
+      )
+    ]);
+    await affectedPage.locator(".card").waitFor({ state: "attached", timeout: 30000 });
+    await unaffectedPage.waitForFunction(
+      () => document.body.textContent.includes("About page"),
+      null,
+      { timeout: 30000 }
+    );
+
+    await affectedPage.evaluate((key) => {
+      const originalApplyStyle = window.__thebe_dev_apply_style;
+      window.sessionStorage.removeItem(key);
+      window.__thebeComponentStyleApplyCount = 0;
+      window.addEventListener("beforeunload", () => {
+        const count = Number(window.sessionStorage.getItem(key) || "0");
+        window.sessionStorage.setItem(key, String(count + 1));
+      });
+      window.__thebe_dev_apply_style = function (...args) {
+        window.__thebeComponentStyleApplyCount += 1;
+        return originalApplyStyle.apply(this, args);
+      };
+      window.__thebeComponentStyleProbeToken = "component-style-affected-probe";
+    }, affectedBeforeUnloadKey);
+    await unaffectedPage.evaluate((key) => {
+      const originalApplyStyle = window.__thebe_dev_apply_style;
+      window.sessionStorage.removeItem(key);
+      window.__thebeComponentStyleApplyCount = 0;
+      window.addEventListener("beforeunload", () => {
+        const count = Number(window.sessionStorage.getItem(key) || "0");
+        window.sessionStorage.setItem(key, String(count + 1));
+      });
+      window.__thebe_dev_apply_style = function (...args) {
+        window.__thebeComponentStyleApplyCount += 1;
+        return originalApplyStyle.apply(this, args);
+      };
+      window.__thebeComponentStyleProbeToken = "component-style-unaffected-probe";
+    }, unaffectedBeforeUnloadKey);
+
+    const initialAffectedColor = await affectedPage.locator(".card").evaluate((el) => getComputedStyle(el).color);
+    fs.writeFileSync(patchFile, patchSource);
+
+    await affectedPage.waitForFunction(
+      ({ initialAffectedColor, affectedBeforeUnloadKey }) => {
+        const card = document.querySelector(".card");
+        return Boolean(
+          card &&
+            getComputedStyle(card).color !== initialAffectedColor &&
+            window.__thebeComponentStyleProbeToken === "component-style-affected-probe" &&
+            (window.sessionStorage.getItem(affectedBeforeUnloadKey) || "0") === "0" &&
+            (window.__thebeComponentStyleApplyCount || 0) >= 1
+        );
+      },
+      { initialAffectedColor, affectedBeforeUnloadKey },
+      { timeout: 30000 }
+    );
+
+    const result = {
+      affected: await affectedPage.evaluate((key) => ({
+        beforeUnloadCount: window.sessionStorage.getItem(key) || "0",
+        applyCount: window.__thebeComponentStyleApplyCount || 0,
+        probeToken: window.__thebeComponentStyleProbeToken || null,
+        computedColor: (() => {
+          const card = document.querySelector(".card");
+          return card ? getComputedStyle(card).color : null;
+        })()
+      }), affectedBeforeUnloadKey),
+      unaffected: await unaffectedPage.evaluate((key) => ({
+        beforeUnloadCount: window.sessionStorage.getItem(key) || "0",
+        applyCount: window.__thebeComponentStyleApplyCount || 0,
+        probeToken: window.__thebeComponentStyleProbeToken || null,
+        stillAbout: document.body.textContent.includes("About page"),
+        hasCard: Boolean(document.querySelector(".card"))
+      }), unaffectedBeforeUnloadKey)
+    };
+
+    console.log(JSON.stringify({
+      affectedBeforeUnloadCount: result.affected.beforeUnloadCount,
+      affectedApplyCount: result.affected.applyCount,
+      affectedColor: result.affected.computedColor,
+      affectedProbeToken: result.affected.probeToken,
+      unaffectedBeforeUnloadCount: result.unaffected.beforeUnloadCount,
+      unaffectedApplyCount: result.unaffected.applyCount,
+      unaffectedStillAbout: result.unaffected.stillAbout,
+      unaffectedHasCard: result.unaffected.hasCard,
+      unaffectedProbeToken: result.unaffected.probeToken
+    }));
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exitCode = 1;
+  } finally {
+    await context.close();
+    await browser.close();
+  }
+})();
+"#;
+
+const COMPONENT_TEMPLATE_HOTPATCH_PROBE_SCRIPT: &str = r#"
+const fs = require("node:fs");
+const { chromium } = require("playwright");
+
+const affectedUrl = "__AFFECTED_URL__";
+const unaffectedUrl = "__UNAFFECTED_URL__";
+const patchFile = process.env.THEBE_HOTPATCH_FILE;
+const patchSource = process.env.THEBE_HOTPATCH_SOURCE;
+const affectedBeforeUnloadKey = "__thebe_component_template_affected_beforeunload__";
+const unaffectedBeforeUnloadKey = "__thebe_component_template_unaffected_beforeunload__";
+
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext();
+  const affectedPage = await context.newPage();
+  const unaffectedPage = await context.newPage();
+
+  try {
+    await Promise.all([
+      affectedPage.goto(affectedUrl, { waitUntil: "domcontentloaded" }),
+      unaffectedPage.goto(unaffectedUrl, { waitUntil: "domcontentloaded" })
+    ]);
+    await Promise.all([
+      affectedPage.waitForFunction(
+        () => typeof window.__thebe_dev_refresh === "function",
+        null,
+        { timeout: 30000 }
+      ),
+      unaffectedPage.waitForFunction(
+        () => typeof window.__thebe_dev_refresh === "function",
+        null,
+        { timeout: 30000 }
+      )
+    ]);
+    await affectedPage.waitForFunction(
+      () => document.body.textContent.includes("Component before"),
+      null,
+      { timeout: 30000 }
+    );
+    await unaffectedPage.waitForFunction(
+      () => document.body.textContent.includes("About page"),
+      null,
+      { timeout: 30000 }
+    );
+
+    await affectedPage.evaluate((key) => {
+      const originalRefresh = window.__thebe_dev_refresh;
+      window.sessionStorage.removeItem(key);
+      window.__thebeComponentTemplateRefreshCount = 0;
+      window.addEventListener("beforeunload", () => {
+        const count = Number(window.sessionStorage.getItem(key) || "0");
+        window.sessionStorage.setItem(key, String(count + 1));
+      });
+      window.__thebe_dev_refresh = function (...args) {
+        window.__thebeComponentTemplateRefreshCount += 1;
+        return originalRefresh.apply(this, args);
+      };
+      window.__thebeComponentTemplateProbeToken = "component-template-affected-probe";
+    }, affectedBeforeUnloadKey);
+    await unaffectedPage.evaluate((key) => {
+      const originalRefresh = window.__thebe_dev_refresh;
+      window.sessionStorage.removeItem(key);
+      window.__thebeComponentTemplateRefreshCount = 0;
+      window.addEventListener("beforeunload", () => {
+        const count = Number(window.sessionStorage.getItem(key) || "0");
+        window.sessionStorage.setItem(key, String(count + 1));
+      });
+      window.__thebe_dev_refresh = function (...args) {
+        window.__thebeComponentTemplateRefreshCount += 1;
+        return originalRefresh.apply(this, args);
+      };
+      window.__thebeComponentTemplateProbeToken = "component-template-unaffected-probe";
+    }, unaffectedBeforeUnloadKey);
+
+    fs.writeFileSync(patchFile, patchSource);
+
+    await affectedPage.waitForFunction(
+      (affectedBeforeUnloadKey) =>
+        document.body.textContent.includes("Component after") &&
+        window.__thebeComponentTemplateProbeToken === "component-template-affected-probe" &&
+        (window.sessionStorage.getItem(affectedBeforeUnloadKey) || "0") === "0" &&
+        (window.__thebeComponentTemplateRefreshCount || 0) >= 1,
+      affectedBeforeUnloadKey,
+      { timeout: 30000 }
+    );
+
+    const result = {
+      affected: await affectedPage.evaluate((key) => ({
+        beforeUnloadCount: window.sessionStorage.getItem(key) || "0",
+        refreshCount: window.__thebeComponentTemplateRefreshCount || 0,
+        probeToken: window.__thebeComponentTemplateProbeToken || null,
+        templateSeen: document.body.textContent.includes("Component after")
+      }), affectedBeforeUnloadKey),
+      unaffected: await unaffectedPage.evaluate((key) => ({
+        beforeUnloadCount: window.sessionStorage.getItem(key) || "0",
+        refreshCount: window.__thebeComponentTemplateRefreshCount || 0,
+        probeToken: window.__thebeComponentTemplateProbeToken || null,
+        stillAbout: document.body.textContent.includes("About page"),
+        templateSeen: document.body.textContent.includes("Component after")
+      }), unaffectedBeforeUnloadKey)
+    };
+
+    console.log(JSON.stringify({
+      affectedBeforeUnloadCount: result.affected.beforeUnloadCount,
+      affectedRefreshCount: result.affected.refreshCount,
+      affectedTemplateSeen: result.affected.templateSeen,
+      affectedProbeToken: result.affected.probeToken,
+      unaffectedBeforeUnloadCount: result.unaffected.beforeUnloadCount,
+      unaffectedRefreshCount: result.unaffected.refreshCount,
+      unaffectedStillAbout: result.unaffected.stillAbout,
+      unaffectedTemplateSeen: result.unaffected.templateSeen,
+      unaffectedProbeToken: result.unaffected.probeToken
+    }));
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exitCode = 1;
+  } finally {
+    await context.close();
+    await browser.close();
+  }
+})();
+"#;
+
+const NOOP_HOTPATCH_PROBE_SCRIPT: &str = r#"
+const fs = require("node:fs");
+const { chromium } = require("playwright");
+
+const targetUrl = "__TARGET_URL__";
+const patchFile = process.env.THEBE_HOTPATCH_FILE;
+const patchSource = process.env.THEBE_HOTPATCH_SOURCE;
+const beforeUnloadKey = "__thebe_noop_beforeunload__";
+
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  try {
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      () =>
+        typeof window.__thebe_dev_refresh === "function" &&
+        typeof window.__thebe_dev_apply_style === "function",
+      null,
+      { timeout: 30000 }
+    );
+    await page.waitForFunction(
+      () => document.body.textContent.includes("Template before"),
+      null,
+      { timeout: 30000 }
+    );
+    await page.evaluate((key) => {
+      const originalRefresh = window.__thebe_dev_refresh;
+      const originalApplyStyle = window.__thebe_dev_apply_style;
+      window.sessionStorage.removeItem(key);
+      window.__thebeNoopRefreshCount = 0;
+      window.__thebeNoopApplyStyleCount = 0;
+      window.addEventListener("beforeunload", () => {
+        const count = Number(window.sessionStorage.getItem(key) || "0");
+        window.sessionStorage.setItem(key, String(count + 1));
+      });
+      window.__thebe_dev_refresh = function (...args) {
+        window.__thebeNoopRefreshCount += 1;
+        return originalRefresh.apply(this, args);
+      };
+      window.__thebe_dev_apply_style = function (...args) {
+        window.__thebeNoopApplyStyleCount += 1;
+        return originalApplyStyle.apply(this, args);
+      };
+      window.__thebeNoopProbeToken = "noop-hotpatch-probe";
+    }, beforeUnloadKey);
+
+    fs.writeFileSync(patchFile, patchSource);
+    await page.waitForTimeout(3000);
+
+    const result = await page.evaluate((key) => ({
+      beforeUnloadCount: window.sessionStorage.getItem(key) || "0",
+      refreshCount: window.__thebeNoopRefreshCount || 0,
+      applyStyleCount: window.__thebeNoopApplyStyleCount || 0,
+      templateBeforeStillVisible: document.body.textContent.includes("Template before"),
+      probeToken: window.__thebeNoopProbeToken || null
+    }), beforeUnloadKey);
+
+    console.log(JSON.stringify(result));
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exitCode = 1;
+  } finally {
+    await browser.close();
+  }
+})();
+"#;
+
+fn style_hotpatch_probe_script(port: u16) -> String {
+  STYLE_HOTPATCH_PROBE_SCRIPT.replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
+}
+
+fn layout_head_hotpatch_probe_script(port: u16) -> String {
+  LAYOUT_HEAD_HOTPATCH_PROBE_SCRIPT.replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
+}
+
+fn route_template_hotpatch_probe_script(port: u16) -> String {
+  ROUTE_TEMPLATE_HOTPATCH_PROBE_SCRIPT.replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
+}
+
+fn component_style_hotpatch_probe_script(port: u16) -> String {
+  COMPONENT_STYLE_HOTPATCH_PROBE_SCRIPT
+    .replace("__AFFECTED_URL__", &format!("http://127.0.0.1:{port}/"))
+    .replace("__UNAFFECTED_URL__", &format!("http://127.0.0.1:{port}/about"))
+}
+
+fn component_template_hotpatch_probe_script(port: u16) -> String {
+  COMPONENT_TEMPLATE_HOTPATCH_PROBE_SCRIPT
+    .replace("__AFFECTED_URL__", &format!("http://127.0.0.1:{port}/"))
+    .replace("__UNAFFECTED_URL__", &format!("http://127.0.0.1:{port}/about"))
+}
+
+fn noop_hotpatch_probe_script(port: u16) -> String {
+  NOOP_HOTPATCH_PROBE_SCRIPT.replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
+}
+
+fn workspace_root() -> PathBuf {
+  Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../..")
+    .canonicalize()
+    .expect("workspace root should resolve")
+}
+
+fn playwright_probe_supported() -> bool {
+  static PLAYWRIGHT_SUPPORTED: OnceLock<bool> = OnceLock::new();
+
+  *PLAYWRIGHT_SUPPORTED.get_or_init(|| {
+    let perf_dir = workspace_root().join("scripts/perf");
+    if !perf_dir.join("node_modules/playwright").exists() {
+      return false;
+    }
+
+    let output = Command::new("node")
+      .current_dir(&perf_dir)
+      .args([
+        "-e",
+        "const { chromium } = require('playwright'); process.stdout.write(chromium.executablePath());",
+      ])
+      .output();
+
+    match output {
+      Ok(output) if output.status.success() => {
+        let executable_path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        !executable_path.is_empty() && Path::new(&executable_path).exists()
+      }
+      _ => false,
+    }
+  })
+}
+
+fn spawn_playwright_probe(script: &str, patch_file: &Path, patch_source: &str) -> Child {
+  Command::new("node")
+    .current_dir(workspace_root().join("scripts/perf"))
+    .env("THEBE_HOTPATCH_FILE", patch_file)
+    .env("THEBE_HOTPATCH_SOURCE", patch_source)
+    .args(["-e", script])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("Playwright hotpatch probe should spawn")
+}
+
+fn assert_playwright_probe_success(
+  output: &std::process::Output,
+  hotpatch_output: &Arc<Mutex<Vec<String>>>,
+  description: &str,
+) {
+  if output.status.success() {
+    return;
+  }
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  panic!(
+    "{description} failed\nstdout:\n{stdout}\nstderr:\n{stderr}\nhotpatch output:\n{}",
+    collected_lines(hotpatch_output).join("\n")
+  );
 }
 
 fn spawn_hotpatch_process(project_root: &Path) -> ManagedChild {

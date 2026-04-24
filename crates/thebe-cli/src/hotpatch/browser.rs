@@ -173,19 +173,17 @@ async fn browser_events(
 mod tests {
   use super::{BROWSER_EVENTS_PATH, BrowserPatchServer};
   use reqwest::blocking::Client;
+  use std::net::SocketAddr;
   use std::io::{BufRead, BufReader};
   use std::sync::mpsc;
   use std::thread;
   use std::time::Duration;
 
-  #[test]
-  fn template_broadcast_without_route_pattern_should_emit_global_template_event() {
-    let server = BrowserPatchServer::spawn().expect("browser patch server should spawn");
+  fn connect_event_stream(server_addr: SocketAddr) -> (mpsc::Receiver<String>, thread::JoinHandle<()>) {
     let client = Client::builder()
       .timeout(None)
       .build()
       .expect("blocking client should build");
-    let server_addr = server.local_addr();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (line_tx, line_rx) = mpsc::channel();
 
@@ -224,20 +222,61 @@ mod tests {
       .recv_timeout(Duration::from_secs(5))
       .expect("event stream should connect before broadcast");
 
+    (line_rx, reader)
+  }
+
+  fn recv_event_pair(line_rx: &mpsc::Receiver<String>) -> (String, String) {
+    let event_line = line_rx
+      .recv_timeout(Duration::from_secs(5))
+      .expect("event should arrive");
+    let data_line = line_rx
+      .recv_timeout(Duration::from_secs(5))
+      .expect("event payload should arrive");
+    (event_line, data_line)
+  }
+
+  #[test]
+  fn template_broadcast_without_route_pattern_should_emit_global_template_event() {
+    let server = BrowserPatchServer::spawn().expect("browser patch server should spawn");
+    let server_addr = server.local_addr();
+    let (line_rx, reader) = connect_event_stream(server_addr);
+
     server.broadcast_template(None);
 
-    assert_eq!(
-      line_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("template event should arrive"),
-      "event: template"
-    );
-    assert_eq!(
-      line_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("template payload should arrive"),
-      "data: {}"
-    );
+    let (event_line, data_line) = recv_event_pair(&line_rx);
+    assert_eq!(event_line, "event: template");
+    assert_eq!(data_line, "data: {}");
+
+    let _ = reader.join();
+  }
+
+  #[test]
+  fn style_broadcast_with_route_pattern_should_emit_camel_case_payload() {
+    let server = BrowserPatchServer::spawn().expect("browser patch server should spawn");
+    let server_addr = server.local_addr();
+    let (line_rx, reader) = connect_event_stream(server_addr);
+
+    server.broadcast_style(Some("/blog/{slug}"), String::from("h1 { color: blue; }"));
+
+    let (event_line, data_line) = recv_event_pair(&line_rx);
+    assert_eq!(event_line, "event: style");
+    assert!(data_line.contains(r#""routePattern":"/blog/{slug}""#));
+    assert!(data_line.contains(r#""css":"h1 { color: blue; }""#));
+
+    let _ = reader.join();
+  }
+
+  #[test]
+  fn reload_broadcast_should_emit_reload_event_with_empty_payload() {
+    let server = BrowserPatchServer::spawn().expect("browser patch server should spawn");
+    let server_addr = server.local_addr();
+    let (line_rx, reader) = connect_event_stream(server_addr);
+
+    server.broadcast_reload();
+
+    let (event_line, data_line) = recv_event_pair(&line_rx);
+    assert_eq!(event_line, "event: reload");
+    assert_eq!(data_line, "data: {}");
 
     let _ = reader.join();
   }
