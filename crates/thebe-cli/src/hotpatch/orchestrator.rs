@@ -579,7 +579,7 @@ mod tests {
   }
 
   #[test]
-  fn plan_change_batch_should_restart_without_codegen_for_patch_candidates() {
+  fn plan_change_batch_should_restart_without_codegen_for_rust_source_changes() {
     let project_root = Path::new("/tmp/project");
     let changed_paths = vec![project_root.join("src/state.rs")];
 
@@ -589,7 +589,7 @@ mod tests {
       plan,
       ChangePlan::Restart(RestartPlan {
         refresh_codegen: false,
-        trigger: RestartTrigger::PatchCandidate,
+        trigger: RestartTrigger::RestartRequired(RestartReason::RustSource),
       })
     );
   }

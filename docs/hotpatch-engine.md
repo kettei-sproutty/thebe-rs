@@ -48,8 +48,9 @@ Current experimental behavior for `thebe dev --hotpatch`:
 2. Build and launch the development binary in a hotpatch-aware mode.
 3. Watch Thebe inputs and relevant Rust sources.
 4. Decide per change whether to patch or restart.
-5. Patch template/style-compatible changes in place and restart for unsupported changes.
-6. Emit clear diagnostics when a restart is chosen.
+5. Patch only `.trs` template, `<head>`, and style changes in place.
+6. Restart for all Rust source, `<script>`, `<script setup>`, shell, config, and dependency changes.
+7. Emit clear diagnostics when a restart is chosen.
 
 The user should not need to install or invoke a second CLI.
 
@@ -209,15 +210,16 @@ The initial implementation should bias toward restart.
 
 ### Likely Patchable
 
-1. Function body changes in route handlers.
-2. Generated Rust changes that do not alter data layout.
-3. Template or style changes that only affect generated render logic.
-4. Small internal control-flow changes within the tip crate.
+1. Route or component template changes that only affect generated render logic.
+2. Route, layout, or component `<head>` changes that only affect generated HTML assembly.
+3. Route, layout, or component style changes that only affect generated CSS artifacts.
 
 ### Restart Required
 
 1. `Cargo.toml` changes.
 2. Dependency graph changes.
+3. Any Rust source changes, including non-entry files under `src/`.
+4. Any `.trs` `<script>` or `<script setup>` changes.
 3. Changes outside the active tip crate, unless explicitly proven safe later.
 4. Struct or enum layout changes in live state.
 5. Global initialization changes.

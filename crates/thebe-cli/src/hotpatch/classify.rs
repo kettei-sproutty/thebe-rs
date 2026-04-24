@@ -25,6 +25,7 @@ pub(crate) enum RestartReason {
   ThebeConfig,
   HtmlShell,
   GeneratedInput,
+  RustSource,
   EntryPoint,
   ExternalRust,
 }
@@ -37,6 +38,7 @@ impl RestartReason {
       Self::ThebeConfig => "thebe.toml changed",
       Self::HtmlShell => "app.html changed",
       Self::GeneratedInput => "Thebe-generated input changed",
+      Self::RustSource => "Rust source changed",
       Self::EntryPoint => "application entry point changed",
       Self::ExternalRust => "Rust source outside src/ changed",
     }
@@ -259,7 +261,7 @@ fn classify_rust_path(project_root: &Path, path: &Path) -> PathAction {
     return PathAction::Restart(RestartReason::EntryPoint);
   }
 
-  PathAction::AttemptPatch
+  PathAction::Restart(RestartReason::RustSource)
 }
 
 fn is_project_root_file(path: &Path, project_root: &Path, file_name: &str) -> bool {
@@ -435,13 +437,13 @@ mod tests {
   }
 
   #[test]
-  fn classify_paths_should_attempt_patch_for_non_entry_rust_sources() {
+  fn classify_paths_should_restart_when_non_entry_rust_sources_change() {
     let project_root = Path::new("/tmp/project");
     let changed = vec![project_root.join("src/state.rs")];
 
     let action = classify_paths(project_root, &changed);
 
-    assert_eq!(action, HotpatchAction::AttemptPatch);
+    assert_eq!(action, HotpatchAction::Restart(RestartReason::RustSource));
   }
 
   #[test]
