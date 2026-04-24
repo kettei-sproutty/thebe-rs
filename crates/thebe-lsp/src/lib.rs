@@ -1120,6 +1120,24 @@ fn attribute_completion_items(
     ),
   ];
 
+  match tag_name {
+    "template" => items.push(snippet_completion_item(
+      &document.source,
+      "slot",
+      "slot=\"$1\"",
+      CompletionItemKind::PROPERTY,
+      replace,
+    )),
+    "slot" => items.push(snippet_completion_item(
+      &document.source,
+      "name",
+      "name=\"$1\"",
+      CompletionItemKind::PROPERTY,
+      replace,
+    )),
+    _ => {}
+  }
+
   items.extend(EVENT_ATTRIBUTE_COMPLETIONS.iter().map(|attribute| {
     snippet_completion_item(
       &document.source,
@@ -5032,6 +5050,54 @@ function decrement() {
 
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].label, "increment");
+  }
+
+  #[test]
+  fn attribute_completion_items_include_named_slot_attributes() {
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: "<template sl></template>\n<slot na />\n".to_owned(),
+      cached_artifacts: None,
+    };
+
+    let template_start = document.source.find("sl").expect("template attr prefix");
+    let template_items = attribute_completion_items(
+      &document,
+      "template",
+      "sl",
+      ByteRange {
+        start: template_start,
+        end: template_start + 2,
+      },
+    );
+
+    assert_eq!(template_items.len(), 1);
+    assert_eq!(template_items[0].label, "slot");
+    assert_eq!(template_items[0].kind, Some(CompletionItemKind::PROPERTY));
+    let Some(CompletionTextEdit::Edit(edit)) = template_items[0].text_edit.as_ref() else {
+      panic!("expected attribute text edit");
+    };
+    assert_eq!(edit.new_text, "slot=\"$1\"");
+
+    let slot_start = document.source.find("na").expect("slot attr prefix");
+    let slot_items = attribute_completion_items(
+      &document,
+      "slot",
+      "na",
+      ByteRange {
+        start: slot_start,
+        end: slot_start + 2,
+      },
+    );
+
+    assert_eq!(slot_items.len(), 1);
+    assert_eq!(slot_items[0].label, "name");
+    assert_eq!(slot_items[0].kind, Some(CompletionItemKind::PROPERTY));
+    let Some(CompletionTextEdit::Edit(edit)) = slot_items[0].text_edit.as_ref() else {
+      panic!("expected attribute text edit");
+    };
+    assert_eq!(edit.new_text, "name=\"$1\"");
   }
 
   #[test]

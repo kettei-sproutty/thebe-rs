@@ -459,8 +459,14 @@ pub fn generate_route(
   // CSS scoping when this route has a non-empty `<style>` block — in that
   // order so markers and scope attrs are not added to Jinja control-flow
   // tokens.
-  let known_component_names: Vec<&str> = components.iter().map(|c| c.name.as_str()).collect();
-  let component_expansion = template::expand_component_tags_with_instances(&blocks.template, &known_component_names);
+  let known_components = components
+    .iter()
+    .map(|component| template::KnownComponent {
+      name: component.name.as_str(),
+      named_slots: &component.named_slots,
+    })
+    .collect::<Vec<_>>();
+  let component_expansion = template::expand_component_tags_with_instances(&blocks.template, &known_components);
   let mut used_component_names = Vec::new();
   for instance in &component_expansion.instances {
     if !used_component_names.contains(&instance.component_name) {
@@ -1219,7 +1225,8 @@ pub struct ComponentMacro {
   /// Full `{% macro __comp_xxx(props) %}...{% endmacro %}` source.
   ///
   /// The component's HTML already has its own CSS scope attributes injected;
-  /// `<slot />` has been replaced with `{{ caller() }}`.
+  /// slot placeholders have been replaced with the corresponding caller or
+  /// named-slot bindings.
   pub jinja_macro: String,
   /// Processed and scoped CSS for this component (empty if no `<style>` block).
   pub style: String,
@@ -1227,6 +1234,8 @@ pub struct ComponentMacro {
   pub client_script: String,
   /// Top-level handler functions discovered in the component client script.
   pub event_fns: Vec<String>,
+  /// Named slots declared by the component template in source order.
+  pub named_slots: Vec<String>,
 }
 
 /// Compile a component `.trs` file into a [`ComponentMacro`] ready for use in
@@ -1256,8 +1265,21 @@ pub fn generate_component(
   // inject hydration markers and apply CSS scope attributes only when this
   // component has a non-empty `<style>` block.
   let component_style_source = blocks.style.as_deref().filter(|style| !style.trim().is_empty());
-  let template_slot_expanded = crate::template::expand_slot(&blocks.template);
-  let template_attr_bound = crate::template::inject_attr_bindings(&template_slot_expanded);
+  let slot_expansion = crate::template::expand_slot_with_metadata(&blocks.template);
+  let macro_params = if slot_expansion.named_slots.is_empty() {
+    String::from("props")
+  } else {
+    format!(
+      "props, {}",
+      slot_expansion
+        .named_slots
+        .iter()
+        .map(|slot_name| format!("{}=none", crate::template::slot_binding_name(slot_name)))
+        .collect::<Vec<_>>()
+        .join(", ")
+    )
+  };
+  let template_attr_bound = crate::template::inject_attr_bindings(&slot_expansion.template);
   let template_hydrated = crate::template::inject_hydration_markers(&template_attr_bound);
   let template_scoped = if component_style_source.is_some() {
     thebe_css::add_scope_attrs(&template_hydrated, &scope)
@@ -1266,7 +1288,7 @@ pub fn generate_component(
   };
 
   let jinja_macro = format!(
-    "{{% macro {macro_name}(props) %}}\n{template_scoped}\n{{% endmacro %}}",
+    "{{% macro {macro_name}({macro_params}) %}}\n{template_scoped}\n{{% endmacro %}}",
   );
 
   let style = if let Some(css) = component_style_source {
@@ -1291,6 +1313,7 @@ pub fn generate_component(
       .as_ref()
       .map_or_else(String::new, |module| module.js.clone()),
     event_fns: component_client.map_or_else(Vec::new, |module| module.event_fns),
+    named_slots: slot_expansion.named_slots,
   })
 }
 
@@ -1303,8 +1326,8 @@ fn instantiate_component_macro(
   instance: &template::ComponentInstance,
 ) -> String {
   let mut source = component.jinja_macro.replacen(
-    &format!("{{% macro {}(props) %}}", component.macro_name),
-    &format!("{{% macro {}(props) %}}", instance.macro_name),
+    &format!("{{% macro {}", component.macro_name),
+    &format!("{{% macro {}", instance.macro_name),
     1,
   );
   source = source.replace(
@@ -2948,6 +2971,62 @@ mod tests {
 
     assert!(dev_artifact.client_script.contains("window.__layoutProbe = \"layout-script\";"));
     assert!(generated.source.contains("let __client_script = __dev_artifact.as_ref().map_or(__CLIENT_SCRIPT"));
+  }
+
+  #[test]
+  fn generate_route_renders_named_slot_component_content() {
+    let route_blocks = SfcBlocks {
+      script_setup: Some(
+        "struct Props { title: String, body: String }\n\n#[thebe::get]\npub fn handler() -> Props { Props { title: \"Named slot\".to_owned(), body: \"Body copy\".to_owned() } }"
+          .to_owned(),
+      ),
+      template: "<Card><template slot=\"header\"><h1>{{ title }}</h1></template><p>{{ body }}</p></Card>"
+        .to_owned(),
+      ..SfcBlocks::default()
+    };
+    let component = generate_component(
+      &SfcBlocks {
+        template: "<section><header><slot name=\"header\" /></header><main><slot /></main></section>"
+          .to_owned(),
+        ..SfcBlocks::default()
+      },
+      "Card",
+      false,
+    )
+    .unwrap();
+
+    assert_eq!(component.named_slots, vec![String::from("header")]);
+    assert!(component.jinja_macro.contains("__slot_header=none"));
+
+    let generated = generate_route(
+      &route_blocks,
+      "/",
+      None,
+      default_app_html(),
+      None,
+      &[component],
+      false,
+      Some("dev-build"),
+    )
+    .unwrap();
+    let dev_artifact = generated.dev_artifact.expect("dev artifact should exist");
+
+    assert!(dev_artifact.template.contains("__comp_card_0__slot_header"));
+    assert!(dev_artifact.template.contains("__slot_header=__comp_card_0__slot_header"));
+
+    let rendered = thebe_runtime::render_template(
+      &dev_artifact.template,
+      &serde_json::json!({
+        "title": "Rendered title",
+        "body": "Rendered body"
+      }),
+    )
+    .expect("named slot template should render");
+
+    assert!(rendered.contains("Rendered title"), "{rendered}");
+    assert!(rendered.contains("Rendered body"), "{rendered}");
+    assert!(rendered.contains("<header>"), "{rendered}");
+    assert!(rendered.contains("<main>"), "{rendered}");
   }
 
   #[test]

@@ -3209,6 +3209,7 @@ dependencies = [
  "thebe-analyzer",
  "thebe-css",
  "thebe-parser",
+ "thebe-runtime",
  "thiserror 2.0.18",
 ]
 

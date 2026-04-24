@@ -17,5 +17,8 @@ serde_json = { workspace = true }
 syn = { version = "2", features = ["full"] }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+thebe-runtime = { path = "../thebe-runtime", version = "0.0.1" }
+
 [lints]
 workspace = true

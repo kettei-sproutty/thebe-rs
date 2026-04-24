@@ -1,6 +1,6 @@
 # Components
 
-> Status: standalone `src/components/**/*.trs` compilation is shipped. Components support typed `Props`, explicit Rust imports, scoped CSS, PascalCase tag expansion, and a default `<slot />`. Named slots are still planned.
+> Status: standalone `src/components/**/*.trs` compilation is shipped. Components support typed `Props`, explicit Rust imports, scoped CSS, PascalCase tag expansion, a default `<slot />`, and named `<slot name="..." />` composition.
 
 Components are reusable `.trs` files that live in the `src/components/` directory. They possess similar capabilities to route files but operate with stricter constraints to maintain application hygiene.
 
@@ -49,4 +49,24 @@ pub async fn handler() -> Props { /* ... */ }
 ## Slots
 Slots allow parents to pass HTML fragments into children.
 - **Scope Ownership:** Slot content fundamentally belongs to the **parent's** reactivity scope. Any bindings within the passed slot resolve against the parent's `getProps()`, not the child's.
-- **Named Slots:** Still planned. Today the shipped component slot surface is the default `<slot />` only.
+- **Default Slot:** Child content that is not wrapped in a named slot template renders through `<slot />`.
+- **Named Slots:** Components can expose `<slot name="header" />`-style placeholders. Parents fill them with immediate `<template slot="header">...</template>` children.
+
+```html
+<!-- src/components/Card.trs -->
+<section class="card">
+  <header><slot name="header" /></header>
+  <main><slot /></main>
+</section>
+```
+
+```html
+<!-- src/routes/index.trs -->
+<Card>
+  <template slot="header">
+    <h1>{{ title }}</h1>
+  </template>
+
+  <p>{{ body }}</p>
+</Card>
+```

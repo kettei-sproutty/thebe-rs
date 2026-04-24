@@ -483,7 +483,10 @@ pub enum TemplateToken<'a> {
     name: &'a str,
   },
   /// A `<slot>`, `<slot/>`, or `<slot />` placeholder.
-  Slot,
+  Slot {
+    /// Optional named slot target from `name="..."`.
+    name: Option<&'a str>,
+  },
 }
 
 /// Tokenize a Thebe HTML template string into a flat stream of tokens.
@@ -575,14 +578,89 @@ fn try_parse_component_or_slot_tag(input: &str) -> Option<(TemplateToken<'_>, us
 
   // `<slot>` / `<slot />` / `<slot/>` — case-insensitive
   if name.eq_ignore_ascii_case("slot") {
-    while i < bytes.len() && bytes[i] != b'>' {
-      i += 1;
+    let mut slot_name = None;
+
+    loop {
+      while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+      }
+      if i >= bytes.len() {
+        return None;
+      }
+
+      match bytes[i] {
+        b'>' => {
+          i += 1;
+          break;
+        }
+        b'/' if bytes.get(i + 1) == Some(&b'>') => {
+          i += 2;
+          break;
+        }
+        _ => {}
+      }
+
+      let attr_name_start = i;
+      while i < bytes.len()
+        && !bytes[i].is_ascii_whitespace()
+        && bytes[i] != b'='
+        && bytes[i] != b'>'
+        && !(bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'>'))
+      {
+        i += 1;
+      }
+      if i == attr_name_start {
+        return None;
+      }
+      let attr_name = &input[attr_name_start..i];
+
+      while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+      }
+
+      let value = if bytes.get(i) == Some(&b'=') {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+          i += 1;
+        }
+        if i >= bytes.len() {
+          return None;
+        }
+
+        if matches!(bytes[i], b'"' | b'\'') {
+          let quote = bytes[i];
+          i += 1;
+          let val_start = i;
+          while i < bytes.len() && bytes[i] != quote {
+            i += 1;
+          }
+          if i >= bytes.len() {
+            return None;
+          }
+          let val = &input[val_start..i];
+          i += 1;
+          Some(val)
+        } else {
+          let val_start = i;
+          while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'>'
+            && !(bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'>'))
+          {
+            i += 1;
+          }
+          Some(&input[val_start..i])
+        }
+      } else {
+        None
+      };
+
+      if attr_name.eq_ignore_ascii_case("name") {
+        slot_name = value;
+      }
     }
-    if i >= bytes.len() {
-      return None;
-    }
-    i += 1;
-    return Some((TemplateToken::Slot, i));
+
+    return Some((TemplateToken::Slot { name: slot_name }, i));
   }
 
   // Must start with ASCII uppercase for a PascalCase component.
@@ -737,6 +815,16 @@ h1 { color: red; }
       .map(|span| &input[span.start..span.end])
       .collect::<String>();
     assert_eq!(reconstructed, input);
+  }
+
+  #[test]
+  fn tokenize_template_preserves_named_slot_names() {
+    let tokens = tokenize_template(r#"<Card><slot name="header" /><slot /></Card>"#);
+
+    assert!(matches!(tokens[0], TemplateToken::ComponentOpen { name: "Card", .. }));
+    assert!(matches!(tokens[1], TemplateToken::Slot { name: Some("header") }));
+    assert!(matches!(tokens[2], TemplateToken::Slot { name: None }));
+    assert!(matches!(tokens[3], TemplateToken::ComponentClose { name: "Card" }));
   }
 
   #[test]

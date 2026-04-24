@@ -7,6 +7,7 @@ This page tracks what is actually implemented in the repository today versus wha
 - HTML-aware `.trs` parsing in `crates/thebe-parser`.
 - Route compilation in `crates/thebe-codegen`.
 - Standalone component compilation in `src/components/**/*.trs`.
+- Component slots, including default `<slot />` content and named `<slot name="..." />` composition.
 - SSR rendering through `crates/thebe-runtime`.
 - Scoped CSS through `crates/thebe-css`.
 - File-system routing for `src/routes/**/*.trs`.
@@ -41,7 +42,7 @@ This page tracks what is actually implemented in the repository today versus wha
 
 ## Planned Or Missing
 
-- Named slot composition outside route layouts is still planned.
+- The hotpatch docs still describe broader long-term engine work beyond the narrower shipped dev loop.
 
 ## Reading The Docs Safely
 
@@ -49,4 +50,4 @@ Some pages in this doc set describe the intended Thebe model, not only the shipp
 
 - routes, layouts, SSR, hydration, scoped CSS, `.thebe` artifacts, the current LSP, and the initial editor extension assets are real
 - standalone component compilation and runtime dynamic attribute support are shipped
-- named slots are not shipped yet, and the hotpatch docs still describe broader long-term engine work beyond the narrower shipped dev loop
+- named slots are shipped, and the hotpatch docs still describe broader long-term engine work beyond the narrower shipped dev loop

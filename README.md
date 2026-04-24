@@ -10,9 +10,9 @@ The goal is not to replace Axum with a separate platform. The goal is to keep Ru
 
 ## Status
 
-Thebe is past the server-only proof-of-concept stage. The repository already ships the core route pipeline: `.trs` parsing, SSR, scoped CSS, client hydration, generated `.thebe/` tooling artifacts, a compiler-backed LSP, initial editor packages for VS Code and tree-sitter, and a supported opt-in hotpatch dev loop.
+Thebe is past the server-only proof-of-concept stage. The repository already ships the core route pipeline: `.trs` parsing, SSR, scoped CSS, client hydration, generated `.thebe/` tooling artifacts, a compiler-backed LSP, initial editor packages for VS Code and tree-sitter, named component slots, and a supported opt-in hotpatch dev loop.
 
-What is still missing is the remaining narrower surface: named slots and deeper editor/tree-sitter polish.
+What is still missing is the remaining narrower surface: deeper editor/tree-sitter polish.
 
 For a repo-accurate view of shipped versus planned work, see [docs/status.md](docs/status.md) and [docs/editor-tooling.md](docs/editor-tooling.md).
 
@@ -318,9 +318,7 @@ The client runtime scans raw `on*` attributes after mount, attaches real event l
 
 ## Components
 
-General `src/components/**/*.trs` compilation is part of the current compiler. Components compile into server-side modules, expand into Minijinja macros during route generation, support typed `Props`, and support a default `<slot />` for child content.
-
-Named slots are still planned and are not part of the shipped compiler surface today.
+General `src/components/**/*.trs` compilation is part of the current compiler. Components compile into server-side modules, expand into Minijinja macros during route generation, support typed `Props`, and support both default and named slots for child content.
 
 ### Component Props (The `Props` trait)
 To define what a component accepts, declare a generic `Props` struct in a standard `<script>` block. This code is compiled into the server-side module for the component.
@@ -370,21 +368,21 @@ use crate::components::Card;
 
 **Named slots:**
 
-Planned, not shipped yet.
-
 ```html
 <Layout>
-  <thebe:slot name="header">
+  <template slot="header">
     <h1>{{ props.title }}</h1>
-  </thebe:slot>
+  </template>
 
   <p>Main content</p>
 
-  <thebe:slot name="footer">
+  <template slot="footer">
     <small>© 2026</small>
-  </thebe:slot>
+  </template>
 </Layout>
 ```
+
+Components expose named insertion points with `<slot name="header" />`-style placeholders. Parents fill them with immediate `<template slot="header">...</template>` children; any unwrapped child content still flows through the default `<slot />`.
 
 Default slot content belongs to the **parent's reactivity scope**: reactive variables from the parent are available inside slot content.
 
@@ -534,7 +532,6 @@ Shipped today:
 
 Still missing:
 
-- Named slot composition in components.
 - Deeper polish on the initial formatter, rename surface, and tree-sitter grammar.
 
 The detailed breakdown lives in [docs/status.md](docs/status.md) and [docs/editor-tooling.md](docs/editor-tooling.md).

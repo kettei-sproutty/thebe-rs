@@ -329,6 +329,18 @@ pub struct ComponentExpansion {
   pub instances: Vec<ComponentInstance>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownComponent<'a> {
+  pub name: &'a str,
+  pub named_slots: &'a [String],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotExpansion {
+  pub template: String,
+  pub named_slots: Vec<String>,
+}
+
 // ── Dynamic attribute bindings (:attr="key") ────────────────────────────────
 
 /// Transform a Thebe template so that each `:attr="key"` binding on a plain
@@ -692,15 +704,35 @@ fn prefix_event_handler_expr(expr: &str, event_fns: &[String], prefix: &str) -> 
 ///
 /// Used when building a component's `{% macro %}` body so that child content
 /// passed via `{% call %}` blocks is rendered in the right position.
+#[cfg_attr(not(test), expect(dead_code, reason = "compat wrapper for callers that only need expanded slot text"))]
 pub fn expand_slot(template: &str) -> String {
+  expand_slot_with_metadata(template).template
+}
+
+pub fn expand_slot_with_metadata(template: &str) -> SlotExpansion {
   use thebe_parser::{TemplateToken, tokenize_template};
 
   let tokens = tokenize_template(template);
   let mut out = String::with_capacity(template.len());
+  let mut named_slots = Vec::new();
   for token in tokens {
     match token {
       TemplateToken::Text(s) => out.push_str(s),
-      TemplateToken::Slot => out.push_str("{{ caller() if caller is defined else '' }}"),
+      TemplateToken::Slot { name } => {
+        if let Some(name) = name {
+          if !named_slots.iter().any(|existing| existing == name) {
+            named_slots.push(name.to_owned());
+          }
+          let binding = slot_binding_name(name);
+          write!(
+            out,
+            "{{{{ {binding}() if {binding} is not none else '' }}}}"
+          )
+          .expect("infallible");
+        } else {
+          out.push_str("{{ caller() if caller is defined else '' }}");
+        }
+      }
       // Nested components inside a component — pass through as raw HTML for now.
       TemplateToken::ComponentOpen {
         name,
@@ -727,7 +759,23 @@ pub fn expand_slot(template: &str) -> String {
       }
     }
   }
-  out
+
+  SlotExpansion {
+    template: out,
+    named_slots,
+  }
+}
+
+pub fn slot_binding_name(slot_name: &str) -> String {
+  let mut binding = String::from("__slot_");
+  for ch in slot_name.chars() {
+    if ch.is_ascii_alphanumeric() || ch == '_' {
+      binding.push(ch);
+    } else {
+      binding.push('_');
+    }
+  }
+  binding
 }
 
 /// Build a Minijinja dict-literal string from component tag attributes.
@@ -786,46 +834,82 @@ pub fn list_used_component_names(template: &str, known_names: &[&str]) -> Vec<St
 /// definitions prepended — the caller is responsible for prepending them.
 #[expect(dead_code, reason = "compat wrapper for callers that only need expanded template text")]
 pub fn expand_component_tags(template: &str, known_names: &[&str]) -> String {
-  expand_component_tags_with_instances(template, known_names).template
+  let known_components = known_names
+    .iter()
+    .copied()
+    .map(|name| KnownComponent {
+      name,
+      named_slots: &[],
+    })
+    .collect::<Vec<_>>();
+  expand_component_tags_with_instances(template, &known_components).template
 }
 
 pub fn expand_component_tags_with_instances(
   template: &str,
-  known_names: &[&str],
+  known_components: &[KnownComponent<'_>],
 ) -> ComponentExpansion {
-  use thebe_parser::{TemplateToken, tokenize_template};
-
-  if known_names.is_empty() {
+  if known_components.is_empty() {
     return ComponentExpansion {
       template: template.to_owned(),
       instances: Vec::new(),
     };
   }
 
-  let tokens = tokenize_template(template);
-  let mut out = String::with_capacity(template.len() + 256);
   let mut instances = Vec::new();
   let mut instance_idx = 0usize;
+  let template = expand_component_tags_with_instances_impl(
+    template,
+    known_components,
+    &mut instances,
+    &mut instance_idx,
+  );
 
-  for token in tokens {
-    match token {
-      TemplateToken::Text(s) => out.push_str(s),
-      TemplateToken::Slot => out.push_str("<slot />"),
+  ComponentExpansion { template, instances }
+}
+
+fn expand_component_tags_with_instances_impl(
+  template: &str,
+  known_components: &[KnownComponent<'_>],
+  instances: &mut Vec<ComponentInstance>,
+  instance_idx: &mut usize,
+) -> String {
+  use thebe_parser::{TemplateToken, tokenize_template};
+
+  let tokens = tokenize_template(template);
+  let mut out = String::with_capacity(template.len() + 256);
+  let mut token_idx = 0usize;
+
+  while token_idx < tokens.len() {
+    match &tokens[token_idx] {
+      TemplateToken::Text(text) => out.push_str(text),
+      TemplateToken::Slot { name } => {
+        if let Some(name) = name {
+          write!(out, r#"<slot name="{name}" />"#).expect("infallible");
+        } else {
+          out.push_str("<slot />");
+        }
+      }
       TemplateToken::ComponentOpen {
         name,
         attrs,
         self_closing,
       } => {
-        if known_names.contains(&name) {
-          let instance_id = format!("c{instance_idx}");
-          let macro_name = format!("__comp_{}_{}", name.to_lowercase(), instance_idx);
-          let props_dict = build_jinja_props(&attrs);
+        if let Some(component) = known_components
+          .iter()
+          .copied()
+          .find(|component| component.name == *name)
+        {
+          let current_instance_idx = *instance_idx;
+          let instance_id = format!("c{current_instance_idx}");
+          let macro_name = format!("__comp_{}_{}", name.to_lowercase(), current_instance_idx);
+          let props_dict = build_jinja_props(attrs);
           instances.push(ComponentInstance {
-            component_name: name.to_owned(),
+            component_name: (*name).to_owned(),
             macro_name: macro_name.clone(),
             instance_id,
             attrs: attrs
-              .into_iter()
+              .iter()
               .map(|attr| ComponentInstanceAttr {
                 name: attr.name.trim_start_matches(':').to_owned(),
                 value: attr.value.map(str::to_owned),
@@ -833,45 +917,348 @@ pub fn expand_component_tags_with_instances(
               })
               .collect(),
           });
-          instance_idx += 1;
-          if self_closing {
-            write!(out, "{{{{ {macro_name}({props_dict}) }}}}")
-              .expect("infallible");
+          *instance_idx += 1;
+
+          if *self_closing {
+            write!(out, "{{{{ {macro_name}({props_dict}) }}}}").expect("infallible");
           } else {
-            write!(out, "{{% call {macro_name}({props_dict}) %}}").expect("infallible");
+            let Some(close_idx) = find_matching_component_close(&tokens, token_idx, name) else {
+              out.push_str(&render_component_open_tag(name, attrs, *self_closing));
+              token_idx += 1;
+              continue;
+            };
+
+            let inner = tokens[token_idx + 1..close_idx]
+              .iter()
+              .map(token_to_source)
+              .collect::<String>();
+            let extracted_slots = extract_component_slots(&inner, component.named_slots);
+            let default_content = expand_component_tags_with_instances_impl(
+              &extracted_slots.default_content,
+              known_components,
+              instances,
+              instance_idx,
+            );
+            let mut named_slot_args = String::new();
+
+            for named_slot in extracted_slots.named_slots {
+              let binding = slot_binding_name(&named_slot.name);
+              let slot_macro_name = format!("{macro_name}{binding}");
+              let slot_content = expand_component_tags_with_instances_impl(
+                &named_slot.content,
+                known_components,
+                instances,
+                instance_idx,
+              );
+              write!(
+                out,
+                "{{% macro {slot_macro_name}() %}}{slot_content}{{% endmacro %}}"
+              )
+              .expect("infallible");
+              write!(named_slot_args, ", {binding}={slot_macro_name}").expect("infallible");
+            }
+
+            if default_content.trim().is_empty() {
+              write!(out, "{{{{ {macro_name}({props_dict}{named_slot_args}) }}}}")
+                .expect("infallible");
+            } else {
+              write!(
+                out,
+                "{{% call {macro_name}({props_dict}{named_slot_args}) %}}{default_content}{{% endcall %}}"
+              )
+              .expect("infallible");
+            }
+            token_idx = close_idx;
           }
         } else {
-          // Unknown / unregistered PascalCase tag — pass through as raw HTML.
-          out.push('<');
-          out.push_str(name);
-          for attr in &attrs {
-            out.push(' ');
-            out.push_str(attr.name);
-            if let Some(val) = attr.value {
-              write!(out, "=\"{val}\"").expect("infallible");
-            }
-          }
-          if self_closing {
-            out.push_str(" />");
-          } else {
-            out.push('>');
-          }
+          out.push_str(&render_component_open_tag(name, attrs, *self_closing));
         }
       }
       TemplateToken::ComponentClose { name } => {
-        if known_names.contains(&name) {
-          out.push_str("{% endcall %}");
-        } else {
-          write!(out, "</{name}>").expect("infallible");
-        }
+        write!(out, "</{name}>").expect("infallible");
       }
+    }
+
+    token_idx += 1;
+  }
+
+  out
+}
+
+fn render_component_open_tag(
+  name: &str,
+  attrs: &[thebe_parser::TemplateAttr<'_>],
+  self_closing: bool,
+) -> String {
+  let mut out = String::new();
+  out.push('<');
+  out.push_str(name);
+  for attr in attrs {
+    out.push(' ');
+    out.push_str(attr.name);
+    if let Some(val) = attr.value {
+      write!(out, "=\"{val}\"").expect("infallible");
+    }
+  }
+  if self_closing {
+    out.push_str(" />");
+  } else {
+    out.push('>');
+  }
+  out
+}
+
+fn token_to_source(token: &thebe_parser::TemplateToken<'_>) -> String {
+  match token {
+    thebe_parser::TemplateToken::Text(text) => (*text).to_owned(),
+    thebe_parser::TemplateToken::Slot { name } => name.map_or_else(
+      || String::from("<slot />"),
+      |name| format!(r#"<slot name="{name}" />"#),
+    ),
+    thebe_parser::TemplateToken::ComponentOpen {
+      name,
+      attrs,
+      self_closing,
+    } => render_component_open_tag(name, attrs, *self_closing),
+    thebe_parser::TemplateToken::ComponentClose { name } => format!("</{name}>"),
+  }
+}
+
+fn find_matching_component_close(
+  tokens: &[thebe_parser::TemplateToken<'_>],
+  open_idx: usize,
+  component_name: &str,
+) -> Option<usize> {
+  let mut depth = 0usize;
+
+  for (idx, token) in tokens.iter().enumerate().skip(open_idx + 1) {
+    match token {
+      thebe_parser::TemplateToken::ComponentOpen {
+        name,
+        self_closing,
+        ..
+      } if *name == component_name && !self_closing => depth += 1,
+      thebe_parser::TemplateToken::ComponentClose { name } if *name == component_name => {
+        if depth == 0 {
+          return Some(idx);
+        }
+        depth -= 1;
+      }
+      _ => {}
     }
   }
 
-  ComponentExpansion {
-    template: out,
-    instances,
+  None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractedNamedSlot {
+  name: String,
+  content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractedComponentSlots {
+  default_content: String,
+  named_slots: Vec<ExtractedNamedSlot>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedHtmlTag {
+  start: usize,
+  end: usize,
+  name: String,
+  attrs: Vec<(String, Option<String>)>,
+  is_closing: bool,
+  self_closing: bool,
+}
+
+fn extract_component_slots(content: &str, allowed_named_slots: &[String]) -> ExtractedComponentSlots {
+  if allowed_named_slots.is_empty() {
+    return ExtractedComponentSlots {
+      default_content: content.to_owned(),
+      named_slots: Vec::new(),
+    };
   }
+
+  let mut default_content = String::new();
+  let mut named_slots = Vec::new();
+  let mut idx = 0usize;
+  let mut segment_start = 0usize;
+  let mut depth = 0usize;
+
+  while idx < content.len() {
+    let Some(tag) = parse_html_tag_at(content, idx) else {
+      let ch = content[idx..]
+        .chars()
+        .next()
+        .expect("char boundary should yield a character");
+      idx += ch.len_utf8();
+      continue;
+    };
+
+    if depth == 0
+      && !tag.is_closing
+      && tag.name.eq_ignore_ascii_case("template")
+      && let Some(slot_name) = tag.attrs.iter().find_map(|(name, value)| {
+        (name == "slot").then_some(value.as_deref()).flatten()
+      })
+      && allowed_named_slots.iter().any(|allowed| allowed == slot_name)
+      && let Some((inner_start, wrapper_end, inner_end)) = find_template_wrapper_bounds(content, &tag)
+    {
+      default_content.push_str(&content[segment_start..tag.start]);
+      push_named_slot(&mut named_slots, slot_name, content[inner_start..inner_end].trim());
+      idx = wrapper_end;
+      segment_start = wrapper_end;
+      continue;
+    }
+
+    if !tag.is_closing && !tag.self_closing && !is_void_html_element(&tag.name) {
+      depth += 1;
+    } else if tag.is_closing && depth > 0 {
+      depth -= 1;
+    }
+    idx = tag.end;
+  }
+
+  default_content.push_str(&content[segment_start..]);
+
+  ExtractedComponentSlots {
+    default_content,
+    named_slots,
+  }
+}
+
+fn push_named_slot(named_slots: &mut Vec<ExtractedNamedSlot>, name: &str, content: &str) {
+  if let Some(existing) = named_slots.iter_mut().find(|slot| slot.name == name) {
+    existing.content.push_str(content);
+    return;
+  }
+
+  named_slots.push(ExtractedNamedSlot {
+    name: name.to_owned(),
+    content: content.to_owned(),
+  });
+}
+
+fn find_template_wrapper_bounds(content: &str, open_tag: &ParsedHtmlTag) -> Option<(usize, usize, usize)> {
+  let mut idx = open_tag.end;
+  let mut depth = 1usize;
+
+  while idx < content.len() {
+    let Some(tag) = parse_html_tag_at(content, idx) else {
+      let ch = content[idx..].chars().next()?;
+      idx += ch.len_utf8();
+      continue;
+    };
+
+    if tag.name.eq_ignore_ascii_case("template") {
+      if tag.is_closing {
+        depth -= 1;
+        if depth == 0 {
+          return Some((open_tag.end, tag.end, tag.start));
+        }
+      } else if !tag.self_closing {
+        depth += 1;
+      }
+    }
+
+    idx = tag.end;
+  }
+
+  None
+}
+
+fn parse_html_tag_at(content: &str, start: usize) -> Option<ParsedHtmlTag> {
+  if !content[start..].starts_with('<') {
+    return None;
+  }
+
+  let bytes = content.as_bytes();
+  let mut idx = start + 1;
+  if idx >= bytes.len() || matches!(bytes[idx], b'!' | b'?') {
+    return None;
+  }
+
+  while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+    idx += 1;
+  }
+
+  let is_closing = bytes.get(idx) == Some(&b'/');
+  if is_closing {
+    idx += 1;
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+      idx += 1;
+    }
+  }
+
+  let name_start = idx;
+  while idx < bytes.len()
+    && (bytes[idx].is_ascii_alphanumeric() || matches!(bytes[idx], b'-' | b'_'))
+  {
+    idx += 1;
+  }
+  if idx == name_start {
+    return None;
+  }
+
+  let name = content[name_start..idx].to_owned();
+  let attrs_start = idx;
+  let mut in_quote = None;
+  while idx < bytes.len() {
+    match in_quote {
+      Some(quote) if bytes[idx] == quote => in_quote = None,
+      None if matches!(bytes[idx], b'"' | b'\'') => in_quote = Some(bytes[idx]),
+      None if bytes[idx] == b'>' => break,
+      _ => {}
+    }
+    idx += 1;
+  }
+  if idx >= bytes.len() {
+    return None;
+  }
+
+  let end = idx + 1;
+  let self_closing = !is_closing && content[start..end].trim_end().ends_with("/>");
+  let attrs = if is_closing {
+    Vec::new()
+  } else {
+    let attrs_raw = if self_closing {
+      &content[attrs_start..end - 2]
+    } else {
+      &content[attrs_start..end - 1]
+    };
+    parse_tag_attrs(attrs_raw)
+  };
+
+  Some(ParsedHtmlTag {
+    start,
+    end,
+    name,
+    attrs,
+    is_closing,
+    self_closing,
+  })
+}
+
+fn is_void_html_element(name: &str) -> bool {
+  matches!(
+    name,
+    "area"
+      | "base"
+      | "br"
+      | "col"
+      | "embed"
+      | "hr"
+      | "img"
+      | "input"
+      | "link"
+      | "meta"
+      | "param"
+      | "source"
+      | "track"
+      | "wbr"
+  )
 }
 
 #[cfg(test)]
@@ -890,9 +1277,19 @@ mod tests {
 
   #[test]
   fn expand_component_tags_with_instances_tracks_component_use_sites() {
+    let known_components = [
+      KnownComponent {
+        name: "Card",
+        named_slots: &[],
+      },
+      KnownComponent {
+        name: "Badge",
+        named_slots: &[],
+      },
+    ];
     let expansion = expand_component_tags_with_instances(
       r#"<Card :title="name" count><Badge label="x" /></Card>"#,
-      &["Card", "Badge"],
+      &known_components,
     );
 
     assert!(expansion.template.contains("__comp_card_0({\"title\": name, \"count\": true})"));
@@ -980,6 +1377,47 @@ mod tests {
     let out = expand_slot("<div><slot /></div>");
 
     assert_eq!(out, "<div>{{ caller() if caller is defined else '' }}</div>");
+  }
+
+  #[test]
+  fn expand_slot_collects_named_slot_placeholders() {
+    let expansion = expand_slot_with_metadata(
+      r#"<article><slot name="header" /><slot /><slot name="actions" /></article>"#,
+    );
+
+    assert_eq!(
+      expansion.template,
+      "<article>{{ __slot_header() if __slot_header is not none else '' }}{{ caller() if caller is defined else '' }}{{ __slot_actions() if __slot_actions is not none else '' }}</article>"
+    );
+    assert_eq!(expansion.named_slots, vec![String::from("header"), String::from("actions")]);
+  }
+
+  #[test]
+  fn expand_component_tags_with_instances_routes_named_slot_templates() {
+    let named_slots = vec![String::from("header")];
+    let expansion = expand_component_tags_with_instances(
+      r#"<Card><template slot="header"><h1>{{ title }}</h1></template><p>{{ body }}</p></Card>"#,
+      &[KnownComponent {
+        name: "Card",
+        named_slots: &named_slots,
+      }],
+    );
+
+    assert!(
+      expansion
+        .template
+        .contains("{% macro __comp_card_0__slot_header() %}<h1>{{ title }}</h1>{% endmacro %}"),
+      "{}",
+      expansion.template
+    );
+    assert!(
+      expansion
+        .template
+        .contains("{% call __comp_card_0({}, __slot_header=__comp_card_0__slot_header) %}"),
+      "{}",
+      expansion.template
+    );
+    assert!(expansion.template.contains("<p>{{ body }}</p>{% endcall %}"), "{}", expansion.template);
   }
 
   // ── inject_hydration_markers ────────────────────────────────────────────
