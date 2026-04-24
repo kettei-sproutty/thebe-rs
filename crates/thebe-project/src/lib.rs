@@ -409,6 +409,7 @@ pub fn generate_project_with_overlay(
           .with_context(|| format!("failed to create {}", parent.display()))?;
       }
       let artifact_json = serde_json::json!({
+        "client_script": dev_artifact.client_script,
         "head_template": dev_artifact.head_template,
         "layout_template": dev_artifact.layout_template,
         "style": dev_artifact.style,
@@ -2500,6 +2501,7 @@ button {
     assert!(dev_source.contains("Responsibilities:"));
     assert!(dev_source.contains("console.log(\"dead\")"));
     assert!(dev_source.contains("function increment() {"));
+    assert!(dev_artifact.contains("function increment()"));
     assert!(dev_artifact.contains("color: red;"));
 
     assert!(prod_source.contains("/.thebe/assets/thebe-"));

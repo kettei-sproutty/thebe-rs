@@ -152,9 +152,10 @@ fn classify_trs_path(project_root: &Path, snapshots: &SourceSnapshots, path: &Pa
         None => return PathAction::Restart(RestartReason::GeneratedInput),
       };
 
+      let client_script_changed = previous_blocks.script_ts != current_blocks.script_ts;
       let restart_change = previous_blocks.script != current_blocks.script
         || previous_blocks.script_setup != current_blocks.script_setup
-        || previous_blocks.script_ts != current_blocks.script_ts;
+        || (client_script_changed && !path_supports_client_script_hotpatch(project_root, path));
 
       if restart_change {
         PathAction::Restart(RestartReason::GeneratedInput)
@@ -183,22 +184,31 @@ pub(crate) fn trs_patch_kind_with_snapshots(
     None => return None,
   };
 
+  let client_script_changed = previous_blocks.script_ts != current_blocks.script_ts;
   let restart_change = previous_blocks.script != current_blocks.script
     || previous_blocks.script_setup != current_blocks.script_setup
-    || previous_blocks.script_ts != current_blocks.script_ts;
+    || (client_script_changed && !path_supports_client_script_hotpatch(project_root, path));
   let style_changed = previous_blocks.style != current_blocks.style;
   let template_like_change = previous_blocks.head != current_blocks.head
     || previous_blocks.template != current_blocks.template;
 
   if restart_change {
     None
-  } else if style_changed && !template_like_change {
+  } else if style_changed && !template_like_change && !client_script_changed {
     Some(TrsPatchKind::StyleOnly)
-  } else if style_changed || template_like_change {
+  } else if style_changed || template_like_change || client_script_changed {
     Some(TrsPatchKind::TemplateLike)
   } else {
     None
   }
+}
+
+fn path_supports_client_script_hotpatch(project_root: &Path, path: &Path) -> bool {
+  let routes_dir = project_root.join("src").join("routes");
+
+  path.starts_with(&routes_dir)
+    && path.extension().is_some_and(|extension| extension == "trs")
+    && path.file_name().is_none_or(|file_name| file_name != "_layout.trs")
 }
 
 fn load_snapshot_blocks_from_snapshots(
@@ -372,6 +382,55 @@ mod tests {
     let action = classify_paths(&project_root, &[layout_path]);
 
     assert_eq!(action, HotpatchAction::AttemptPatch);
+
+    let _ = fs::remove_dir_all(project_root);
+  }
+
+  #[test]
+  fn classify_paths_should_attempt_patch_when_route_client_script_changes() {
+    let project_root = temp_project_root("patch-route-client-script");
+    let route_path = project_root.join("src/routes/index.trs");
+
+    write_snapshot(
+      &project_root,
+      &route_path,
+      "<script setup>fn index() -> Props { Props {} }</script>\n<script lang=\"ts\">window.__probe = \"before\";</script>\n<div>same</div>",
+    );
+    fs::write(
+      &route_path,
+      "<script setup>fn index() -> Props { Props {} }</script>\n<script lang=\"ts\">window.__probe = \"after\";</script>\n<div>same</div>",
+    )
+    .expect("current route should write");
+
+    let action = classify_paths(&project_root, &[route_path]);
+
+    assert_eq!(action, HotpatchAction::AttemptPatch);
+
+    let _ = fs::remove_dir_all(project_root);
+  }
+
+  #[test]
+  fn classify_paths_should_restart_when_component_client_script_changes() {
+    let project_root = temp_project_root("restart-component-client-script");
+    let component_path = project_root.join("src/components/Card.trs");
+
+    write_snapshot(
+      &project_root,
+      &component_path,
+      "<script>pub struct Props {}</script>\n<script lang=\"ts\">window.__probe = \"before\";</script>\n<div>same</div>",
+    );
+    fs::write(
+      &component_path,
+      "<script>pub struct Props {}</script>\n<script lang=\"ts\">window.__probe = \"after\";</script>\n<div>same</div>",
+    )
+    .expect("current component should write");
+
+    let action = classify_paths(&project_root, &[component_path]);
+
+    assert_eq!(
+      action,
+      HotpatchAction::Restart(RestartReason::GeneratedInput)
+    );
 
     let _ = fs::remove_dir_all(project_root);
   }

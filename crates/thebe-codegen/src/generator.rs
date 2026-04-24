@@ -210,6 +210,7 @@ pub struct GeneratedRoute {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevRouteArtifact {
+  pub client_script: String,
   pub head_template: String,
   pub layout_template: Option<String>,
   pub relative_path: String,
@@ -556,6 +557,7 @@ pub fn generate_route(
 
   let route_path_literal = escape_rust_raw_str(route_path);
   let dev_artifact = dev_build_id.filter(|_| !minify).map(|_| DevRouteArtifact {
+    client_script: client_script_str.clone(),
     head_template: merged_head.html_template.clone(),
     layout_template: layout_template.clone(),
     relative_path: dev_route_artifact_relative_path(route_path),
@@ -766,6 +768,7 @@ fn write_support_fns(source: &mut String, type_bridge_enabled: bool) {
   );
   source.push_str("#[derive(serde::Deserialize)]\n");
   source.push_str("struct __ThebeDevRouteArtifact {\n");
+  source.push_str("    client_script: String,\n");
   source.push_str("    head_template: String,\n");
   source.push_str("    layout_template: Option<String>,\n");
   source.push_str("    style: String,\n");
@@ -868,6 +871,7 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
   }
   source.push_str(wrapper.call);
   source.push_str("    let __dev_artifact = __thebe_load_dev_route_artifact()?;\n");
+  source.push_str("    let __client_script = __dev_artifact.as_ref().map_or(__CLIENT_SCRIPT, |artifact| artifact.client_script.as_str());\n");
   source.push_str("    let __title_template = __dev_artifact.as_ref().map_or(__TITLE_TEMPLATE, |artifact| artifact.title_template.as_str());\n");
   source.push_str("    let __head_template = __dev_artifact.as_ref().map_or(__HEAD_TEMPLATE, |artifact| artifact.head_template.as_str());\n");
   source.push_str("    let __template = __dev_artifact.as_ref().map_or(__TEMPLATE, |artifact| artifact.template.as_str());\n");
@@ -930,7 +934,7 @@ fn write_html_assembly(source: &mut String) {
   source.push_str("        props_json = __props_json,\n");
   source.push_str("        dev_reload = __dev_reload,\n");
   source.push_str("        runtime = __CLIENT_RUNTIME,\n");
-  source.push_str("        user_script = __CLIENT_SCRIPT,\n");
+  source.push_str("        user_script = __client_script,\n");
   source.push_str(
     r##"    )
     } else if __CLIENT_SCRIPT_ASSET_URL.is_empty() {
@@ -979,6 +983,7 @@ fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<
   }
   source.push_str(wrapper.call);
   source.push_str("    let __dev_artifact = __thebe_load_dev_route_artifact()?;\n");
+  source.push_str("    let __client_script = __dev_artifact.as_ref().map_or(__CLIENT_SCRIPT, |artifact| artifact.client_script.as_str());\n");
   source.push_str("    let __title_template = __dev_artifact.as_ref().map_or(__TITLE_TEMPLATE, |artifact| artifact.title_template.as_str());\n");
   source.push_str("    let __head_template = __dev_artifact.as_ref().map_or(__HEAD_TEMPLATE, |artifact| artifact.head_template.as_str());\n");
   source.push_str("    let __template = __dev_artifact.as_ref().map_or(__TEMPLATE, |artifact| artifact.template.as_str());\n");
@@ -2436,6 +2441,7 @@ mod tests {
       Some("build-1"),
     )
     .unwrap();
+    assert!(generated.dev_artifact.is_some(), "dev artifact should exist");
     let src = generated.source;
 
     assert!(generated.assets.is_empty());
@@ -2458,7 +2464,8 @@ mod tests {
 
     // The format! call must reference both as named args.
     assert!(src.contains("runtime = __CLIENT_RUNTIME"));
-    assert!(src.contains("user_script = __CLIENT_SCRIPT"));
+    assert!(src.contains("user_script = __client_script"));
+    assert!(src.contains("let __client_script = __dev_artifact.as_ref().map_or(__CLIENT_SCRIPT"));
 
     // The analyzer must have stripped the generic type parameter.
     assert!(
@@ -2590,6 +2597,7 @@ mod tests {
     .unwrap();
     let dev_artifact = generated.dev_artifact.expect("dev artifact should exist");
 
+    assert!(dev_artifact.client_script.is_empty());
     assert!(dev_artifact.template.contains("__comp_used"));
     assert!(!dev_artifact.template.contains("__comp_unused"));
     assert!(dev_artifact.style.contains("red"));
