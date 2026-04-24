@@ -561,6 +561,53 @@ fn template_only_route_edit_should_refresh_live_browser_without_page_reload() {
 }
 
 #[test]
+fn route_component_prop_edit_should_refresh_component_output_without_page_reload() {
+  let _guard = hotpatch_test_guard();
+  if !playwright_probe_supported() {
+    eprintln!("skipping Playwright hotpatch browser test: local Playwright runtime is unavailable");
+    return;
+  }
+
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("route-component-prop-browser-patch");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", route_using_stat_card_before_source());
+  fixture.write("src/components/StatCard.trs", stat_card_component_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("Template before"));
+
+  let probe = spawn_playwright_probe(
+    &route_template_hotpatch_probe_script(fixture_port),
+    &fixture.root().join("src/routes/index.trs"),
+    route_using_stat_card_after_source(),
+  );
+  let probe_output = probe
+    .wait_with_output()
+    .expect("Playwright route component prop probe should complete");
+  assert_playwright_probe_success(&probe_output, &output, "route component prop hotpatch browser probe");
+
+  let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
+  assert!(probe_stdout.contains(r#""beforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""refreshCount":1"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""templateSeen":true"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("template-route-hotpatch-probe"), "unexpected probe output: {probe_stdout}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
 fn route_client_script_edit_should_refresh_live_browser_and_apply_new_handler_without_page_reload() {
   let _guard = hotpatch_test_guard();
   if !playwright_probe_supported() {
@@ -597,6 +644,52 @@ fn route_client_script_edit_should_refresh_live_browser_and_apply_new_handler_wi
   assert!(probe_stdout.contains(r#""initialHandlerCount":"1""#), "unexpected probe output: {probe_stdout}");
   assert!(probe_stdout.contains(r#""postPatchCount":"2""#), "unexpected probe output: {probe_stdout}");
   assert!(probe_stdout.contains("route-client-script-hotpatch-probe"), "unexpected probe output: {probe_stdout}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn component_client_script_should_work_in_live_browser() {
+  let _guard = hotpatch_test_guard();
+  if !playwright_probe_supported() {
+    eprintln!("skipping Playwright component browser test: local Playwright runtime is unavailable");
+    return;
+  }
+
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("component-client-script-browser");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", route_using_counter_button_source());
+  fixture.write("src/components/CounterButton.trs", counter_button_component_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("id=\"component-counter\""));
+
+  let probe = spawn_playwright_probe(
+    &component_client_script_probe_script(fixture_port),
+    &fixture.root().join("src/routes/index.trs"),
+    route_using_counter_button_source(),
+  );
+  let probe_output = probe
+    .wait_with_output()
+    .expect("Playwright component client script probe should complete");
+  assert_playwright_probe_success(&probe_output, &output, "component client script browser probe");
+
+  let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
+  assert!(probe_stdout.contains(r#""beforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""count":"1""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("component-client-script-probe"), "unexpected probe output: {probe_stdout}");
 
   wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
   assert!(child.try_wait().expect("child wait should succeed").is_none());
@@ -1183,6 +1276,102 @@ pub fn index() -> Props {
 "#
 }
 
+fn route_using_stat_card_before_source() -> &'static str {
+  r#"<script setup>
+struct Props {
+  name: String,
+  tagline: String,
+}
+
+#[thebe::get]
+pub fn index() -> Props {
+  Props {
+    name: "Thebe".to_owned(),
+    tagline: "Hotpatch value".to_owned(),
+  }
+}
+</script>
+
+<main>
+  <StatCard label="Template before" :value="name" />
+</main>
+"#
+}
+
+fn route_using_stat_card_after_source() -> &'static str {
+  r#"<script setup>
+struct Props {
+  name: String,
+  tagline: String,
+}
+
+#[thebe::get]
+pub fn index() -> Props {
+  Props {
+    name: "Thebe".to_owned(),
+    tagline: "Hotpatch value".to_owned(),
+  }
+}
+</script>
+
+<main>
+  <StatCard label="Template after" :value="tagline" />
+</main>
+"#
+}
+
+fn route_using_counter_button_source() -> &'static str {
+  r#"<script setup>
+struct Props {
+  count: i32,
+}
+
+#[thebe::get]
+pub fn index() -> Props {
+  Props { count: 0 }
+}
+</script>
+
+<main>
+  <CounterButton :count="count" />
+</main>
+"#
+}
+
+fn counter_button_component_source() -> &'static str {
+  r#"<script>
+pub struct Props {
+  pub count: i32,
+}
+</script>
+
+<script lang="ts">
+let props = getProps<Props>();
+
+function increment() {
+  props.count += 1;
+}
+</script>
+
+<button id="component-counter" onclick="increment">{{ props.count }}</button>
+"#
+}
+
+fn stat_card_component_source() -> &'static str {
+  r#"<script>
+pub struct Props {
+  pub label: String,
+  pub value: String,
+}
+</script>
+
+<article class="stat-card">
+  <h2>{{ props.label }}</h2>
+  <p>{{ props.value }}</p>
+</article>
+"#
+}
+
 fn plain_about_route_source() -> &'static str {
   r#"<script setup>
 struct Props {}
@@ -1328,6 +1517,37 @@ const beforeUnloadKey = "__thebe_style_beforeunload__";
 (async () => {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => {
+    pageErrors.push(error && error.stack ? error.stack : String(error));
+  });
+  await page.addInitScript(() => {
+    const registeredNames = [];
+    const registeredHandlers = {};
+    let realRegister = null;
+
+    Object.defineProperty(window, "__thebeRegisteredNames", {
+      configurable: true,
+      value: registeredNames
+    });
+    Object.defineProperty(window, "__thebeRegisteredHandlers", {
+      configurable: true,
+      value: registeredHandlers
+    });
+    Object.defineProperty(window, "__thebe_register", {
+      configurable: true,
+      get() {
+        return realRegister;
+      },
+      set(fn) {
+        realRegister = function(name, handler) {
+          registeredNames.push(name);
+          registeredHandlers[name] = handler;
+          return fn(name, handler);
+        };
+      }
+    });
+  });
 
   try {
     await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
@@ -1409,6 +1629,10 @@ const beforeUnloadKey = "__thebe_layout_head_beforeunload__";
 (async () => {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => {
+    pageErrors.push(error && error.stack ? error.stack : String(error));
+  });
 
   try {
     await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
@@ -1484,6 +1708,10 @@ const beforeUnloadKey = "__thebe_template_route_beforeunload__";
 (async () => {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => {
+    pageErrors.push(error && error.stack ? error.stack : String(error));
+  });
 
   try {
     await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
@@ -1638,6 +1866,99 @@ const beforeUnloadKey = "__thebe_route_client_script_beforeunload__";
 
     console.log(JSON.stringify(result));
   } catch (error) {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exitCode = 1;
+  } finally {
+    await browser.close();
+  }
+})();
+"##;
+
+const COMPONENT_CLIENT_SCRIPT_PROBE_SCRIPT: &str = r##"
+const { chromium } = require("playwright");
+
+const targetUrl = "__TARGET_URL__";
+const beforeUnloadKey = "__thebe_component_client_script_beforeunload__";
+
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => {
+    pageErrors.push(error && error.stack ? error.stack : String(error));
+  });
+
+  try {
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      () => typeof window.__thebe_dev_refresh === "function",
+      null,
+      { timeout: 30000 }
+    );
+    await page.locator("#component-counter").waitFor({ state: "attached", timeout: 30000 });
+    await page.waitForFunction(
+      () => {
+        const button = document.querySelector("#component-counter");
+        return button && button.textContent.trim() === "0";
+      },
+      null,
+      { timeout: 30000 }
+    );
+
+    await page.evaluate((key) => {
+      window.sessionStorage.removeItem(key);
+      window.__thebeComponentClientScriptErrors = [];
+      window.addEventListener("error", (event) => {
+        const message = event && event.error && event.error.stack
+          ? event.error.stack
+          : (event && event.message) || "unknown error";
+        window.__thebeComponentClientScriptErrors.push(message);
+      });
+      window.addEventListener("beforeunload", () => {
+        const count = Number(window.sessionStorage.getItem(key) || "0");
+        window.sessionStorage.setItem(key, String(count + 1));
+      });
+      window.__thebeComponentClientScriptProbeToken = "component-client-script-probe";
+    }, beforeUnloadKey);
+
+    await page.locator("#component-counter").click();
+
+    await page.waitForFunction(
+      () => {
+        const button = document.querySelector("#component-counter");
+        return button && button.textContent.trim() === "1";
+      },
+      null,
+      { timeout: 30000 }
+    );
+
+    const result = await page.evaluate((key) => {
+      const button = document.querySelector("#component-counter");
+
+      return {
+        beforeUnloadCount: window.sessionStorage.getItem(key) || "0",
+        count: button ? button.textContent.trim() : null,
+        probeToken: window.__thebeComponentClientScriptProbeToken || null,
+        errors: window.__thebeComponentClientScriptErrors || []
+      };
+    }, beforeUnloadKey);
+
+    result.pageErrors = pageErrors;
+
+    console.log(JSON.stringify(result));
+  } catch (error) {
+    const diagnostics = await page.evaluate(() => {
+      const button = document.querySelector("#component-counter");
+
+      return {
+        count: button ? button.textContent.trim() : null,
+        onclickAttr: button ? button.getAttribute("onclick") : null,
+        errors: window.__thebeComponentClientScriptErrors || []
+      };
+    }).catch(() => null);
+    if (diagnostics) {
+      console.error(JSON.stringify({ diagnostics, pageErrors }));
+    }
     console.error(error && error.stack ? error.stack : String(error));
     process.exitCode = 1;
   } finally {
@@ -1980,6 +2301,11 @@ fn route_template_hotpatch_probe_script(port: u16) -> String {
 
 fn route_client_script_hotpatch_probe_script(port: u16) -> String {
   ROUTE_CLIENT_SCRIPT_HOTPATCH_PROBE_SCRIPT
+    .replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
+}
+
+fn component_client_script_probe_script(port: u16) -> String {
+  COMPONENT_CLIENT_SCRIPT_PROBE_SCRIPT
     .replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
 }
 

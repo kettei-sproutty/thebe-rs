@@ -138,12 +138,12 @@ async fn run_browser_server(
     .route(BROWSER_EVENTS_PATH, get(browser_events))
     .with_state(event_tx);
 
-  axum::serve(listener, app)
-    .with_graceful_shutdown(async move {
+  tokio::select! {
+    result = axum::serve(listener, app) => result.map_err(io::Error::other),
+    _ = async move {
       let _ = shutdown_rx.await;
-    })
-    .await
-    .map_err(io::Error::other)
+    } => Ok(()),
+  }
 }
 
 async fn browser_events(
@@ -200,9 +200,10 @@ mod tests {
 
       loop {
         line.clear();
-        let bytes_read = reader
-          .read_line(&mut line)
-          .expect("event stream line should read");
+        let bytes_read = match reader.read_line(&mut line) {
+          Ok(bytes_read) => bytes_read,
+          Err(_error) => break,
+        };
         if bytes_read == 0 {
           break;
         }
@@ -278,6 +279,24 @@ mod tests {
     assert_eq!(event_line, "event: reload");
     assert_eq!(data_line, "data: {}");
 
+    let _ = reader.join();
+  }
+
+  #[test]
+  fn drop_should_not_block_with_active_event_stream_client() {
+    let server = BrowserPatchServer::spawn().expect("browser patch server should spawn");
+    let server_addr = server.local_addr();
+    let (_line_rx, reader) = connect_event_stream(server_addr);
+    let (drop_tx, drop_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+      drop(server);
+      let _ = drop_tx.send(());
+    });
+
+    drop_rx
+      .recv_timeout(Duration::from_secs(2))
+      .expect("dropping the browser patch server should not block on active clients");
     let _ = reader.join();
   }
 }

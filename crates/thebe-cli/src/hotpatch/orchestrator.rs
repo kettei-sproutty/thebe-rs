@@ -22,6 +22,10 @@ use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::{Duration, Instant};
 
+const RUNTIME_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
+const CHILD_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
+const FORCED_RUNTIME_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(300);
+
 /// Run the experimental hotpatch dev loop.
 pub(crate) fn run(project_root: &Path) -> anyhow::Result<()> {
   let (listener, server_addr) = PatchServer::bind()
@@ -79,6 +83,10 @@ pub(crate) fn run(project_root: &Path) -> anyhow::Result<()> {
     .with_context(|| format!("failed to watch {}", project_root.display()))?;
 
   loop {
+    if managed_child_exited(&mut child) {
+      break;
+    }
+
     if shutdown_requested.load(Ordering::SeqCst) {
       break;
     }
@@ -549,12 +557,12 @@ fn shutdown_runtime(patch_server: &PatchServer, child: &mut Child, reason: &str)
   let runtime_process_id = patch_server.active_process_id();
   patch_server.request_restart(reason);
 
-  let runtime_exited = wait_for_runtime_exit(runtime_process_id, Duration::from_millis(300));
-  let child_exited = wait_for_child_exit(child, Duration::from_millis(300));
+  let runtime_exited = wait_for_runtime_exit(runtime_process_id, RUNTIME_EXIT_GRACE_PERIOD);
+  let child_exited = wait_for_child_exit(child, CHILD_EXIT_GRACE_PERIOD);
 
   if !runtime_exited {
     terminate_runtime_process(runtime_process_id);
-    let _ = wait_for_runtime_exit(runtime_process_id, Duration::from_secs(2));
+    let _ = wait_for_runtime_exit(runtime_process_id, FORCED_RUNTIME_EXIT_GRACE_PERIOD);
   }
 
   if !child_exited {
@@ -568,12 +576,12 @@ fn stop_runtime(patch_server: &PatchServer, child: &mut Child) {
   let runtime_process_id = patch_server.active_process_id();
   patch_server.request_shutdown();
 
-  let runtime_exited = wait_for_runtime_exit(runtime_process_id, Duration::from_millis(300));
-  let child_exited = wait_for_child_exit(child, Duration::from_millis(300));
+  let runtime_exited = wait_for_runtime_exit(runtime_process_id, RUNTIME_EXIT_GRACE_PERIOD);
+  let child_exited = wait_for_child_exit(child, CHILD_EXIT_GRACE_PERIOD);
 
   if !runtime_exited {
     terminate_runtime_process(runtime_process_id);
-    let _ = wait_for_runtime_exit(runtime_process_id, Duration::from_secs(2));
+    let _ = wait_for_runtime_exit(runtime_process_id, FORCED_RUNTIME_EXIT_GRACE_PERIOD);
   }
 
   if !child_exited {
@@ -593,6 +601,20 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
   }
 
   false
+}
+
+fn managed_child_exited(child: &mut Child) -> bool {
+  match child.try_wait() {
+    Ok(Some(status)) => {
+      eprintln!("thebe: managed server exited ({status}); stopping hotpatch loop");
+      true
+    }
+    Ok(None) => false,
+    Err(error) => {
+      eprintln!("thebe: failed to observe managed server status: {error}");
+      true
+    }
+  }
 }
 
 fn wait_for_runtime_exit(process_id: Option<u32>, timeout: Duration) -> bool {
@@ -647,7 +669,7 @@ fn terminate_runtime_process(_process_id: Option<u32>) {}
 mod tests {
   use super::{
     BrowserPatch, ChangePlan, PatchPlan, RestartPlan, RestartTrigger, is_rebuild_event_kind,
-    plan_change_batch, wait_for_runtime_exit,
+    managed_child_exited, plan_change_batch, wait_for_runtime_exit,
   };
   use crate::hotpatch::classify::RestartReason;
   use std::fs;
@@ -655,6 +677,7 @@ mod tests {
   use std::path::{Path, PathBuf};
   use std::process::Command;
   use std::process;
+  use std::process::Stdio;
   use std::time::Duration;
   use std::time::{SystemTime, UNIX_EPOCH};
   use thebe_project::{
@@ -720,6 +743,20 @@ mod tests {
     );
 
     let _ = fs::remove_dir_all(project_root);
+  }
+
+  #[test]
+  fn managed_child_exited_should_detect_completed_child() {
+    let mut child = Command::new("sh")
+      .args(["-c", "exit 0"])
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .spawn()
+      .expect("child should spawn");
+
+    assert!(child.wait().expect("child wait should succeed").success());
+    assert!(managed_child_exited(&mut child));
   }
 
   #[test]

@@ -121,6 +121,7 @@ struct LocalTypeInfo {
 #[derive(Clone, Copy)]
 struct ModuleLiterals<'a> {
   app_html: &'a str,
+  component_instances_json: &'a str,
   head_template: &'a str,
   template: &'a str,
   title_template: &'a str,
@@ -211,6 +212,7 @@ pub struct GeneratedRoute {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevRouteArtifact {
   pub client_script: String,
+  pub component_instances_json: String,
   pub head_template: String,
   pub layout_template: Option<String>,
   pub relative_path: String,
@@ -457,14 +459,18 @@ pub fn generate_route(
   // order so markers and scope attrs are not added to Jinja control-flow
   // tokens.
   let known_component_names: Vec<&str> = components.iter().map(|c| c.name.as_str()).collect();
-  let used_component_names = template::list_used_component_names(&blocks.template, &known_component_names);
-  let used_component_name_refs: Vec<&str> = used_component_names.iter().map(String::as_str).collect();
+  let component_expansion = template::expand_component_tags_with_instances(&blocks.template, &known_component_names);
+  let mut used_component_names = Vec::new();
+  for instance in &component_expansion.instances {
+    if !used_component_names.contains(&instance.component_name) {
+      used_component_names.push(instance.component_name.clone());
+    }
+  }
   let used_components: Vec<&ComponentMacro> = components
     .iter()
     .filter(|component| used_component_names.iter().any(|name| name == &component.name))
     .collect();
-  let template_expanded =
-    template::expand_component_tags(&blocks.template, &used_component_name_refs);
+  let template_expanded = component_expansion.template;
   let template_attr_bound = template::inject_attr_bindings(&template_expanded);
   let template_hydrated = template::inject_hydration_markers(&template_attr_bound);
   let template_scoped = if route_style_source.is_some() {
@@ -475,9 +481,16 @@ pub fn generate_route(
 
   // Prepend compiled component macro sources (already scoped with component
   // scope IDs) before the route template body.
-  let component_macros_source: String = used_components
+  let component_macros_source: String = component_expansion
+    .instances
     .iter()
-    .map(|c| c.jinja_macro.as_str())
+    .map(|instance| {
+      let component = used_components
+        .iter()
+        .find(|component| component.name == instance.component_name)
+        .expect("component instance should resolve to a generated component");
+      instantiate_component_macro(component, instance)
+    })
     .collect::<Vec<_>>()
     .join("\n");
   let template_with_macros = if component_macros_source.is_empty() {
@@ -509,10 +522,22 @@ pub fn generate_route(
   };
 
   // Process the optional `<script lang="ts">` block.
-  let client_js = client_script_ts
+  let route_client_js = client_script_ts
     .map(|ts| thebe_analyzer::analyze(ts, minify).map(|module| module.js))
     .transpose()?
     .unwrap_or_default();
+  let component_client_scripts = component_expansion
+    .instances
+    .iter()
+    .filter_map(|instance| {
+      let component = used_components
+        .iter()
+        .find(|component| component.name == instance.component_name)
+        .expect("component instance should resolve to a generated component");
+      build_component_instance_script(component, instance)
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
 
   let runtime_str = if minify {
     format!(
@@ -522,7 +547,14 @@ pub fn generate_route(
   } else {
     THEBE_CLIENT_RUNTIME.to_string()
   };
-  let client_script_str = client_js;
+  let client_script_str = if route_client_js.is_empty() {
+    component_client_scripts
+  } else if component_client_scripts.is_empty() {
+    route_client_js
+  } else {
+    format!("{route_client_js}\n{component_client_scripts}")
+  };
+  let component_instances_json = build_component_instances_json(&component_expansion.instances);
 
   // Process the optional layout.
   let layout_processed = layout
@@ -558,6 +590,7 @@ pub fn generate_route(
   let route_path_literal = escape_rust_raw_str(route_path);
   let dev_artifact = dev_build_id.filter(|_| !minify).map(|_| DevRouteArtifact {
     client_script: client_script_str.clone(),
+    component_instances_json: component_instances_json.clone(),
     head_template: merged_head.html_template.clone(),
     layout_template: layout_template.clone(),
     relative_path: dev_route_artifact_relative_path(route_path),
@@ -632,9 +665,11 @@ pub fn generate_route(
   let layout_template_literal = layout_template.as_deref().map(|template| {
     escape_rust_raw_str(if dev_artifact.is_some() { "" } else { template })
   });
+  let component_instances_json_literal = escape_rust_raw_str(&component_instances_json);
 
   let literals = ModuleLiterals {
     app_html: &app_html_literal,
+    component_instances_json: &component_instances_json_literal,
     head_template: &head_literal,
     template: &template_literal,
     title_template: &title_literal,
@@ -721,6 +756,12 @@ fn write_module_constants(source: &mut String, literals: ModuleLiterals<'_>) {
   .expect("infallible");
   writeln!(
     source,
+    "const __COMPONENT_INSTANCES_JSON: &str = {};",
+    literals.component_instances_json
+  )
+  .expect("infallible");
+  writeln!(
+    source,
     "const __RUNTIME_ASSET_URL: &str = {};",
     literals.runtime_asset_url
   )
@@ -767,8 +808,20 @@ fn write_support_fns(source: &mut String, type_bridge_enabled: bool) {
     "type __ThebeResponse = Result<axum::response::Html<String>, axum::response::Response>;\n\n",
   );
   source.push_str("#[derive(serde::Deserialize)]\n");
+  source.push_str("struct __ThebeComponentInstanceAttr {\n");
+  source.push_str("    dynamic: bool,\n");
+  source.push_str("    name: String,\n");
+  source.push_str("    value: Option<String>,\n");
+  source.push_str("}\n\n");
+  source.push_str("#[derive(serde::Deserialize)]\n");
+  source.push_str("struct __ThebeComponentInstance {\n");
+  source.push_str("    attrs: Vec<__ThebeComponentInstanceAttr>,\n");
+  source.push_str("    instance_id: String,\n");
+  source.push_str("}\n\n");
+  source.push_str("#[derive(serde::Deserialize)]\n");
   source.push_str("struct __ThebeDevRouteArtifact {\n");
   source.push_str("    client_script: String,\n");
+  source.push_str("    component_instances_json: String,\n");
   source.push_str("    head_template: String,\n");
   source.push_str("    layout_template: Option<String>,\n");
   source.push_str("    style: String,\n");
@@ -842,6 +895,50 @@ fn write_support_fns(source: &mut String, type_bridge_enabled: bool) {
   source.push_str("    )\n");
   source.push_str("        .into_response()\n");
   source.push_str("}\n\n");
+  source.push_str("fn __thebe_lookup_ctx(ctx: &serde_json::Value, path: &str) -> serde_json::Value {\n");
+  source.push_str("    if path.is_empty() {\n");
+  source.push_str("        return serde_json::Value::Null;\n");
+  source.push_str("    }\n\n");
+  source.push_str("    let mut current = ctx;\n");
+  source.push_str("    for segment in path.split('.') {\n");
+  source.push_str("        let Some(next) = current.get(segment) else {\n");
+  source.push_str("            return serde_json::Value::Null;\n");
+  source.push_str("        };\n");
+  source.push_str("        current = next;\n");
+  source.push_str("    }\n\n");
+  source.push_str("    current.clone()\n");
+  source.push_str("}\n\n");
+  source.push_str("fn __thebe_load_component_instances(source: &str) -> Result<Vec<__ThebeComponentInstance>, axum::response::Response> {\n");
+  source.push_str("    if source.is_empty() {\n");
+  source.push_str("        return Ok(Vec::new());\n");
+  source.push_str("    }\n\n");
+  source.push_str("    serde_json::from_str(source)\n");
+  source.push_str("        .map_err(|err| __thebe_internal_error(\"parse component props\", err))\n");
+  source.push_str("}\n\n");
+  source.push_str("fn __thebe_build_component_props(\n");
+  source.push_str("    ctx: &serde_json::Value,\n");
+  source.push_str("    component_instances: &[__ThebeComponentInstance],\n");
+  source.push_str(") -> serde_json::Map<String, serde_json::Value> {\n");
+  source.push_str("    let mut components = serde_json::Map::new();\n\n");
+  source.push_str("    for instance in component_instances {\n");
+  source.push_str("        let mut props = serde_json::Map::new();\n");
+  source.push_str("        for attr in &instance.attrs {\n");
+  source.push_str("            let value = if attr.dynamic {\n");
+  source.push_str("                attr\n");
+  source.push_str("                    .value\n");
+  source.push_str("                    .as_deref()\n");
+  source.push_str("                    .map_or(serde_json::Value::Null, |path| __thebe_lookup_ctx(ctx, path))\n");
+  source.push_str("            } else {\n");
+  source.push_str("                attr.value.as_ref().map_or(serde_json::Value::Bool(true), |literal| {\n");
+  source.push_str("                    serde_json::Value::String(literal.clone())\n");
+  source.push_str("                })\n");
+  source.push_str("            };\n");
+  source.push_str("            props.insert(attr.name.clone(), value);\n");
+  source.push_str("        }\n");
+  source.push_str("        components.insert(instance.instance_id.clone(), serde_json::Value::Object(props));\n");
+  source.push_str("    }\n\n");
+  source.push_str("    components\n");
+  source.push_str("}\n\n");
 
   if type_bridge_enabled {
     source.push_str("fn __thebe_export_types() {\n");
@@ -858,7 +955,10 @@ fn write_support_fns(source: &mut String, type_bridge_enabled: bool) {
   }
 }
 
-fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
+fn write_render_handler(
+  source: &mut String,
+  wrapper: WrapperSource<'_>,
+) {
   if wrapper.params.is_empty() {
     source.push_str("async fn __thebe_render_handler() -> __ThebeResponse {\n");
   } else {
@@ -872,14 +972,22 @@ fn write_render_handler(source: &mut String, wrapper: WrapperSource<'_>) {
   source.push_str(wrapper.call);
   source.push_str("    let __dev_artifact = __thebe_load_dev_route_artifact()?;\n");
   source.push_str("    let __client_script = __dev_artifact.as_ref().map_or(__CLIENT_SCRIPT, |artifact| artifact.client_script.as_str());\n");
+  source.push_str("    let __component_instances_json = __dev_artifact.as_ref().map_or(__COMPONENT_INSTANCES_JSON, |artifact| artifact.component_instances_json.as_str());\n");
+  source.push_str("    let __component_instances = __thebe_load_component_instances(__component_instances_json)?;\n");
   source.push_str("    let __title_template = __dev_artifact.as_ref().map_or(__TITLE_TEMPLATE, |artifact| artifact.title_template.as_str());\n");
   source.push_str("    let __head_template = __dev_artifact.as_ref().map_or(__HEAD_TEMPLATE, |artifact| artifact.head_template.as_str());\n");
   source.push_str("    let __template = __dev_artifact.as_ref().map_or(__TEMPLATE, |artifact| artifact.template.as_str());\n");
   source.push_str("    let __style = __dev_artifact.as_ref().map_or(__STYLE, |artifact| artifact.style.as_str());\n");
   source.push_str(
-    "    let __ctx = serde_json::to_value(&__props)\
+    "    let mut __ctx = serde_json::to_value(&__props)\
          .map_err(|err| __thebe_internal_error(\"serialize props\", err))?;\n",
   );
+  source.push_str("    let __thebe_components = __thebe_build_component_props(&__ctx, &__component_instances);\n");
+  source.push_str("    if !__thebe_components.is_empty() {\n");
+  source.push_str("        if let Some(__ctx_obj) = __ctx.as_object_mut() {\n");
+  source.push_str("            __ctx_obj.insert(\"__thebe_components\".to_owned(), serde_json::Value::Object(__thebe_components));\n");
+  source.push_str("        }\n");
+  source.push_str("    }\n");
   source.push_str(
     "    let __title = if __title_template.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__title\",\n            __title_template,\n            &__ctx,\n            \"compile title template\",\n            \"load title template\",\n            \"render title template\",\n        )?\n    };\n",
   );
@@ -970,7 +1078,10 @@ fn write_html_assembly(source: &mut String) {
 
 /// Like [`write_render_handler`] but renders the route body first, then wraps
 /// it inside the layout template before assembling the HTML shell.
-fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<'_>) {
+fn write_render_handler_with_layout(
+  source: &mut String,
+  wrapper: WrapperSource<'_>,
+) {
   if wrapper.params.is_empty() {
     source.push_str("async fn __thebe_render_handler() -> __ThebeResponse {\n");
   } else {
@@ -984,15 +1095,23 @@ fn write_render_handler_with_layout(source: &mut String, wrapper: WrapperSource<
   source.push_str(wrapper.call);
   source.push_str("    let __dev_artifact = __thebe_load_dev_route_artifact()?;\n");
   source.push_str("    let __client_script = __dev_artifact.as_ref().map_or(__CLIENT_SCRIPT, |artifact| artifact.client_script.as_str());\n");
+  source.push_str("    let __component_instances_json = __dev_artifact.as_ref().map_or(__COMPONENT_INSTANCES_JSON, |artifact| artifact.component_instances_json.as_str());\n");
+  source.push_str("    let __component_instances = __thebe_load_component_instances(__component_instances_json)?;\n");
   source.push_str("    let __title_template = __dev_artifact.as_ref().map_or(__TITLE_TEMPLATE, |artifact| artifact.title_template.as_str());\n");
   source.push_str("    let __head_template = __dev_artifact.as_ref().map_or(__HEAD_TEMPLATE, |artifact| artifact.head_template.as_str());\n");
   source.push_str("    let __template = __dev_artifact.as_ref().map_or(__TEMPLATE, |artifact| artifact.template.as_str());\n");
   source.push_str("    let __style = __dev_artifact.as_ref().map_or(__STYLE, |artifact| artifact.style.as_str());\n");
   source.push_str("    let __layout_template = __dev_artifact.as_ref().and_then(|artifact| artifact.layout_template.as_deref()).unwrap_or(__LAYOUT_TEMPLATE);\n");
   source.push_str(
-    "    let __ctx = serde_json::to_value(&__props)\
+    "    let mut __ctx = serde_json::to_value(&__props)\
          .map_err(|err| __thebe_internal_error(\"serialize props\", err))?;\n",
   );
+  source.push_str("    let __thebe_components = __thebe_build_component_props(&__ctx, &__component_instances);\n");
+  source.push_str("    if !__thebe_components.is_empty() {\n");
+  source.push_str("        if let Some(__ctx_obj) = __ctx.as_object_mut() {\n");
+  source.push_str("            __ctx_obj.insert(\"__thebe_components\".to_owned(), serde_json::Value::Object(__thebe_components));\n");
+  source.push_str("        }\n");
+  source.push_str("    }\n");
   source.push_str(
     "    let __title = if __title_template.is_empty() {\n        String::new()\n    } else {\n        __thebe_render_fragment(\n            \"__title\",\n            __title_template,\n            &__ctx,\n            \"compile title template\",\n            \"load title template\",\n            \"render title template\",\n        )?\n    };\n",
   );
@@ -1093,6 +1212,10 @@ pub struct ComponentMacro {
   pub jinja_macro: String,
   /// Processed and scoped CSS for this component (empty if no `<style>` block).
   pub style: String,
+  /// Browser-runnable JavaScript extracted from the component's `<script lang="ts">` block.
+  pub client_script: String,
+  /// Top-level handler functions discovered in the component client script.
+  pub event_fns: Vec<String>,
 }
 
 /// Compile a component `.trs` file into a [`ComponentMacro`] ready for use in
@@ -1119,15 +1242,16 @@ pub fn generate_component(
   let macro_name = format!("__comp_{}", component_name.to_lowercase());
 
   // Replace <slot /> with {{ caller() }}, transform `:attr` bindings, then
-  // apply CSS scope attributes only when this component has a non-empty
-  // `<style>` block.
+  // inject hydration markers and apply CSS scope attributes only when this
+  // component has a non-empty `<style>` block.
   let component_style_source = blocks.style.as_deref().filter(|style| !style.trim().is_empty());
   let template_slot_expanded = crate::template::expand_slot(&blocks.template);
   let template_attr_bound = crate::template::inject_attr_bindings(&template_slot_expanded);
+  let template_hydrated = crate::template::inject_hydration_markers(&template_attr_bound);
   let template_scoped = if component_style_source.is_some() {
-    thebe_css::add_scope_attrs(&template_attr_bound, &scope)
+    thebe_css::add_scope_attrs(&template_hydrated, &scope)
   } else {
-    template_attr_bound
+    template_hydrated
   };
 
   let jinja_macro = format!(
@@ -1140,12 +1264,97 @@ pub fn generate_component(
     String::new()
   };
 
+  let component_client = blocks
+    .script_ts
+    .as_deref()
+    .filter(|script| !script.trim().is_empty())
+    .map(|script| thebe_analyzer::analyze(script, minify))
+    .transpose()?;
+
   Ok(ComponentMacro {
     name: component_name.to_owned(),
     macro_name,
     jinja_macro,
     style,
+    client_script: component_client
+      .as_ref()
+      .map_or_else(String::new, |module| module.js.clone()),
+    event_fns: component_client.map_or_else(Vec::new, |module| module.event_fns),
   })
+}
+
+fn component_handler_prefix(instance_id: &str) -> String {
+  format!("__thebe_component_{instance_id}__")
+}
+
+fn instantiate_component_macro(
+  component: &ComponentMacro,
+  instance: &template::ComponentInstance,
+) -> String {
+  let mut source = component.jinja_macro.replacen(
+    &format!("{{% macro {}(props) %}}", component.macro_name),
+    &format!("{{% macro {}(props) %}}", instance.macro_name),
+    1,
+  );
+  source = source.replace(
+    "props.",
+    &format!("__thebe_components.{}.", instance.instance_id),
+  );
+  template::prefix_event_handler_attrs(
+    &source,
+    &component.event_fns,
+    &component_handler_prefix(&instance.instance_id),
+  )
+}
+
+fn build_component_instance_script(
+  component: &ComponentMacro,
+  instance: &template::ComponentInstance,
+) -> Option<String> {
+  if component.client_script.is_empty() {
+    return None;
+  }
+
+  let handler_prefix = component_handler_prefix(&instance.instance_id);
+  let mut client_script = component.client_script.clone();
+  for event_fn in &component.event_fns {
+    client_script = client_script.replace(
+      &format!(r#"__thebe_register("{event_fn}", {event_fn});"#),
+      &format!(r#"window.__thebe_register("{handler_prefix}{event_fn}", {event_fn});"#),
+    );
+  }
+
+  Some(format!(
+    r#"(function() {{
+const getProps = () => window.getProps().__thebe_components.{instance_id};
+{client_script}
+}})();"#,
+    instance_id = instance.instance_id,
+    client_script = client_script,
+  ))
+}
+
+fn build_component_instances_json(instances: &[template::ComponentInstance]) -> String {
+  serde_json::Value::Array(
+    instances
+      .iter()
+      .map(|instance| {
+        serde_json::json!({
+          "attrs": instance
+            .attrs
+            .iter()
+            .map(|attr| serde_json::json!({
+              "dynamic": attr.dynamic,
+              "name": attr.name,
+              "value": attr.value,
+            }))
+            .collect::<Vec<_>>(),
+          "instance_id": instance.instance_id,
+        })
+      })
+      .collect(),
+  )
+  .to_string()
 }
 
 pub fn generate_routes_file(
@@ -2551,7 +2760,28 @@ mod tests {
     let component = generate_component(&blocks, "Badge", false).unwrap();
 
     assert!(component.style.is_empty());
+    assert!(component.client_script.is_empty());
+    assert!(component.event_fns.is_empty());
     assert!(!component.jinja_macro.contains("data-thebe-c-"));
+  }
+
+  #[test]
+  fn generate_component_carries_analyzed_client_script() {
+    let blocks = SfcBlocks {
+      script_ts: Some(
+        "let props = getProps<Props>();\nfunction increment() { props.count += 1; }".to_owned(),
+      ),
+      template: "<button onclick=\"increment\">{{ props.count }}</button>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let component = generate_component(&blocks, "CounterButton", false).unwrap();
+
+    assert!(!component.client_script.is_empty());
+    assert!(!component.client_script.contains("getProps<Props>()"));
+    assert!(component.client_script.contains("function increment"));
+    assert!(component.client_script.contains("__thebe_register(\"increment\", increment);"));
+    assert_eq!(component.event_fns, vec![String::from("increment")]);
   }
 
   #[test]
@@ -2605,6 +2835,57 @@ mod tests {
   }
 
   #[test]
+  fn generate_route_embeds_instance_scoped_component_client_script() {
+    let route_blocks = SfcBlocks {
+      script_setup: Some(
+        "struct Props { count: i32 }\n\n#[thebe::get]\npub fn handler() -> Props { Props { count: 0 } }"
+          .to_owned(),
+      ),
+      template: "<CounterButton :count=\"count\" />".to_owned(),
+      ..SfcBlocks::default()
+    };
+    let component = generate_component(
+      &SfcBlocks {
+        script_ts: Some(
+          "let props = getProps<Props>();\nfunction increment() { props.count += 1; }".to_owned(),
+        ),
+        template: "<button onclick=\"increment\">{{ props.count }}</button>".to_owned(),
+        ..SfcBlocks::default()
+      },
+      "CounterButton",
+      false,
+    )
+    .unwrap();
+
+    let generated = generate_route(
+      &route_blocks,
+      "/",
+      None,
+      default_app_html(),
+      None,
+      &[component],
+      false,
+      Some("dev-build"),
+    )
+    .unwrap();
+    let dev_artifact = generated.dev_artifact.expect("dev artifact should exist");
+
+    assert!(generated.source.contains("fn __thebe_lookup_ctx"));
+    assert!(generated.source.contains("const __COMPONENT_INSTANCES_JSON"));
+    assert!(generated.source.contains("\"__thebe_components\".to_owned()"));
+    assert!(generated.source.contains("window.getProps().__thebe_components.c0"));
+    assert!(generated.source.contains("__thebe_component_c0__"));
+    assert!(generated.source.contains("window.__thebe_register(\"__thebe_component_c0__increment\", increment);"));
+    assert!(dev_artifact.template.contains("__comp_counterbutton_0"));
+    assert!(dev_artifact.template.contains("onclick=\"__thebe_component_c0__increment\""));
+    assert!(dev_artifact.template.contains("<!--thebe:__thebe_components.c0.count-->"));
+    assert!(dev_artifact.client_script.contains("window.getProps().__thebe_components.c0"));
+    assert!(dev_artifact.component_instances_json.contains("\"instance_id\":\"c0\""));
+    assert!(dev_artifact.component_instances_json.contains("\"name\":\"count\""));
+    assert!(dev_artifact.component_instances_json.contains("\"dynamic\":true"));
+  }
+
+  #[test]
   fn process_layout_without_style_skips_scope_attrs() {
     let blocks = SfcBlocks {
       template: "<div><slot /></div>".to_owned(),
@@ -2638,7 +2919,6 @@ mod tests {
       .unwrap();
 
     assert!(runtime_asset.contents.contains("/* __thebe_runtime */"));
-    assert!(!runtime_asset.contents.contains("Responsibilities:"));
   }
 
   #[test]

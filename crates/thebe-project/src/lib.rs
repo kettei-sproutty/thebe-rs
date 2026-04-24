@@ -410,6 +410,7 @@ pub fn generate_project_with_overlay(
       }
       let artifact_json = serde_json::json!({
         "client_script": dev_artifact.client_script,
+        "component_instances_json": dev_artifact.component_instances_json,
         "head_template": dev_artifact.head_template,
         "layout_template": dev_artifact.layout_template,
         "style": dev_artifact.style,

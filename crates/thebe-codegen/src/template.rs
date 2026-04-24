@@ -308,6 +308,27 @@ pub fn escape_rust_str(s: &str) -> String {
   out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentInstanceAttr {
+  pub name: String,
+  pub value: Option<String>,
+  pub dynamic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentInstance {
+  pub component_name: String,
+  pub macro_name: String,
+  pub instance_id: String,
+  pub attrs: Vec<ComponentInstanceAttr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentExpansion {
+  pub template: String,
+  pub instances: Vec<ComponentInstance>,
+}
+
 // ── Dynamic attribute bindings (:attr="key") ────────────────────────────────
 
 /// Transform a Thebe template so that each `:attr="key"` binding on a plain
@@ -560,10 +581,114 @@ fn is_valid_binding_key(key: &str) -> bool {
   validate_binding(key).is_ok()
 }
 
+pub fn prefix_event_handler_attrs(template: &str, event_fns: &[String], prefix: &str) -> String {
+  if event_fns.is_empty() {
+    return template.to_owned();
+  }
+
+  let mut out = String::with_capacity(template.len() + 64);
+  let mut chars = template.chars().peekable();
+
+  while let Some(ch) = chars.next() {
+    if ch != '<' {
+      out.push(ch);
+      continue;
+    }
+
+    let mut tag_buf = String::from('<');
+    let mut in_quote: Option<char> = None;
+    loop {
+      let Some(c) = chars.next() else { break };
+      tag_buf.push(c);
+      match in_quote {
+        Some(q) if c == q => in_quote = None,
+        None if c == '"' || c == '\'' => in_quote = Some(c),
+        None if c == '>' => break,
+        _ => {}
+      }
+    }
+
+    out.push_str(&transform_tag_event_handlers(&tag_buf, event_fns, prefix));
+  }
+
+  out
+}
+
+fn transform_tag_event_handlers(tag: &str, event_fns: &[String], prefix: &str) -> String {
+  let inner = tag.trim_start_matches('<');
+  let first_meaningful = inner.trim_start();
+  if first_meaningful.starts_with('/') || first_meaningful.starts_with('!') {
+    return tag.to_owned();
+  }
+
+  let name_end = first_meaningful
+    .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+    .unwrap_or(first_meaningful.len());
+  let tag_name = &first_meaningful[..name_end];
+  if tag_name.is_empty() || tag_name.chars().next().is_some_and(char::is_uppercase) {
+    return tag.to_owned();
+  }
+
+  let self_closing = tag.ends_with("/>") || tag.trim_end().ends_with("/>");
+  let after_name = &first_meaningful[name_end..];
+  let attrs_raw = if self_closing {
+    after_name
+      .strip_suffix('>')
+      .and_then(|s| s.strip_suffix('/'))
+      .unwrap_or(after_name)
+  } else {
+    after_name.strip_suffix('>').unwrap_or(after_name)
+  };
+  let attrs = parse_tag_attrs(attrs_raw);
+
+  let mut rebuilt = format!("<{tag_name}");
+  for (name, value) in attrs {
+    let rewritten_value = if name.starts_with("on") {
+      value
+        .as_deref()
+        .map(|expr| prefix_event_handler_expr(expr, event_fns, prefix))
+    } else {
+      value
+    };
+
+    match rewritten_value {
+      Some(v) => write!(rebuilt, r#" {name}="{v}""#).expect("infallible"),
+      None => write!(rebuilt, " {name}").expect("infallible"),
+    }
+  }
+
+  if self_closing {
+    rebuilt.push_str(" />");
+  } else {
+    rebuilt.push('>');
+  }
+
+  rebuilt
+}
+
+fn prefix_event_handler_expr(expr: &str, event_fns: &[String], prefix: &str) -> String {
+  let trimmed = expr.trim();
+
+  for event_fn in event_fns {
+    if trimmed == event_fn {
+      return format!("{prefix}{event_fn}");
+    }
+
+    if let Some(rest) = trimmed.strip_prefix(event_fn)
+      && rest.starts_with('(')
+    {
+      return format!("{prefix}{event_fn}{rest}");
+    }
+  }
+
+  expr.to_owned()
+}
+
 // ── Component expansion ──────────────────────────────────────────────────────
 
 /// Replace `<slot>` / `<slot/>` / `<slot />` in a component template body with
-/// the Minijinja `{{ caller() }}` expression.
+/// the Minijinja `caller()` expression, defaulting to empty output when the
+/// component was invoked without a `{% call %}` block.
 ///
 /// Used when building a component's `{% macro %}` body so that child content
 /// passed via `{% call %}` blocks is rendered in the right position.
@@ -575,7 +700,7 @@ pub fn expand_slot(template: &str) -> String {
   for token in tokens {
     match token {
       TemplateToken::Text(s) => out.push_str(s),
-      TemplateToken::Slot => out.push_str("{{ caller() }}"),
+      TemplateToken::Slot => out.push_str("{{ caller() if caller is defined else '' }}"),
       // Nested components inside a component — pass through as raw HTML for now.
       TemplateToken::ComponentOpen {
         name,
@@ -659,15 +784,28 @@ pub fn list_used_component_names(template: &str, known_names: &[&str]) -> Vec<St
 ///
 /// The returned string is the expanded template body **without** the macro
 /// definitions prepended — the caller is responsible for prepending them.
+#[expect(dead_code, reason = "compat wrapper for callers that only need expanded template text")]
 pub fn expand_component_tags(template: &str, known_names: &[&str]) -> String {
+  expand_component_tags_with_instances(template, known_names).template
+}
+
+pub fn expand_component_tags_with_instances(
+  template: &str,
+  known_names: &[&str],
+) -> ComponentExpansion {
   use thebe_parser::{TemplateToken, tokenize_template};
 
   if known_names.is_empty() {
-    return template.to_owned();
+    return ComponentExpansion {
+      template: template.to_owned(),
+      instances: Vec::new(),
+    };
   }
 
   let tokens = tokenize_template(template);
   let mut out = String::with_capacity(template.len() + 256);
+  let mut instances = Vec::new();
+  let mut instance_idx = 0usize;
 
   for token in tokens {
     match token {
@@ -679,10 +817,25 @@ pub fn expand_component_tags(template: &str, known_names: &[&str]) -> String {
         self_closing,
       } => {
         if known_names.contains(&name) {
-          let macro_name = format!("__comp_{}", name.to_lowercase());
+          let instance_id = format!("c{instance_idx}");
+          let macro_name = format!("__comp_{}_{}", name.to_lowercase(), instance_idx);
           let props_dict = build_jinja_props(&attrs);
+          instances.push(ComponentInstance {
+            component_name: name.to_owned(),
+            macro_name: macro_name.clone(),
+            instance_id,
+            attrs: attrs
+              .into_iter()
+              .map(|attr| ComponentInstanceAttr {
+                name: attr.name.trim_start_matches(':').to_owned(),
+                value: attr.value.map(str::to_owned),
+                dynamic: attr.name.starts_with(':'),
+              })
+              .collect(),
+          });
+          instance_idx += 1;
           if self_closing {
-            write!(out, "{{% call {macro_name}({props_dict}) %}}{{% endcall %}}",)
+            write!(out, "{{{{ {macro_name}({props_dict}) }}}}")
               .expect("infallible");
           } else {
             write!(out, "{{% call {macro_name}({props_dict}) %}}").expect("infallible");
@@ -715,7 +868,10 @@ pub fn expand_component_tags(template: &str, known_names: &[&str]) -> String {
     }
   }
 
-  out
+  ComponentExpansion {
+    template: out,
+    instances,
+  }
 }
 
 #[cfg(test)]
@@ -730,6 +886,41 @@ mod tests {
     );
 
     assert_eq!(used, vec![String::from("Card"), String::from("Badge")]);
+  }
+
+  #[test]
+  fn expand_component_tags_with_instances_tracks_component_use_sites() {
+    let expansion = expand_component_tags_with_instances(
+      r#"<Card :title="name" count><Badge label="x" /></Card>"#,
+      &["Card", "Badge"],
+    );
+
+    assert!(expansion.template.contains("__comp_card_0({\"title\": name, \"count\": true})"));
+    assert!(expansion.template.contains("__comp_badge_1({\"label\": \"x\"})"));
+    assert_eq!(expansion.instances.len(), 2);
+    assert_eq!(expansion.instances[0].component_name, "Card");
+    assert_eq!(expansion.instances[0].instance_id, "c0");
+    assert_eq!(expansion.instances[0].attrs[0].name, "title");
+    assert!(expansion.instances[0].attrs[0].dynamic);
+    assert_eq!(expansion.instances[0].attrs[0].value.as_deref(), Some("name"));
+    assert_eq!(expansion.instances[0].attrs[1].name, "count");
+    assert!(!expansion.instances[0].attrs[1].dynamic);
+    assert_eq!(expansion.instances[0].attrs[1].value, None);
+    assert_eq!(expansion.instances[1].component_name, "Badge");
+    assert_eq!(expansion.instances[1].instance_id, "c1");
+  }
+
+  #[test]
+  fn prefix_event_handler_attrs_scopes_component_handlers() {
+    let out = prefix_event_handler_attrs(
+      r#"<button onclick="increment" oninput="adjust(this.value)" data-x="keep"></button>"#,
+      &[String::from("increment"), String::from("adjust")],
+      "__thebe_component_c0__",
+    );
+
+    assert!(out.contains(r#"onclick="__thebe_component_c0__increment""#), "{out}");
+    assert!(out.contains(r#"oninput="__thebe_component_c0__adjust(this.value)""#), "{out}");
+    assert!(out.contains(r#"data-x="keep""#), "{out}");
   }
 
   #[test]
@@ -782,6 +973,13 @@ mod tests {
       &template[occurrences[1].span.start..occurrences[1].span.end],
       "{{ user.name }}"
     );
+  }
+
+  #[test]
+  fn expand_slot_defaults_to_empty_when_no_caller_exists() {
+    let out = expand_slot("<div><slot /></div>");
+
+    assert_eq!(out, "<div>{{ caller() if caller is defined else '' }}</div>");
   }
 
   // ── inject_hydration_markers ────────────────────────────────────────────
