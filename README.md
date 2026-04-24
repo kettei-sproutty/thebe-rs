@@ -10,9 +10,9 @@ The goal is not to replace Axum with a separate platform. The goal is to keep Ru
 
 ## Status
 
-Thebe is past the server-only proof-of-concept stage. The repository already ships the core route pipeline: `.trs` parsing, SSR, scoped CSS, client hydration, generated `.thebe/` tooling artifacts, a compiler-backed LSP, and initial editor packages for VS Code and tree-sitter.
+Thebe is past the server-only proof-of-concept stage. The repository already ships the core route pipeline: `.trs` parsing, SSR, scoped CSS, client hydration, generated `.thebe/` tooling artifacts, a compiler-backed LSP, initial editor packages for VS Code and tree-sitter, and a supported opt-in hotpatch dev loop.
 
-What is still missing is the remaining narrower surface: named slots, deeper editor/tree-sitter polish, and graduating the experimental hotpatch path.
+What is still missing is the remaining narrower surface: named slots and deeper editor/tree-sitter polish.
 
 For a repo-accurate view of shipped versus planned work, see [docs/status.md](docs/status.md) and [docs/editor-tooling.md](docs/editor-tooling.md).
 
@@ -528,6 +528,7 @@ Shipped today:
 - `.trs` parsing, SSR rendering, scoped CSS, layouts, components, app shells, hydration markers, and dynamic attribute bindings.
 - Client `Props` bridging and generated TypeScript mirrors under `.thebe/`.
 - CLI flows for `thebe new`, `thebe dev`, `thebe dev --watch`, `thebe dev --hotpatch`, `thebe build`, and `thebe check`.
+- Supported opt-in hotpatch updates for route, layout, and component `.trs` template, `<head>`, style, and `<script lang="ts">` edits, with restart fallback for Rust and server-script changes.
 - `thebe-lsp` diagnostics, semantic tokens, hover, document symbols, definition, references, rename, code actions, formatting, and richer completions.
 - Packaged editor assets under `packages/thebe-vscode/` and `packages/tree-sitter-thebe/`.
 
@@ -535,7 +536,6 @@ Still missing:
 
 - Named slot composition in components.
 - Deeper polish on the initial formatter, rename surface, and tree-sitter grammar.
-- Graduating the experimental hotpatch path into the default supported dev surface.
 
 The detailed breakdown lives in [docs/status.md](docs/status.md) and [docs/editor-tooling.md](docs/editor-tooling.md).
 

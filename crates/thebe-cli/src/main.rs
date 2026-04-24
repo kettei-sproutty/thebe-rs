@@ -22,7 +22,7 @@ enum Command {
     /// Watch `.trs` files and auto-restart the server on changes.
     #[arg(long, short, conflicts_with = "hotpatch")]
     watch: bool,
-    /// Experimental: start a hotpatch-managed dev loop with restart fallback.
+    /// Start a hotpatch-managed dev loop with in-place `.trs` updates and restart fallback.
     #[arg(long, conflicts_with = "watch")]
     hotpatch: bool,
   },

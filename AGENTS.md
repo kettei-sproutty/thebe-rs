@@ -4,7 +4,7 @@ High-signal guidance for OpenCode agents working on Thebe.
 
 ## Project Status
 
-Core route/layout/component compilation, generated `.thebe` tooling artifacts, the initial LSP/editor packages, and an experimental hotpatch path are already implemented. Named slots, deeper editor polish, and hotpatch graduation are still pending.
+Core route/layout/component compilation, generated `.thebe` tooling artifacts, the initial LSP/editor packages, and a supported opt-in hotpatch path are already implemented. Named slots and deeper editor polish are still pending.
 
 ## What Thebe Is
 
@@ -76,7 +76,7 @@ Thebe compiles to standard `axum::Router`. All Axum extractors work (State, Path
 1. Keep routes, layouts, components, hydration, and generated tooling stable.
 2. Finish the missing named-slot composition surface.
 3. Continue polishing LSP/editor behavior.
-4. Graduate the experimental hotpatch path once the patch/restart boundary is solid.
+4. Keep hardening the supported hotpatch path and only widen it when the patch/restart boundary stays solid.
 
 ## Non-Goals for v0
 

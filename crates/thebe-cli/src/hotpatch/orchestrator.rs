@@ -26,7 +26,7 @@ const RUNTIME_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
 const CHILD_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
 const FORCED_RUNTIME_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(300);
 
-/// Run the experimental hotpatch dev loop.
+/// Run the hotpatch dev loop.
 pub(crate) fn run(project_root: &Path) -> anyhow::Result<()> {
   let (listener, server_addr) = PatchServer::bind()
     .context("failed to bind the local hotpatch server")?;
@@ -50,7 +50,7 @@ pub(crate) fn run(project_root: &Path) -> anyhow::Result<()> {
     browser_server.local_addr()
   );
   println!(
-    "thebe: hotpatch mode — template/style .trs changes patch in place; script and Rust changes restart"
+    "thebe: hotpatch mode — route/layout/component template, head, style, and client-script deltas patch in place; Rust, <script setup>, and plain <script> changes restart"
   );
 
   let src_dir = project_root.join("src");

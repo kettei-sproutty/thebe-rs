@@ -35,30 +35,7 @@ fn style_only_route_edit_should_emit_style_event_without_runtime_restart() {
     .expect("fixture page body should read");
   assert!(page.contains("Hello hotpatch"));
 
-  let (event_tx, event_rx) = mpsc::channel();
-  let sse_handle = thread::spawn(move || {
-    let response = client
-      .get(format!("http://{browser_addr}/.thebe/dev/events"))
-      .send()
-      .expect("browser event stream should connect");
-    let mut reader = BufReader::new(response);
-    let mut line = String::new();
-
-    loop {
-      line.clear();
-      let bytes_read = reader
-        .read_line(&mut line)
-        .expect("event stream line should read");
-      if bytes_read == 0 {
-        break;
-      }
-
-      let trimmed = line.trim().to_owned();
-      if trimmed.starts_with("event:") || trimmed.starts_with("data:") {
-        let _ = event_tx.send(trimmed);
-      }
-    }
-  });
+  let (event_rx, sse_handle) = open_event_stream(browser_addr);
 
   thread::sleep(Duration::from_millis(150));
   fixture.write("src/routes/index.trs", updated_route_source());
@@ -129,30 +106,7 @@ fn template_only_route_edit_should_emit_template_event_without_runtime_restart()
     .expect("fixture page body should read");
   assert!(page.contains("Template before"));
 
-  let (event_tx, event_rx) = mpsc::channel();
-  let sse_handle = thread::spawn(move || {
-    let response = client
-      .get(format!("http://{browser_addr}/.thebe/dev/events"))
-      .send()
-      .expect("browser event stream should connect");
-    let mut reader = BufReader::new(response);
-    let mut line = String::new();
-
-    loop {
-      line.clear();
-      let bytes_read = reader
-        .read_line(&mut line)
-        .expect("event stream line should read");
-      if bytes_read == 0 {
-        break;
-      }
-
-      let trimmed = line.trim().to_owned();
-      if trimmed.starts_with("event:") || trimmed.starts_with("data:") {
-        let _ = event_tx.send(trimmed);
-      }
-    }
-  });
+  let (event_rx, sse_handle) = open_event_stream(browser_addr);
 
   thread::sleep(Duration::from_millis(150));
   fixture.write("src/routes/index.trs", updated_template_route_source());

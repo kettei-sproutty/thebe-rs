@@ -1,12 +1,12 @@
 # Hotpatch Engine
 
-Status: design target plus experimental implementation.
+Status: long-term design target plus shipped conservative implementation.
 
-This document describes the long-term target for Thebe's first-party hotpatch engine. The repository already ships an experimental `thebe dev --hotpatch` path with a local patch server, runtime handshake/control loop, generated `.thebe/hotpatch.rs` glue, text-artifact patch delivery, browser refresh notifications, and restart fallback. This page still captures the fuller target architecture rather than only the currently shipped slice.
+This document describes the long-term target for Thebe's first-party hotpatch engine. The repository already ships a supported opt-in `thebe dev --hotpatch` path with a local patch server, runtime handshake/control loop, generated `.thebe/hotpatch.rs` glue, text-artifact patch delivery, browser refresh notifications, and restart fallback. This page still captures the fuller target architecture rather than only the currently shipped slice.
 
 ## Summary
 
-Thebe now has an experimental server-side hotpatch mode for development that updates a running Axum process without a full restart when a change is safe to patch.
+Thebe now has a conservative server-side hotpatch mode for development that updates a running Axum process without a full restart when a change is safe to patch.
 
 The design will use `subsecond` as the in-process patch runtime, but Thebe itself will own the rest of the system:
 
@@ -42,14 +42,14 @@ The intended long-term interface is:
 2. `thebe dev --watch` for restart-on-change behavior.
 3. `thebe dev --hotpatch` for patch-first development.
 
-Current experimental behavior for `thebe dev --hotpatch`:
+Current shipped behavior for `thebe dev --hotpatch`:
 
 1. Run the initial codegen pass.
 2. Build and launch the development binary in a hotpatch-aware mode.
 3. Watch Thebe inputs and relevant Rust sources.
 4. Decide per change whether to patch or restart.
-5. Patch route, layout, and component `.trs` template, `<head>`, and style changes in place.
-6. Restart for all Rust source, `<script>`, `<script setup>`, shell, config, and dependency changes.
+5. Patch route, layout, and component `.trs` template, `<head>`, style, and `<script lang="ts">` changes in place.
+6. Restart for Rust source, plain `<script>`, `<script setup>`, shell, config, and dependency changes.
 7. Scope layout and component hotpatch delivery to the affected routes when that can be resolved safely.
 8. Emit clear diagnostics when a restart is chosen.
 

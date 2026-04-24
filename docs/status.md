@@ -23,7 +23,7 @@ This page tracks what is actually implemented in the repository today versus wha
   - `thebe new`
   - `thebe dev`
   - `thebe dev --watch`
-  - `thebe dev --hotpatch` (experimental)
+  - `thebe dev --hotpatch`
   - `thebe build`
   - `thebe check`
 - `thebe-lsp` language server with diagnostics, semantic tokens, document highlights, linked editing, hover, document symbols, definition, references, rename, code actions, formatting, and richer completions.
@@ -36,13 +36,12 @@ This page tracks what is actually implemented in the repository today versus wha
 - Rename support is currently limited to route handlers, route template symbols, component prop definitions/usages, component tag/import relationships across known `.trs` sources, and client event handlers.
 - The tree-sitter grammar is still an initial grammar rather than a full HTML-aware parser.
 - Production assets are emitted under `.thebe/assets` and served by generated routes rather than a standalone public dist pipeline.
-- The experimental hotpatch path patches route, layout, and component `.trs` template, `<head>`, style, and `<script lang="ts">` deltas in place through the dev artifact path; Rust, `<script setup>`, and plain `<script>` changes still force restart.
+- The shipped opt-in hotpatch path patches route, layout, and component `.trs` template, `<head>`, style, and `<script lang="ts">` deltas in place through the dev artifact path; Rust, `<script setup>`, and plain `<script>` changes still force restart.
 - Component and layout hotpatches now scope runtime/browser updates to the affected routes instead of always falling back to a global template refresh.
 
 ## Planned Or Missing
 
 - Named slot composition outside route layouts is still planned.
-- Hotpatch remains experimental even though `thebe dev --hotpatch` now exists.
 
 ## Reading The Docs Safely
 
@@ -50,4 +49,4 @@ Some pages in this doc set describe the intended Thebe model, not only the shipp
 
 - routes, layouts, SSR, hydration, scoped CSS, `.thebe` artifacts, the current LSP, and the initial editor extension assets are real
 - standalone component compilation and runtime dynamic attribute support are shipped
-- named slots and a fully graduated hotpatch workflow are not shipped yet
+- named slots are not shipped yet, and the hotpatch docs still describe broader long-term engine work beyond the narrower shipped dev loop
