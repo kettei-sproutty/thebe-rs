@@ -168,3 +168,77 @@ async fn browser_events(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))),
   )
 }
+
+#[cfg(test)]
+mod tests {
+  use super::{BROWSER_EVENTS_PATH, BrowserPatchServer};
+  use reqwest::blocking::Client;
+  use std::io::{BufRead, BufReader};
+  use std::sync::mpsc;
+  use std::thread;
+  use std::time::Duration;
+
+  #[test]
+  fn template_broadcast_without_route_pattern_should_emit_global_template_event() {
+    let server = BrowserPatchServer::spawn().expect("browser patch server should spawn");
+    let client = Client::builder()
+      .timeout(None)
+      .build()
+      .expect("blocking client should build");
+    let server_addr = server.local_addr();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (line_tx, line_rx) = mpsc::channel();
+
+    let reader = thread::spawn(move || {
+      let response = client
+        .get(format!("http://{server_addr}{BROWSER_EVENTS_PATH}"))
+        .send()
+        .expect("browser event stream should connect");
+      ready_tx.send(()).expect("reader should report readiness");
+
+      let mut reader = BufReader::new(response);
+      let mut line = String::new();
+      let mut sent_lines = 0_u8;
+
+      loop {
+        line.clear();
+        let bytes_read = reader
+          .read_line(&mut line)
+          .expect("event stream line should read");
+        if bytes_read == 0 {
+          break;
+        }
+
+        let trimmed = line.trim().to_owned();
+        if trimmed.starts_with("event:") || trimmed.starts_with("data:") {
+          let _ = line_tx.send(trimmed);
+          sent_lines += 1;
+          if sent_lines == 2 {
+            break;
+          }
+        }
+      }
+    });
+
+    ready_rx
+      .recv_timeout(Duration::from_secs(5))
+      .expect("event stream should connect before broadcast");
+
+    server.broadcast_template(None);
+
+    assert_eq!(
+      line_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("template event should arrive"),
+      "event: template"
+    );
+    assert_eq!(
+      line_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("template payload should arrive"),
+      "data: {}"
+    );
+
+    let _ = reader.join();
+  }
+}

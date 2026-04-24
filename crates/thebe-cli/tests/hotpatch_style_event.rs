@@ -370,6 +370,69 @@ fn head_only_layout_edit_should_emit_template_event_for_affected_route_without_r
 }
 
 #[test]
+fn unused_layout_edit_should_not_emit_browser_event_or_restart_runtime() {
+  let _guard = hotpatch_test_guard();
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("unused-layout-noop");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", initial_template_route_source());
+  fixture.write("src/routes/admin/_layout.trs", initial_unused_layout_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  let browser_addr = wait_for_browser_addr(fixture.root());
+
+  assert!(fetch_page(fixture_port, "/").contains("Template before"));
+
+  let (event_rx, sse_handle) = open_event_stream(browser_addr);
+
+  thread::sleep(Duration::from_millis(150));
+  fixture.write("src/routes/admin/_layout.trs", updated_unused_layout_source());
+
+  wait_for_output_line(
+    &output,
+    |line| line.contains("refreshing hotpatch state"),
+    Duration::from_secs(20),
+  )
+  .unwrap_or_else(|error| {
+    panic!(
+      "{error}\nprocess output:\n{}",
+      collected_lines(&output).join("\n")
+    )
+  });
+
+  match event_rx.recv_timeout(Duration::from_secs(2)) {
+    Err(mpsc::RecvTimeoutError::Timeout) => {}
+    Err(mpsc::RecvTimeoutError::Disconnected) => {
+      panic!(
+        "event stream disconnected unexpectedly\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      );
+    }
+    Ok(line) => {
+      panic!(
+        "unexpected browser event for unused layout edit: {line}\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      );
+    }
+  }
+
+  assert!(fetch_page(fixture_port, "/").contains("Template before"));
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  let _ = sse_handle.join();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
 fn route_script_edit_should_restart_runtime_with_generated_input_reason() {
   let _guard = hotpatch_test_guard();
   let fixture_port = reserve_port();
@@ -390,6 +453,12 @@ fn route_script_edit_should_restart_runtime_with_generated_input_reason() {
   wait_for_output_line(
     &output,
     |line| line.contains("restart required — Thebe-generated input changed"),
+    Duration::from_secs(30),
+  )
+  .unwrap();
+  wait_for_output_line(
+    &output,
+    |line| line.contains("thebe: hotpatch restart requested — Thebe-generated input changed"),
     Duration::from_secs(30),
   )
   .unwrap();
@@ -422,6 +491,12 @@ fn entry_point_edit_should_restart_runtime_with_entry_point_reason() {
   wait_for_output_line(
     &output,
     |line| line.contains("restart required — application entry point changed"),
+    Duration::from_secs(30),
+  )
+  .unwrap();
+  wait_for_output_line(
+    &output,
+    |line| line.contains("thebe: hotpatch restart requested — application entry point changed"),
     Duration::from_secs(30),
   )
   .unwrap();
@@ -725,6 +800,32 @@ fn updated_layout_head_source() -> &'static str {
 </head>
 
 <div>
+  <slot />
+</div>
+"#
+}
+
+fn initial_unused_layout_source() -> &'static str {
+  r#"<style>
+.admin-shell {
+  color: red;
+}
+</style>
+
+<div class="admin-shell">
+  <slot />
+</div>
+"#
+}
+
+fn updated_unused_layout_source() -> &'static str {
+  r#"<style>
+.admin-shell {
+  color: blue;
+}
+</style>
+
+<div class="admin-shell">
   <slot />
 </div>
 "#

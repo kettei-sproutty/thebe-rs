@@ -215,16 +215,12 @@ struct RestartPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RestartTrigger {
-  PatchCandidate,
   RestartRequired(RestartReason),
 }
 
 impl RestartTrigger {
   fn message(&self) -> String {
     match self {
-      Self::PatchCandidate => {
-        String::from("hotpatch candidate could not be scoped safely, restarting")
-      }
       Self::RestartRequired(reason) => {
         format!("restart required — {}", reason.describe())
       }
@@ -233,9 +229,6 @@ impl RestartTrigger {
 
   fn protocol_reason(&self) -> &'static str {
     match self {
-      Self::PatchCandidate => {
-        "patch candidate requires restart until runtime patch delivery is wired"
-      }
       Self::RestartRequired(reason) => reason.describe(),
     }
   }
@@ -264,7 +257,7 @@ fn plan_change_batch_with_snapshots(
       || {
         ChangePlan::Restart(RestartPlan {
           refresh_codegen: should_refresh_codegen(project_root, changed_paths),
-          trigger: RestartTrigger::PatchCandidate,
+          trigger: RestartTrigger::RestartRequired(RestartReason::GeneratedInput),
         })
       },
       ChangePlan::Patch,
@@ -868,6 +861,36 @@ mod tests {
       plan,
       ChangePlan::Patch(PatchPlan {
         browser_patch: BrowserPatch::StyleRoutes(vec![route_path]),
+        refresh_codegen: true,
+      })
+    );
+
+    let _ = fs::remove_dir_all(project_root);
+  }
+
+  #[test]
+  fn plan_change_batch_should_fall_back_to_global_template_patch_without_manifest() {
+    let project_root = temp_project_root("patch-global-component-fallback");
+    let component_path = project_root.join("src/components/Card.trs");
+
+    fs::create_dir_all(project_root.join("src/components")).expect("components dir should create");
+    write_snapshot(
+      &project_root,
+      &component_path,
+      "<style>.card { color: red; }</style>\n<div class=\"card\">Card</div>",
+    );
+    fs::write(
+      &component_path,
+      "<style>.card { color: blue; }</style>\n<div class=\"card\">Card</div>",
+    )
+    .expect("component should write");
+
+    let plan = plan_change_batch(&project_root, &[component_path]);
+
+    assert_eq!(
+      plan,
+      ChangePlan::Patch(PatchPlan {
+        browser_patch: BrowserPatch::TemplateGlobal,
         refresh_codegen: true,
       })
     );
