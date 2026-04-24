@@ -861,6 +861,75 @@ fn layout_client_script_edit_should_refresh_live_browser_and_apply_new_handler_w
   }
 }
 
+#[cfg(unix)]
+#[test]
+fn hotpatch_process_should_exit_cleanly_on_sigint_with_live_browser_page_connected() {
+  let _guard = hotpatch_test_guard();
+  if !playwright_probe_supported() {
+    eprintln!("skipping Playwright hotpatch shutdown test: local Playwright runtime is unavailable");
+    return;
+  }
+
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("shutdown-browser-session");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", initial_template_route_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("Template before"));
+
+  let mut probe = spawn_playwright_probe(
+    &shutdown_hotpatch_probe_script(fixture_port),
+    &fixture.root().join("src/routes/index.trs"),
+    initial_template_route_source(),
+  );
+  let probe_output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let probe_threads = spawn_child_output_collectors(&mut probe, Arc::clone(&probe_output));
+
+  wait_for_output_line(
+    &probe_output,
+    |line| line.starts_with("event-source-opened "),
+    Duration::from_secs(30),
+  )
+  .unwrap_or_else(|error| {
+    panic!(
+      "{error}\nprobe output:\n{}\nhotpatch output:\n{}",
+      collected_lines(&probe_output).join("\n"),
+      collected_lines(&output).join("\n")
+    )
+  });
+
+  let exit_status = child
+    .interrupt_and_wait(Duration::from_secs(10))
+    .unwrap_or_else(|error| {
+      panic!(
+        "{error}\nprobe output:\n{}\nhotpatch output:\n{}",
+        collected_lines(&probe_output).join("\n"),
+        collected_lines(&output).join("\n")
+      )
+    });
+  assert!(
+    exit_status.success(),
+    "expected clean shutdown after SIGINT, got {exit_status}\nprobe output:\n{}\nhotpatch output:\n{}",
+    collected_lines(&probe_output).join("\n"),
+    collected_lines(&output).join("\n")
+  );
+  wait_for_app_to_stop(fixture_port, Duration::from_secs(5));
+
+  terminate_process_tree(&mut probe);
+  for handle in probe_threads {
+    let _ = handle.join();
+  }
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
 #[test]
 fn component_client_script_should_work_in_live_browser() {
   let _guard = hotpatch_test_guard();
@@ -1224,6 +1293,43 @@ impl ManagedChild {
     if let Some(mut child) = self.child.take() {
       terminate_process_tree(&mut child);
     }
+  }
+
+  #[cfg(unix)]
+  fn interrupt_and_wait(
+    &mut self,
+    timeout: Duration,
+  ) -> Result<std::process::ExitStatus, String> {
+    let pid = self.child_mut().id();
+    let status = Command::new("kill")
+      .args(["-INT", &pid.to_string()])
+      .status()
+      .map_err(|error| format!("failed to send SIGINT to hotpatch process {pid}: {error}"))?;
+    if !status.success() {
+      return Err(format!(
+        "kill -INT {pid} returned non-zero status {status}"
+      ));
+    }
+
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+      let exit_status = self
+        .child
+        .as_mut()
+        .expect("managed child should be present")
+        .try_wait()
+        .map_err(|error| format!("failed to wait for hotpatch process {pid}: {error}"))?;
+      if let Some(exit_status) = exit_status {
+        self.child = None;
+        return Ok(exit_status);
+      }
+      thread::sleep(Duration::from_millis(100));
+    }
+
+    self.terminate();
+    Err(format!(
+      "timed out waiting for hotpatch process {pid} to exit after SIGINT"
+    ))
   }
 
   fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -2769,6 +2875,85 @@ const beforeUnloadKey = "__thebe_noop_beforeunload__";
 })();
 "#;
 
+const SHUTDOWN_HOTPATCH_PROBE_SCRIPT: &str = r#"
+const { chromium } = require("playwright");
+
+const targetUrl = "__TARGET_URL__";
+
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => {
+    pageErrors.push(error && error.stack ? error.stack : String(error));
+  });
+
+  await page.addInitScript(() => {
+    const NativeEventSource = window.EventSource;
+    const probe = {
+      openCount: 0,
+      eventSourceUrl: null
+    };
+
+    Object.defineProperty(window, "__thebeShutdownProbe", {
+      configurable: true,
+      value: probe
+    });
+
+    if (typeof NativeEventSource !== "function") {
+      probe.unsupported = true;
+      return;
+    }
+
+    class PatchedEventSource extends NativeEventSource {
+      constructor(...args) {
+        super(...args);
+        probe.eventSourceUrl = String(args[0] || "");
+        this.addEventListener("open", () => {
+          probe.openCount += 1;
+        });
+      }
+    }
+
+    PatchedEventSource.CONNECTING = NativeEventSource.CONNECTING;
+    PatchedEventSource.OPEN = NativeEventSource.OPEN;
+    PatchedEventSource.CLOSED = NativeEventSource.CLOSED;
+    window.EventSource = PatchedEventSource;
+  });
+
+  try {
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      () =>
+        window.__thebeShutdownProbe &&
+        window.__thebeShutdownProbe.openCount > 0 &&
+        typeof window.__thebe_dev_refresh === "function" &&
+        typeof window.__thebe_dev_apply_style === "function",
+      null,
+      { timeout: 30000 }
+    );
+
+    const result = await page.evaluate(() => ({
+      openCount: window.__thebeShutdownProbe.openCount,
+      eventSourceUrl: window.__thebeShutdownProbe.eventSourceUrl,
+      hasRefresh: typeof window.__thebe_dev_refresh === "function",
+      hasStyleApply: typeof window.__thebe_dev_apply_style === "function"
+    }));
+    console.log(`event-source-opened ${JSON.stringify(result)}`);
+
+    await new Promise(() => {});
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : String(error));
+    if (pageErrors.length > 0) {
+      console.error(pageErrors.join("\n"));
+    }
+    process.exitCode = 1;
+  } finally {
+    await browser.close();
+  }
+})();
+"#;
+
 fn style_hotpatch_probe_script(port: u16) -> String {
   STYLE_HOTPATCH_PROBE_SCRIPT.replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
 }
@@ -2815,6 +3000,10 @@ fn component_template_hotpatch_probe_script(port: u16) -> String {
 
 fn noop_hotpatch_probe_script(port: u16) -> String {
   NOOP_HOTPATCH_PROBE_SCRIPT.replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
+}
+
+fn shutdown_hotpatch_probe_script(port: u16) -> String {
+  SHUTDOWN_HOTPATCH_PROBE_SCRIPT.replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
 }
 
 fn workspace_root() -> PathBuf {
@@ -2896,13 +3085,20 @@ fn spawn_output_collectors(
   child: &mut ManagedChild,
   output: Arc<Mutex<Vec<String>>>,
 ) -> Vec<thread::JoinHandle<()>> {
+  spawn_child_output_collectors(child.child_mut(), output)
+}
+
+fn spawn_child_output_collectors(
+  child: &mut Child,
+  output: Arc<Mutex<Vec<String>>>,
+) -> Vec<thread::JoinHandle<()>> {
   let mut handles = Vec::new();
 
-  if let Some(stdout) = child.child_mut().stdout.take() {
+  if let Some(stdout) = child.stdout.take() {
     handles.push(spawn_output_collector(stdout, Arc::clone(&output)));
   }
 
-  if let Some(stderr) = child.child_mut().stderr.take() {
+  if let Some(stderr) = child.stderr.take() {
     handles.push(spawn_output_collector(stderr, output));
   }
 
@@ -3100,6 +3296,20 @@ fn wait_for_app_ready_with_output(port: u16, output: &Arc<Mutex<Vec<String>>>) {
     "fixture app did not become ready on port {port}{last_response}\nprocess output:\n{}",
     collected_lines(output).join("\n")
   );
+}
+
+fn wait_for_app_to_stop(port: u16, timeout: Duration) {
+  let started = Instant::now();
+
+  while started.elapsed() < timeout {
+    if try_fetch_page(port, "/").is_none() {
+      return;
+    }
+
+    thread::sleep(Duration::from_millis(100));
+  }
+
+  panic!("fixture app on port {port} still responded after {timeout:?}");
 }
 
 fn wait_for_browser_addr(project_root: &Path) -> SocketAddr {
