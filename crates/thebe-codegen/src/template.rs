@@ -628,6 +628,28 @@ fn build_jinja_props(attrs: &[thebe_parser::TemplateAttr<'_>]) -> String {
   out
 }
 
+#[must_use]
+pub fn list_used_component_names(template: &str, known_names: &[&str]) -> Vec<String> {
+  use thebe_parser::{TemplateToken, tokenize_template};
+
+  if known_names.is_empty() {
+    return Vec::new();
+  }
+
+  let mut used = Vec::new();
+
+  for token in tokenize_template(template) {
+    if let TemplateToken::ComponentOpen { name, .. } = token
+      && known_names.contains(&name)
+      && !used.iter().any(|used_name| used_name == name)
+    {
+      used.push(name.to_owned());
+    }
+  }
+
+  used
+}
+
 /// Expand PascalCase component tags in a route template into Minijinja
 /// `{% call %}` / `{% endcall %}` blocks.
 ///
@@ -699,6 +721,16 @@ pub fn expand_component_tags(template: &str, known_names: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn list_used_component_names_returns_known_pascal_case_tags_once() {
+    let used = list_used_component_names(
+      "<Card /><div></div><Badge></Badge><Card><span /></Card><Unknown />",
+      &["Card", "Badge"],
+    );
+
+    assert_eq!(used, vec![String::from("Card"), String::from("Badge")]);
+  }
 
   #[test]
   fn parse_single_binding() {

@@ -12,5 +12,5 @@ pub use generator::{
 };
 pub use template::{
   TemplateBindingOccurrence, inject_attr_bindings, list_template_binding_occurrences,
-  list_template_bindings,
+  list_template_bindings, list_used_component_names,
 };

@@ -48,9 +48,10 @@ Current experimental behavior for `thebe dev --hotpatch`:
 2. Build and launch the development binary in a hotpatch-aware mode.
 3. Watch Thebe inputs and relevant Rust sources.
 4. Decide per change whether to patch or restart.
-5. Patch only `.trs` template, `<head>`, and style changes in place.
+5. Patch route, layout, and component `.trs` template, `<head>`, and style changes in place.
 6. Restart for all Rust source, `<script>`, `<script setup>`, shell, config, and dependency changes.
-7. Emit clear diagnostics when a restart is chosen.
+7. Scope layout and component hotpatch delivery to the affected routes when that can be resolved safely.
+8. Emit clear diagnostics when a restart is chosen.
 
 The user should not need to install or invoke a second CLI.
 
@@ -211,8 +212,9 @@ The initial implementation should bias toward restart.
 ### Likely Patchable
 
 1. Route or component template changes that only affect generated render logic.
-2. Route, layout, or component `<head>` changes that only affect generated HTML assembly.
-3. Route, layout, or component style changes that only affect generated CSS artifacts.
+2. Layout template changes that only affect routes wrapped by that layout.
+3. Route, layout, or component `<head>` changes that only affect generated HTML assembly.
+4. Route, layout, or component style changes that only affect generated CSS artifacts.
 
 ### Restart Required
 

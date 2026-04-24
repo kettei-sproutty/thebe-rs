@@ -105,6 +105,8 @@ pub struct RouteMetadata {
   pub generated_client_path: Option<String>,
   pub generated_server_path: String,
   pub generated_types_path: Option<String>,
+  #[serde(default)]
+  pub component_source_paths: Vec<String>,
   pub handler: HandlerMetadata,
   pub has_client_script: bool,
   pub has_head: bool,
@@ -497,7 +499,7 @@ pub fn generate_project_with_overlay(
   write_manifest_file(project_root, &manifest)?;
 
   let diagnostics = ThebeDiagnosticsFile {
-    version: 1,
+      version: 6,
     diagnostics: Vec::new(),
   };
   write_diagnostics_file(project_root, &diagnostics)?;
@@ -1571,12 +1573,12 @@ fn build_thebe_manifest(
   let layout_entries = build_thebe_manifest_layouts(project_root, layouts)?;
   let routes = routes
     .iter()
-    .map(|route| build_thebe_manifest_route(project_root, routes_dir, route, layouts))
+    .map(|route| build_thebe_manifest_route(project_root, routes_dir, route, layouts, components))
     .collect::<anyhow::Result<Vec<_>>>()?;
   let components = build_thebe_manifest_components(project_root, components)?;
 
   Ok(ThebeManifest {
-    version: 5,
+    version: 6,
     server_router_path: THEBE_SERVER_ROUTES_FILE.to_owned(),
     app_html: AppHtmlMetadata {
       source_path: app_html_path
@@ -1595,6 +1597,7 @@ fn build_thebe_manifest_route(
   routes_dir: &Path,
   route: &ParsedRoute,
   layouts: &HashMap<PathBuf, ParsedLayout>,
+  components: &[ParsedComponent],
 ) -> anyhow::Result<RouteMetadata> {
   let layout = find_layout(layouts, &route.trs_path, routes_dir);
   let relative_rs_path = route
@@ -1602,6 +1605,16 @@ fn build_thebe_manifest_route(
     .strip_prefix(routes_dir)
     .with_context(|| format!("route {} is outside src/routes/", route.trs_path.display()))?
     .with_extension("rs");
+  let known_component_names: Vec<&str> = components.iter().map(|component| component.tag_name.as_str()).collect();
+  let component_source_paths = thebe_codegen::list_used_component_names(&route.blocks.template, &known_component_names)
+    .into_iter()
+    .filter_map(|component_name| {
+      components
+        .iter()
+        .find(|component| component.tag_name == component_name)
+    })
+    .map(|component| to_project_relative_path(project_root, &component.trs_path))
+    .collect::<anyhow::Result<Vec<_>>>()?;
 
   Ok(RouteMetadata {
     generated_client_path: route
@@ -1616,6 +1629,7 @@ fn build_thebe_manifest_route(
       .types_export_path
       .as_ref()
       .map(|path| format!("{TYPECHECK_TYPES_DIR}/{path}")),
+    component_source_paths,
     handler: HandlerMetadata {
       is_async: route.handler_info.is_async,
       method: route.handler_info.method.to_owned(),
@@ -2122,7 +2136,7 @@ mod tests {
   #[test]
   fn build_manifest_records_generated_paths() {
     let manifest = ThebeManifest {
-      version: 5,
+      version: 6,
       server_router_path: THEBE_SERVER_ROUTES_FILE.to_owned(),
       app_html: AppHtmlMetadata {
         source_path: Some("app.html".to_owned()),
@@ -2140,6 +2154,7 @@ mod tests {
         generated_client_path: Some(".thebe/client/routes/index.ts".to_owned()),
         generated_server_path: ".thebe/server/routes/index.rs".to_owned(),
         generated_types_path: Some(".thebe/types/routes/index.ts".to_owned()),
+        component_source_paths: Vec::new(),
         handler: HandlerMetadata {
           is_async: false,
           method: "get".to_owned(),
@@ -2386,6 +2401,35 @@ fn handler() -> Props {
     );
     assert_eq!(artifacts.manifest.routes[0].handler.name, "handler");
     assert_eq!(artifacts.manifest.routes[0].template_symbols, vec!["title"]);
+  }
+
+  #[test]
+  fn generate_project_manifest_records_direct_component_dependencies() {
+    let project = TestProject::new("manifest-component-deps");
+    project.write("Cargo.toml", &fixture_cargo_toml(true));
+    project.write(
+      "src/routes/index.trs",
+      r#"<script setup>
+struct Props {}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+
+<Card />
+"#,
+    );
+    project.write("src/components/Card.trs", "<div>Card</div>");
+
+    let artifacts = generate_project(project.path(), BuildMode::Dev)
+      .expect("project generation should succeed");
+
+    assert_eq!(
+      artifacts.manifest.routes[0].component_source_paths,
+      vec![String::from("src/components/Card.trs")]
+    );
   }
 
   #[test]

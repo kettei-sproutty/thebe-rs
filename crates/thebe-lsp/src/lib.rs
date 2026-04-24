@@ -6136,7 +6136,7 @@ struct Post {
       .expect("profile binding");
 
     ThebeManifest {
-      version: 5,
+      version: 6,
       server_router_path: ".thebe/server/routes.rs".to_owned(),
       app_html: thebe_project::AppHtmlMetadata {
         source_path: Some("app.html".to_owned()),
@@ -6164,6 +6164,7 @@ struct Post {
         generated_client_path: Some(".thebe/client/routes/profile.ts".to_owned()),
         generated_server_path: ".thebe/server/routes/profile.rs".to_owned(),
         generated_types_path: Some(".thebe/types/routes/profile.ts".to_owned()),
+        component_source_paths: Vec::new(),
         handler: thebe_project::HandlerMetadata {
           is_async: false,
           method: "get".to_owned(),
@@ -6289,7 +6290,7 @@ fn handler(State(state): State<crate::AppState>) -> Props {
     let title_field = component_source.find("title: String").expect("component prop field");
 
     ThebeManifest {
-      version: 5,
+      version: 6,
       server_router_path: ".thebe/server/routes.rs".to_owned(),
       app_html: thebe_project::AppHtmlMetadata {
         source_path: Some("app.html".to_owned()),
@@ -6302,6 +6303,7 @@ fn handler(State(state): State<crate::AppState>) -> Props {
           generated_client_path: None,
           generated_server_path: format!(".thebe/server/{}.rs", source_path.replace('/', "__")),
           generated_types_path: None,
+          component_source_paths: Vec::new(),
           handler: thebe_project::HandlerMetadata {
             is_async: false,
             method: "get".to_owned(),

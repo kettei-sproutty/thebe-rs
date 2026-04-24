@@ -456,8 +456,14 @@ pub fn generate_route(
   // order so markers and scope attrs are not added to Jinja control-flow
   // tokens.
   let known_component_names: Vec<&str> = components.iter().map(|c| c.name.as_str()).collect();
+  let used_component_names = template::list_used_component_names(&blocks.template, &known_component_names);
+  let used_component_name_refs: Vec<&str> = used_component_names.iter().map(String::as_str).collect();
+  let used_components: Vec<&ComponentMacro> = components
+    .iter()
+    .filter(|component| used_component_names.iter().any(|name| name == &component.name))
+    .collect();
   let template_expanded =
-    template::expand_component_tags(&blocks.template, &known_component_names);
+    template::expand_component_tags(&blocks.template, &used_component_name_refs);
   let template_attr_bound = template::inject_attr_bindings(&template_expanded);
   let template_hydrated = template::inject_hydration_markers(&template_attr_bound);
   let template_scoped = if route_style_source.is_some() {
@@ -468,7 +474,7 @@ pub fn generate_route(
 
   // Prepend compiled component macro sources (already scoped with component
   // scope IDs) before the route template body.
-  let component_macros_source: String = components
+  let component_macros_source: String = used_components
     .iter()
     .map(|c| c.jinja_macro.as_str())
     .collect::<Vec<_>>()
@@ -487,7 +493,7 @@ pub fn generate_route(
     .transpose()
     .map_err(|e| CodegenError::CssError(e.to_string()))?
     .unwrap_or_default();
-  let merged_component_styles: String = components
+  let merged_component_styles: String = used_components
     .iter()
     .filter(|c| !c.style.is_empty())
     .map(|c| c.style.as_str())
@@ -2539,6 +2545,55 @@ mod tests {
 
     assert!(component.style.is_empty());
     assert!(!component.jinja_macro.contains("data-thebe-c-"));
+  }
+
+  #[test]
+  fn generate_route_only_embeds_used_components() {
+    let route_blocks = SfcBlocks {
+      script_setup: Some(
+        "struct Props {}\n\n#[thebe::get]\npub fn handler() -> Props { Props {} }".to_owned(),
+      ),
+      template: "<Used label=\"Hello\" />".to_owned(),
+      ..SfcBlocks::default()
+    };
+    let used_component = generate_component(
+      &SfcBlocks {
+        template: "<span class=\"used\">{{ props.label }}</span>".to_owned(),
+        style: Some(".used { color: red; }".to_owned()),
+        ..SfcBlocks::default()
+      },
+      "Used",
+      false,
+    )
+    .unwrap();
+    let unused_component = generate_component(
+      &SfcBlocks {
+        template: "<span class=\"unused\">{{ props.label }}</span>".to_owned(),
+        style: Some(".unused { color: green; }".to_owned()),
+        ..SfcBlocks::default()
+      },
+      "Unused",
+      false,
+    )
+    .unwrap();
+
+    let generated = generate_route(
+      &route_blocks,
+      "/",
+      None,
+      default_app_html(),
+      None,
+      &[used_component, unused_component],
+      false,
+      Some("dev-build"),
+    )
+    .unwrap();
+    let dev_artifact = generated.dev_artifact.expect("dev artifact should exist");
+
+    assert!(dev_artifact.template.contains("__comp_used"));
+    assert!(!dev_artifact.template.contains("__comp_unused"));
+    assert!(dev_artifact.style.contains("red"));
+    assert!(!dev_artifact.style.contains("green"));
   }
 
   #[test]

@@ -3,12 +3,13 @@ use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn style_only_route_edit_should_emit_style_event_without_runtime_restart() {
+  let _guard = hotpatch_test_guard();
   let fixture_port = reserve_port();
   let fixture = TestProject::new("style-event");
   fixture.write("Cargo.toml", &fixture_cargo_toml());
@@ -102,6 +103,7 @@ fn style_only_route_edit_should_emit_style_event_without_runtime_restart() {
 
 #[test]
 fn template_only_route_edit_should_emit_template_event_without_runtime_restart() {
+  let _guard = hotpatch_test_guard();
   let fixture_port = reserve_port();
   let fixture = TestProject::new("template-event");
   fixture.write("Cargo.toml", &fixture_cargo_toml());
@@ -185,6 +187,249 @@ fn template_only_route_edit_should_emit_template_event_without_runtime_restart()
 
   child.terminate();
   let _ = sse_handle.join();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn style_only_component_edit_should_emit_style_event_for_affected_route_without_runtime_restart() {
+  let _guard = hotpatch_test_guard();
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("component-style-event");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", route_using_card_source());
+  fixture.write("src/routes/about.trs", plain_about_route_source());
+  fixture.write("src/components/Card.trs", initial_card_component_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  let browser_addr = wait_for_browser_addr(fixture.root());
+
+  assert!(fetch_page(fixture_port, "/").contains("Component before"));
+  assert!(fetch_page(fixture_port, "/about").contains("About page"));
+
+  let (event_rx, sse_handle) = open_event_stream(browser_addr);
+
+  thread::sleep(Duration::from_millis(150));
+  fixture.write("src/components/Card.trs", updated_card_component_style_source());
+
+  let event_name = wait_for_line(&event_rx, |line| line == "event: style", Duration::from_secs(20))
+    .unwrap_or_else(|error| {
+      panic!(
+        "{error}\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      )
+    });
+  assert_eq!(event_name, "event: style");
+
+  let data_line = wait_for_line(&event_rx, |line| line.starts_with("data:"), Duration::from_secs(5))
+    .unwrap_or_else(|error| {
+      panic!(
+        "{error}\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      )
+    });
+  assert!(data_line.contains(r#""routePattern":"/""#));
+  assert!(data_line.contains("blue") || data_line.contains("#00f"));
+
+  wait_for_page_matching(
+    fixture_port,
+    "/",
+    |page| page.contains("blue") || page.contains("#00f"),
+    "blue or #00f",
+    Duration::from_secs(20),
+  );
+  let about_page = fetch_page(fixture_port, "/about");
+  assert!(about_page.contains("About page"));
+  assert!(!about_page.contains(".card"));
+  assert!(!about_page.contains("blue"));
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  let _ = sse_handle.join();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn template_only_component_edit_should_emit_template_event_for_affected_route_without_runtime_restart() {
+  let _guard = hotpatch_test_guard();
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("component-template-event");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", route_using_card_source());
+  fixture.write("src/routes/about.trs", plain_about_route_source());
+  fixture.write("src/components/Card.trs", initial_card_component_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  let browser_addr = wait_for_browser_addr(fixture.root());
+
+  assert!(fetch_page(fixture_port, "/").contains("Component before"));
+
+  let (event_rx, sse_handle) = open_event_stream(browser_addr);
+
+  thread::sleep(Duration::from_millis(150));
+  fixture.write("src/components/Card.trs", updated_card_component_template_source());
+
+  let event_name = wait_for_line(&event_rx, |line| line == "event: template", Duration::from_secs(20))
+    .unwrap_or_else(|error| {
+      panic!(
+        "{error}\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      )
+    });
+  assert_eq!(event_name, "event: template");
+
+  let data_line = wait_for_line(&event_rx, |line| line.starts_with("data:"), Duration::from_secs(5))
+    .unwrap_or_else(|error| {
+      panic!(
+        "{error}\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      )
+    });
+  assert!(data_line.contains(r#""routePattern":"/""#));
+  assert!(!data_line.contains("css"));
+
+  wait_for_page_contains(fixture_port, "/", "Component after", Duration::from_secs(20));
+  let about_page = fetch_page(fixture_port, "/about");
+  assert!(about_page.contains("About page"));
+  assert!(!about_page.contains("Component after"));
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  let _ = sse_handle.join();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn head_only_layout_edit_should_emit_template_event_for_affected_route_without_runtime_restart() {
+  let _guard = hotpatch_test_guard();
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("layout-head-event");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/_layout.trs", initial_layout_source());
+  fixture.write("src/routes/index.trs", layout_body_route_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  let browser_addr = wait_for_browser_addr(fixture.root());
+
+  assert!(fetch_page(fixture_port, "/").contains("Layout before"));
+
+  let (event_rx, sse_handle) = open_event_stream(browser_addr);
+
+  thread::sleep(Duration::from_millis(150));
+  fixture.write("src/routes/_layout.trs", updated_layout_head_source());
+
+  let event_name = wait_for_line(&event_rx, |line| line == "event: template", Duration::from_secs(20))
+    .unwrap_or_else(|error| {
+      panic!(
+        "{error}\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      )
+    });
+  assert_eq!(event_name, "event: template");
+
+  let data_line = wait_for_line(&event_rx, |line| line.starts_with("data:"), Duration::from_secs(5))
+    .unwrap_or_else(|error| {
+      panic!(
+        "{error}\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      )
+    });
+  assert!(data_line.contains(r#""routePattern":"/""#));
+
+  wait_for_page_contains(fixture_port, "/", "Layout after", Duration::from_secs(20));
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  let _ = sse_handle.join();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn route_script_edit_should_restart_runtime_with_generated_input_reason() {
+  let _guard = hotpatch_test_guard();
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("route-script-restart");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", &script_restart_route_source("Before restart"));
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("Before restart"));
+
+  fixture.write("src/routes/index.trs", &script_restart_route_source("After restart"));
+
+  wait_for_output_line(
+    &output,
+    |line| line.contains("restart required — Thebe-generated input changed"),
+    Duration::from_secs(30),
+  )
+  .unwrap();
+  wait_for_runtime_handshake_count(&output, 2, Duration::from_secs(30)).unwrap();
+  wait_for_page_contains(fixture_port, "/", "After restart", Duration::from_secs(30));
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn entry_point_edit_should_restart_runtime_with_entry_point_reason() {
+  let _guard = hotpatch_test_guard();
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("entry-point-restart");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", initial_template_route_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  fixture.write("src/main.rs", &format!("{}\n// entrypoint touch\n", fixture_main_rs(fixture_port)));
+
+  wait_for_output_line(
+    &output,
+    |line| line.contains("restart required — application entry point changed"),
+    Duration::from_secs(30),
+  )
+  .unwrap();
+  wait_for_runtime_handshake_count(&output, 2, Duration::from_secs(30)).unwrap();
+  wait_for_page_contains(fixture_port, "/", "Template before", Duration::from_secs(30));
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
   for handle in output_threads {
     let _ = handle.join();
   }
@@ -389,6 +634,138 @@ pub fn index() -> Props {
 "#
 }
 
+fn hotpatch_test_guard() -> std::sync::MutexGuard<'static, ()> {
+  static HOTPATCH_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+  HOTPATCH_TEST_MUTEX
+    .get_or_init(|| Mutex::new(()))
+    .lock()
+    .expect("hotpatch test mutex should lock")
+}
+
+fn route_using_card_source() -> &'static str {
+  r#"<script setup>
+struct Props {}
+
+#[thebe::get]
+pub fn index() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <Card />
+</main>
+"#
+}
+
+fn plain_about_route_source() -> &'static str {
+  r#"<script setup>
+struct Props {}
+
+#[thebe::get]
+pub fn about() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <p>About page</p>
+</main>
+"#
+}
+
+fn initial_card_component_source() -> &'static str {
+  r#"<style>
+.card {
+  color: red;
+}
+</style>
+
+<div class="card">Component before<slot /></div>
+"#
+}
+
+fn updated_card_component_style_source() -> &'static str {
+  r#"<style>
+.card {
+  color: blue;
+}
+</style>
+
+<div class="card">Component before<slot /></div>
+"#
+}
+
+fn updated_card_component_template_source() -> &'static str {
+  r#"<style>
+.card {
+  color: red;
+}
+</style>
+
+<div class="card">Component after<slot /></div>
+"#
+}
+
+fn initial_layout_source() -> &'static str {
+  r#"<head>
+  <meta name="layout-probe" content="Layout before" />
+</head>
+
+<div>
+  <slot />
+</div>
+"#
+}
+
+fn updated_layout_head_source() -> &'static str {
+  r#"<head>
+  <meta name="layout-probe" content="Layout after" />
+</head>
+
+<div>
+  <slot />
+</div>
+"#
+}
+
+fn layout_body_route_source() -> &'static str {
+  r#"<script setup>
+struct Props {}
+
+#[thebe::get]
+pub fn index() -> Props {
+  Props {}
+}
+</script>
+
+<main>
+  <p>Layout route body</p>
+</main>
+"#
+}
+
+fn script_restart_route_source(message: &str) -> String {
+  format!(
+    r#"<script setup>
+struct Props {{
+  title: String,
+}}
+
+#[thebe::get]
+pub fn index() -> Props {{
+  Props {{
+    title: "{message}".to_owned(),
+  }}
+}}
+</script>
+
+<h1>{{{{ title }}}}</h1>
+"#,
+  )
+}
+
 fn spawn_hotpatch_process(project_root: &Path) -> ManagedChild {
   ManagedChild::new(
     Command::new(env!("CARGO_BIN_EXE_thebe"))
@@ -437,6 +814,133 @@ fn collected_lines(output: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
   output.lock().expect("output lock should hold").clone()
 }
 
+fn open_event_stream(browser_addr: SocketAddr) -> (mpsc::Receiver<String>, thread::JoinHandle<()>) {
+  let client = reqwest::blocking::Client::builder()
+    .timeout(None)
+    .build()
+    .expect("blocking client should build");
+  let (event_tx, event_rx) = mpsc::channel();
+  let sse_handle = thread::spawn(move || {
+    let response = client
+      .get(format!("http://{browser_addr}/.thebe/dev/events"))
+      .send()
+      .expect("browser event stream should connect");
+    let mut reader = BufReader::new(response);
+    let mut line = String::new();
+
+    loop {
+      line.clear();
+      let bytes_read = match reader.read_line(&mut line) {
+        Ok(bytes_read) => bytes_read,
+        Err(_error) => break,
+      };
+      if bytes_read == 0 {
+        break;
+      }
+
+      let trimmed = line.trim().to_owned();
+      if trimmed.starts_with("event:") || trimmed.starts_with("data:") {
+        let _ = event_tx.send(trimmed);
+      }
+    }
+  });
+
+  (event_rx, sse_handle)
+}
+
+fn try_fetch_page(port: u16, path: &str) -> Option<String> {
+  let client = reqwest::blocking::Client::builder()
+    .timeout(Duration::from_millis(250))
+    .build()
+    .expect("polling client should build");
+  let response = client
+    .get(format!("http://127.0.0.1:{port}{path}"))
+    .send()
+    .ok()?;
+
+  response.text().ok()
+}
+
+fn fetch_page(port: u16, path: &str) -> String {
+  try_fetch_page(port, path).expect("fixture page should respond")
+}
+
+fn wait_for_page_contains(port: u16, path: &str, needle: &str, timeout: Duration) {
+  wait_for_page_matching(port, path, |page| page.contains(needle), needle, timeout);
+}
+
+fn wait_for_page_matching<F>(
+  port: u16,
+  path: &str,
+  predicate: F,
+  description: &str,
+  timeout: Duration,
+)
+where
+  F: Fn(&str) -> bool,
+{
+  let started = Instant::now();
+
+  while started.elapsed() < timeout {
+    if try_fetch_page(port, path).is_some_and(|page| predicate(&page)) {
+      return;
+    }
+    thread::sleep(Duration::from_millis(100));
+  }
+
+  panic!("page {path} did not contain {description:?} within {timeout:?}");
+}
+
+fn wait_for_runtime_handshake_count(
+  output: &Arc<Mutex<Vec<String>>>,
+  expected_count: usize,
+  timeout: Duration,
+) -> Result<(), String> {
+  let started = Instant::now();
+
+  while started.elapsed() < timeout {
+    let connected_lines = collected_lines(output)
+      .into_iter()
+      .filter(|line| line.contains("thebe: hotpatch runtime connected"))
+      .count();
+    if connected_lines == expected_count {
+      return Ok(());
+    }
+    thread::sleep(Duration::from_millis(100));
+  }
+
+  Err(format!(
+    "timed out waiting for {expected_count} runtime handshake(s); seen output: {:?}",
+    collected_lines(output)
+  ))
+}
+
+fn wait_for_output_line<F>(
+  output: &Arc<Mutex<Vec<String>>>,
+  predicate: F,
+  timeout: Duration,
+) -> Result<String, String>
+where
+  F: Fn(&str) -> bool,
+{
+  let started = Instant::now();
+
+  while started.elapsed() < timeout {
+    if let Some(line) = collected_lines(output)
+      .into_iter()
+      .find(|line| predicate(line))
+    {
+      return Ok(line);
+    }
+    thread::sleep(Duration::from_millis(100));
+  }
+
+  Err(format!(
+    "timed out waiting for matching process output; seen: {:?}",
+    collected_lines(output)
+  ))
+}
+
 fn wait_for_app_ready(port: u16) {
   let started = Instant::now();
   let client = reqwest::blocking::Client::builder()
@@ -453,6 +957,35 @@ fn wait_for_app_ready(port: u16) {
   }
 
   panic!("fixture app did not become ready on port {port}");
+}
+
+fn wait_for_app_ready_with_output(port: u16, output: &Arc<Mutex<Vec<String>>>) {
+  let started = Instant::now();
+  let client = reqwest::blocking::Client::builder()
+    .timeout(Duration::from_millis(250))
+    .build()
+    .expect("polling client should build");
+  let mut last_response = None;
+
+  while started.elapsed() < Duration::from_secs(30) {
+    if let Ok(response) = client.get(format!("http://127.0.0.1:{port}/")).send() {
+      let status = response.status();
+      let body = response.text().unwrap_or_default();
+      if status.is_success() {
+        return;
+      }
+      last_response = Some((status, body));
+    }
+    thread::sleep(Duration::from_millis(100));
+  }
+
+  let last_response = last_response
+    .map(|(status, body)| format!("\nlast response: {status}\n{body}"))
+    .unwrap_or_default();
+  panic!(
+    "fixture app did not become ready on port {port}{last_response}\nprocess output:\n{}",
+    collected_lines(output).join("\n")
+  );
 }
 
 fn wait_for_browser_addr(project_root: &Path) -> SocketAddr {

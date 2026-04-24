@@ -331,6 +331,52 @@ mod tests {
   }
 
   #[test]
+  fn classify_paths_should_attempt_patch_when_component_style_only_changes() {
+    let project_root = temp_project_root("patch-component-style");
+    let component_path = project_root.join("src/components/Card.trs");
+
+    write_snapshot(
+      &project_root,
+      &component_path,
+      "<style>.card { color: red; }</style>\n<div class=\"card\">Card</div>",
+    );
+    fs::write(
+      &component_path,
+      "<style>.card { color: blue; }</style>\n<div class=\"card\">Card</div>",
+    )
+    .expect("current component should write");
+
+    let action = classify_paths(&project_root, &[component_path]);
+
+    assert_eq!(action, HotpatchAction::AttemptPatch);
+
+    let _ = fs::remove_dir_all(project_root);
+  }
+
+  #[test]
+  fn classify_paths_should_attempt_patch_when_layout_head_changes() {
+    let project_root = temp_project_root("patch-layout-head");
+    let layout_path = project_root.join("src/routes/_layout.trs");
+
+    write_snapshot(
+      &project_root,
+      &layout_path,
+      "<head><meta name=\"probe\" content=\"before\" /></head><div><slot /></div>",
+    );
+    fs::write(
+      &layout_path,
+      "<head><meta name=\"probe\" content=\"after\" /></head><div><slot /></div>",
+    )
+    .expect("current layout should write");
+
+    let action = classify_paths(&project_root, &[layout_path]);
+
+    assert_eq!(action, HotpatchAction::AttemptPatch);
+
+    let _ = fs::remove_dir_all(project_root);
+  }
+
+  #[test]
   fn classify_paths_with_snapshots_should_survive_snapshot_dir_rewrites() {
     let project_root = temp_project_root("stable-snapshots");
     let route_path = project_root.join("src/routes/index.trs");
@@ -372,6 +418,48 @@ mod tests {
       "<script setup>fn index() -> Props { Props { count: 2 } }</script>\n<div>{{ count }}</div>",
     )
     .expect("current route should write");
+
+    let action = classify_paths(&project_root, &[route_path]);
+
+    assert_eq!(
+      action,
+      HotpatchAction::Restart(RestartReason::GeneratedInput)
+    );
+
+    let _ = fs::remove_dir_all(project_root);
+  }
+
+  #[test]
+  fn classify_paths_should_restart_when_new_route_file_appears() {
+    let project_root = temp_project_root("restart-new-route");
+    let route_path = project_root.join("src/routes/index.trs");
+
+    fs::write(
+      &route_path,
+      "<script setup>struct Props {}\n#[thebe::get]\npub fn index() -> Props { Props {} }</script>\n<div>new</div>",
+    )
+    .expect("current route should write");
+
+    let action = classify_paths(&project_root, &[route_path]);
+
+    assert_eq!(
+      action,
+      HotpatchAction::Restart(RestartReason::GeneratedInput)
+    );
+
+    let _ = fs::remove_dir_all(project_root);
+  }
+
+  #[test]
+  fn classify_paths_should_restart_when_existing_route_is_deleted() {
+    let project_root = temp_project_root("restart-deleted-route");
+    let route_path = project_root.join("src/routes/index.trs");
+
+    write_snapshot(
+      &project_root,
+      &route_path,
+      "<script setup>struct Props {}\n#[thebe::get]\npub fn index() -> Props { Props {} }</script>\n<div>before</div>",
+    );
 
     let action = classify_paths(&project_root, &[route_path]);
 

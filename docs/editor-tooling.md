@@ -11,7 +11,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
   - `.thebe/client/**` mirrors each `<script lang="ts">` block with a concrete `Props` import.
   - `.thebe/thebe-env.d.ts` declares `getProps()` for those mirrors.
   - `.thebe/tsconfig.json` gives editors a self-contained TypeScript project without forcing a root `tsconfig.json`.
-- `.thebe/manifest.json` is currently version 5 and records route/layout/component metadata, generated paths, handler signatures, template bindings, exact field-level template symbol definitions, source spans, and route template symbols derived from `Props`.
+- `.thebe/manifest.json` is currently version 6 and records route/layout/component metadata, generated paths, handler signatures, direct component dependencies, template bindings, exact field-level template symbol definitions, source spans, and route template symbols derived from `Props`.
 - `.thebe/diagnostics.json` is currently version 1 and records structured project and file diagnostics with relative paths and source spans.
 - `packages/thebe-vscode/` ships a packaged VS Code extension with `.trs` language registration, snippets, TextMate highlighting, and automatic `thebe-lsp` startup.
 - `packages/tree-sitter-thebe/` ships an initial tree-sitter grammar for `.trs` block structure and template bindings.

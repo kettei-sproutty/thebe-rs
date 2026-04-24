@@ -127,7 +127,7 @@ pub(crate) fn run(project_root: &Path) -> anyhow::Result<()> {
           continue;
         }
 
-        if let Err(err) = deliver_runtime_patches(project_root, &patch_server) {
+        if let Err(err) = deliver_runtime_patches(project_root, &patch_server, &patch_plan) {
           eprintln!("thebe: failed to deliver runtime patch: {err:#}");
           browser_server.broadcast_reload();
           continue;
@@ -185,6 +185,7 @@ struct PatchPlan {
 impl PatchPlan {
   fn message(&self) -> &'static str {
     match self.browser_patch {
+      BrowserPatch::Noop => "refreshing hotpatch state",
       BrowserPatch::StyleRoutes(_) => "applying CSS hotpatch",
       BrowserPatch::TemplateRoutes(_) | BrowserPatch::TemplateGlobal => {
         "applying template hotpatch"
@@ -195,6 +196,7 @@ impl PatchPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BrowserPatch {
+  Noop,
   StyleRoutes(Vec<PathBuf>),
   TemplateRoutes(Vec<PathBuf>),
   TemplateGlobal,
@@ -221,7 +223,7 @@ impl RestartTrigger {
   fn message(&self) -> String {
     match self {
       Self::PatchCandidate => {
-        String::from("hotpatch candidate detected — runtime patch delivery is not wired yet, restarting")
+        String::from("hotpatch candidate could not be scoped safely, restarting")
       }
       Self::RestartRequired(reason) => {
         format!("restart required — {}", reason.describe())
@@ -284,8 +286,9 @@ fn plan_patch_batch(
   }
 
   let routes_dir = project_root.join("src").join("routes");
-  let mut style_only_routes = Vec::new();
-  let mut template_routes = Vec::new();
+  let manifest = thebe_project::load_manifest(project_root).ok();
+  let mut style_only_routes = BTreeSet::new();
+  let mut template_routes = BTreeSet::new();
   let mut requires_global_template = false;
   let mut saw_patchable_trs = false;
 
@@ -301,13 +304,30 @@ fn plan_patch_batch(
     }
 
     let patch_kind = trs_patch_kind_with_snapshots(project_root, source_snapshots, path)?;
-    let is_route = path.starts_with(&routes_dir);
     saw_patchable_trs = true;
+    let affected_routes = if is_direct_route_source_path(&routes_dir, path) {
+      Some(vec![path.clone()])
+    } else {
+      manifest
+        .as_ref()
+        .and_then(|manifest| resolve_non_route_patch_targets(project_root, manifest, path))
+    };
 
-    match (patch_kind, is_route) {
-      (TrsPatchKind::StyleOnly, true) => style_only_routes.push(path.clone()),
-      (TrsPatchKind::TemplateLike, true) => template_routes.push(path.clone()),
-      (_, false) => requires_global_template = true,
+    match patch_kind {
+      TrsPatchKind::StyleOnly => {
+        if let Some(routes) = affected_routes {
+          style_only_routes.extend(routes);
+        } else {
+          requires_global_template = true;
+        }
+      }
+      TrsPatchKind::TemplateLike => {
+        if let Some(routes) = affected_routes {
+          template_routes.extend(routes);
+        } else {
+          requires_global_template = true;
+        }
+      }
     }
   }
 
@@ -318,15 +338,76 @@ fn plan_patch_batch(
   let browser_patch = if requires_global_template {
     BrowserPatch::TemplateGlobal
   } else if !template_routes.is_empty() {
-    BrowserPatch::TemplateRoutes(template_routes)
+    template_routes.extend(style_only_routes);
+    BrowserPatch::TemplateRoutes(template_routes.into_iter().collect())
+  } else if !style_only_routes.is_empty() {
+    BrowserPatch::StyleRoutes(style_only_routes.into_iter().collect())
   } else {
-    BrowserPatch::StyleRoutes(style_only_routes)
+    BrowserPatch::Noop
   };
 
   Some(PatchPlan {
     browser_patch,
     refresh_codegen: true,
   })
+}
+
+fn is_direct_route_source_path(routes_dir: &Path, path: &Path) -> bool {
+  path.starts_with(routes_dir)
+    && path.extension().is_some_and(|ext| ext == "trs")
+    && path.file_name().is_none_or(|file_name| file_name != "_layout.trs")
+}
+
+fn resolve_non_route_patch_targets(
+  project_root: &Path,
+  manifest: &thebe_project::ThebeManifest,
+  changed_path: &Path,
+) -> Option<Vec<PathBuf>> {
+  let is_known_layout = manifest
+    .layouts
+    .iter()
+    .any(|layout| project_root.join(&layout.source_path) == changed_path);
+  let layout_routes = manifest
+    .routes
+    .iter()
+    .filter(|route| {
+      route
+        .layout_source_path
+        .as_ref()
+        .is_some_and(|source_path| project_root.join(source_path) == changed_path)
+    })
+    .map(|route| project_root.join(&route.source_path))
+    .collect::<Vec<_>>();
+  if is_known_layout {
+    return Some(layout_routes);
+  }
+
+  resolve_component_patch_targets(project_root, manifest, changed_path)
+}
+
+fn resolve_component_patch_targets(
+  project_root: &Path,
+  manifest: &thebe_project::ThebeManifest,
+  changed_path: &Path,
+) -> Option<Vec<PathBuf>> {
+  manifest
+    .components
+    .iter()
+    .find(|component| project_root.join(&component.source_path) == changed_path)?;
+
+  Some(
+    manifest
+      .routes
+      .iter()
+      .filter(|route| {
+        route
+          .component_source_paths
+          .iter()
+          .any(|source_path| project_root.join(source_path) == changed_path)
+      })
+      .map(|route| project_root.join(&route.source_path))
+      .collect(),
+  )
 }
 
 fn should_refresh_codegen(project_root: &Path, changed_paths: &[PathBuf]) -> bool {
@@ -337,11 +418,15 @@ fn should_refresh_codegen(project_root: &Path, changed_paths: &[PathBuf]) -> boo
   })
 }
 
-fn deliver_runtime_patches(project_root: &Path, patch_server: &PatchServer) -> anyhow::Result<()> {
+fn deliver_runtime_patches(
+  project_root: &Path,
+  patch_server: &PatchServer,
+  patch_plan: &PatchPlan,
+) -> anyhow::Result<()> {
   let manifest = thebe_project::load_manifest(project_root)?;
   let build_id = patch_build_id();
 
-  for route in manifest.routes {
+  for route in affected_routes_for_patch(project_root, &manifest, &patch_plan.browser_patch) {
     let artifact_path = thebe_codegen::dev_route_artifact_path(&route.route_path);
     let contents = fs::read_to_string(project_root.join(&artifact_path))
       .with_context(|| format!("failed to read {}", project_root.join(&artifact_path).display()))?;
@@ -368,6 +453,7 @@ fn dispatch_browser_patch(
   let manifest = thebe_project::load_manifest(project_root)?;
 
   match &patch_plan.browser_patch {
+    BrowserPatch::Noop => {}
     BrowserPatch::StyleRoutes(route_paths) => {
       for changed_path in route_paths {
         let Some(route) = find_route_metadata(project_root, &manifest, changed_path) else {
@@ -396,6 +482,23 @@ fn dispatch_browser_patch(
   }
 
   Ok(())
+}
+
+fn affected_routes_for_patch<'a>(
+  project_root: &Path,
+  manifest: &'a thebe_project::ThebeManifest,
+  browser_patch: &BrowserPatch,
+) -> Vec<&'a thebe_project::RouteMetadata> {
+  match browser_patch {
+    BrowserPatch::Noop => Vec::new(),
+    BrowserPatch::TemplateGlobal => manifest.routes.iter().collect(),
+    BrowserPatch::StyleRoutes(route_paths) | BrowserPatch::TemplateRoutes(route_paths) => {
+      route_paths
+        .iter()
+        .filter_map(|route_path| find_route_metadata(project_root, manifest, route_path))
+        .collect()
+    }
+  }
 }
 
 fn find_route_metadata<'a>(
@@ -561,6 +664,9 @@ mod tests {
   use std::process;
   use std::time::Duration;
   use std::time::{SystemTime, UNIX_EPOCH};
+  use thebe_project::{
+    AppHtmlMetadata, ComponentMetadata, HandlerMetadata, RouteMetadata, ThebeManifest,
+  };
 
   #[test]
   fn plan_change_batch_should_restart_with_codegen_for_thebe_inputs() {
@@ -653,6 +759,174 @@ mod tests {
   }
 
   #[test]
+  fn plan_change_batch_should_patch_style_only_component_changes_for_affected_routes() {
+    let project_root = temp_project_root("patch-style-component");
+    let route_path = project_root.join("src/routes/index.trs");
+    let other_route_path = project_root.join("src/routes/about.trs");
+    let component_path = project_root.join("src/components/Card.trs");
+
+    fs::create_dir_all(project_root.join("src/components")).expect("components dir should create");
+    fs::write(
+      &route_path,
+      "<script setup>struct Props {}\n#[thebe::get]\npub fn index() -> Props { Props {} }</script>\n<Card />",
+    )
+    .expect("route should write");
+    fs::write(
+      &other_route_path,
+      "<script setup>struct Props {}\n#[thebe::get]\npub fn about() -> Props { Props {} }</script>\n<p>about</p>",
+    )
+    .expect("other route should write");
+    write_snapshot(
+      &project_root,
+      &component_path,
+      "<style>.card { color: red; }</style>\n<div class=\"card\">Card</div>",
+    );
+    fs::write(
+      &component_path,
+      "<style>.card { color: blue; }</style>\n<div class=\"card\">Card</div>",
+    )
+    .expect("component should write");
+    write_manifest(
+      &project_root,
+      &ThebeManifest {
+        version: 6,
+        server_router_path: String::from(".thebe/server/routes.rs"),
+        app_html: AppHtmlMetadata {
+          source_path: None,
+          uses_default: true,
+        },
+        layouts: Vec::new(),
+        routes: vec![
+          RouteMetadata {
+            generated_client_path: None,
+            generated_server_path: String::from(".thebe/server/routes/index.rs"),
+            generated_types_path: None,
+            component_source_paths: vec![String::from("src/components/Card.trs")],
+            handler: HandlerMetadata {
+              is_async: false,
+              method: String::from("get"),
+              name: String::from("index"),
+              param_types: Vec::new(),
+              source_span: None,
+            },
+            has_client_script: false,
+            has_head: false,
+            has_style: false,
+            layout_scope_path: None,
+            layout_source_path: None,
+            module_name: String::from("route__index"),
+            route_path: String::from("/"),
+            source_path: String::from("src/routes/index.trs"),
+            state_type: None,
+            template_binding_spans: Vec::new(),
+            template_bindings: Vec::new(),
+            template_symbols: Vec::new(),
+            template_symbol_definitions: Vec::new(),
+          },
+          RouteMetadata {
+            generated_client_path: None,
+            generated_server_path: String::from(".thebe/server/routes/about.rs"),
+            generated_types_path: None,
+            component_source_paths: Vec::new(),
+            handler: HandlerMetadata {
+              is_async: false,
+              method: String::from("get"),
+              name: String::from("about"),
+              param_types: Vec::new(),
+              source_span: None,
+            },
+            has_client_script: false,
+            has_head: false,
+            has_style: false,
+            layout_scope_path: None,
+            layout_source_path: None,
+            module_name: String::from("route__about"),
+            route_path: String::from("/about"),
+            source_path: String::from("src/routes/about.trs"),
+            state_type: None,
+            template_binding_spans: Vec::new(),
+            template_bindings: Vec::new(),
+            template_symbols: Vec::new(),
+            template_symbol_definitions: Vec::new(),
+          },
+        ],
+        components: vec![ComponentMetadata {
+          has_client_script: false,
+          has_style: true,
+          module_path: String::from("crate::components::Card"),
+          prop_names: Vec::new(),
+          props: Vec::new(),
+          source_path: String::from("src/components/Card.trs"),
+          tag_name: String::from("Card"),
+        }],
+      },
+    );
+
+    let plan = plan_change_batch(&project_root, &[component_path]);
+
+    assert_eq!(
+      plan,
+      ChangePlan::Patch(PatchPlan {
+        browser_patch: BrowserPatch::StyleRoutes(vec![route_path]),
+        refresh_codegen: true,
+      })
+    );
+
+    let _ = fs::remove_dir_all(project_root);
+  }
+
+  #[test]
+  fn plan_change_batch_should_noop_for_unused_layout_changes() {
+    let project_root = temp_project_root("patch-unused-layout");
+    let layout_path = project_root.join("src/routes/admin/_layout.trs");
+
+    fs::create_dir_all(project_root.join("src/routes/admin")).expect("layout dir should create");
+    write_snapshot(
+      &project_root,
+      &layout_path,
+      "<style>.shell { color: red; }</style>\n<div class=\"shell\"><slot /></div>",
+    );
+    fs::write(
+      &layout_path,
+      "<style>.shell { color: blue; }</style>\n<div class=\"shell\"><slot /></div>",
+    )
+    .expect("layout should write");
+    write_manifest(
+      &project_root,
+      &ThebeManifest {
+        version: 6,
+        server_router_path: String::from(".thebe/server/routes.rs"),
+        app_html: AppHtmlMetadata {
+          source_path: None,
+          uses_default: true,
+        },
+        layouts: vec![thebe_project::LayoutMetadata {
+          has_head: false,
+          has_style: true,
+          scope_path: String::from("admin_layout"),
+          source_path: String::from("src/routes/admin/_layout.trs"),
+          template_binding_spans: Vec::new(),
+          template_bindings: Vec::new(),
+        }],
+        routes: Vec::new(),
+        components: Vec::new(),
+      },
+    );
+
+    let plan = plan_change_batch(&project_root, &[layout_path]);
+
+    assert_eq!(
+      plan,
+      ChangePlan::Patch(PatchPlan {
+        browser_patch: BrowserPatch::Noop,
+        refresh_codegen: true,
+      })
+    );
+
+    let _ = fs::remove_dir_all(project_root);
+  }
+
+  #[test]
   fn plan_change_batch_should_ignore_non_rebuild_inputs() {
     let project_root = Path::new("/tmp/project");
     let changed_paths = vec![PathBuf::from("/tmp/project/public/logo.png")];
@@ -709,5 +983,14 @@ mod tests {
       fs::create_dir_all(parent).expect("snapshot parent should create");
     }
     fs::write(&snapshot_path, source).expect("snapshot should write");
+  }
+
+  fn write_manifest(project_root: &Path, manifest: &ThebeManifest) {
+    let manifest_path = project_root.join(thebe_project::THEBE_MANIFEST_FILE);
+    if let Some(parent) = manifest_path.parent() {
+      fs::create_dir_all(parent).expect("manifest parent should create");
+    }
+    let contents = serde_json::to_vec_pretty(manifest).expect("manifest should serialize");
+    fs::write(&manifest_path, contents).expect("manifest should write");
   }
 }

@@ -36,7 +36,8 @@ This page tracks what is actually implemented in the repository today versus wha
 - Rename support is currently limited to route handlers, route template symbols, component prop definitions/usages, component tag/import relationships across known `.trs` sources, and client event handlers.
 - The tree-sitter grammar is still an initial grammar rather than a full HTML-aware parser.
 - Production assets are emitted under `.thebe/assets` and served by generated routes rather than a standalone public dist pipeline.
-- The experimental hotpatch path only patches `.trs` template, `<head>`, and style deltas in place; Rust and `.trs` script changes still force restart.
+- The experimental hotpatch path patches route, layout, and component `.trs` template, `<head>`, and style deltas in place; Rust and `.trs` script changes still force restart.
+- Component and layout hotpatches now scope runtime/browser updates to the affected routes instead of always falling back to a global template refresh.
 
 ## Planned Or Missing
 
