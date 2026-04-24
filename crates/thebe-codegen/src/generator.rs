@@ -152,6 +152,7 @@ struct HeadFragments {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessedLayout {
+  client_script: String,
   template: String,
   style: String,
   head: HeadFragments,
@@ -560,6 +561,16 @@ pub fn generate_route(
   let layout_processed = layout
     .map(|(layout_blocks, layout_scope_path)| process_layout(layout_blocks, layout_scope_path, minify))
     .transpose()?;
+  let layout_client_script = layout_processed
+    .as_ref()
+    .map_or("", |processed_layout| processed_layout.client_script.as_str());
+  let client_script_str = if layout_client_script.is_empty() {
+    client_script_str
+  } else if client_script_str.is_empty() {
+    layout_client_script.to_owned()
+  } else {
+    format!("{client_script_str}\n{layout_client_script}")
+  };
 
   // Build the final style literal, optional layout template literal, and
   // merged head contribution. Route titles override layout titles.
@@ -1716,10 +1727,18 @@ fn process_layout(
     .transpose()
     .map_err(|e| CodegenError::CssError(e.to_string()))?
     .unwrap_or_default();
+  let layout_client_script = layout_blocks
+    .script_ts
+    .as_deref()
+    .filter(|script| !script.trim().is_empty())
+    .map(|script| thebe_analyzer::analyze(script, minify).map(|module| module.js))
+    .transpose()?
+    .unwrap_or_default();
 
   let head = process_head_block(layout_blocks.head.as_deref())?;
 
   Ok(ProcessedLayout {
+    client_script: layout_client_script,
     template: scoped_template,
     style: layout_style,
     head,
@@ -2896,6 +2915,39 @@ mod tests {
 
     assert!(processed.style.is_empty());
     assert!(!processed.template.contains("data-thebe-c-"));
+  }
+
+  #[test]
+  fn generate_route_embeds_layout_client_script() {
+    let route_blocks = SfcBlocks {
+      script_setup: Some(
+        "struct Props { title: String }\n\n#[thebe::get]\npub fn handler() -> Props { Props { title: \"Counter\".to_owned() } }"
+          .to_owned(),
+      ),
+      template: "<main>{{ title }}</main>".to_owned(),
+      ..SfcBlocks::default()
+    };
+    let layout_blocks = SfcBlocks {
+      script_ts: Some("window.__layoutProbe = \"layout-script\";".to_owned()),
+      template: "<div><slot /></div>".to_owned(),
+      ..SfcBlocks::default()
+    };
+
+    let generated = generate_route(
+      &route_blocks,
+      "/",
+      Some((&layout_blocks, "src/routes/_layout.trs")),
+      default_app_html(),
+      None,
+      &[],
+      false,
+      Some("dev-build"),
+    )
+    .unwrap();
+    let dev_artifact = generated.dev_artifact.expect("dev artifact should exist");
+
+    assert!(dev_artifact.client_script.contains("window.__layoutProbe = \"layout-script\";"));
+    assert!(generated.source.contains("let __client_script = __dev_artifact.as_ref().map_or(__CLIENT_SCRIPT"));
   }
 
   #[test]

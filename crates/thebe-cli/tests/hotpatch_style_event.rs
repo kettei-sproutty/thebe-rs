@@ -423,6 +423,117 @@ fn head_only_layout_edit_should_emit_template_event_for_affected_route_without_r
 }
 
 #[test]
+fn component_client_script_edit_should_emit_template_event_without_runtime_restart() {
+  let _guard = hotpatch_test_guard();
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("component-client-script-event");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", route_using_counter_button_source());
+  fixture.write("src/components/CounterButton.trs", counter_button_component_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  let browser_addr = wait_for_browser_addr(fixture.root());
+
+  let page = fetch_page(fixture_port, "/");
+  assert!(page.contains("id=\"component-counter\""));
+
+  let (event_rx, sse_handle) = open_event_stream(browser_addr);
+
+  thread::sleep(Duration::from_millis(150));
+  fixture.write(
+    "src/components/CounterButton.trs",
+    updated_counter_button_component_source(),
+  );
+
+  let event_name = wait_for_line(&event_rx, |line| line == "event: template", Duration::from_secs(20))
+    .unwrap_or_else(|error| {
+      panic!(
+        "{error}\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      )
+    });
+  assert_eq!(event_name, "event: template");
+
+  let data_line = wait_for_line(&event_rx, |line| line.starts_with("data:"), Duration::from_secs(5))
+    .unwrap_or_else(|error| {
+      panic!(
+        "{error}\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      )
+    });
+  assert!(data_line.contains(r#""routePattern":"/""#));
+  assert!(!data_line.contains("css"), "unexpected template payload: {data_line}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  let _ = sse_handle.join();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn layout_client_script_edit_should_emit_template_event_without_runtime_restart() {
+  let _guard = hotpatch_test_guard();
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("layout-client-script-event");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/_layout.trs", initial_layout_client_script_source());
+  fixture.write("src/routes/index.trs", layout_client_script_route_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  let browser_addr = wait_for_browser_addr(fixture.root());
+
+  let page = fetch_page(fixture_port, "/");
+  assert!(page.contains("id=\"layout-counter\""));
+
+  let (event_rx, sse_handle) = open_event_stream(browser_addr);
+
+  thread::sleep(Duration::from_millis(150));
+  fixture.write("src/routes/_layout.trs", updated_layout_client_script_source());
+
+  let event_name = wait_for_line(&event_rx, |line| line == "event: template", Duration::from_secs(20))
+    .unwrap_or_else(|error| {
+      panic!(
+        "{error}\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      )
+    });
+  assert_eq!(event_name, "event: template");
+
+  let data_line = wait_for_line(&event_rx, |line| line.starts_with("data:"), Duration::from_secs(5))
+    .unwrap_or_else(|error| {
+      panic!(
+        "{error}\nprocess output:\n{}",
+        collected_lines(&output).join("\n")
+      )
+    });
+  assert!(data_line.contains(r#""routePattern":"/""#));
+  assert!(!data_line.contains("css"), "unexpected template payload: {data_line}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  let _ = sse_handle.join();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
 fn style_only_route_edit_should_update_live_browser_styles_without_page_reload() {
   let _guard = hotpatch_test_guard();
   if !playwright_probe_supported() {
@@ -644,6 +755,102 @@ fn route_client_script_edit_should_refresh_live_browser_and_apply_new_handler_wi
   assert!(probe_stdout.contains(r#""initialHandlerCount":"1""#), "unexpected probe output: {probe_stdout}");
   assert!(probe_stdout.contains(r#""postPatchCount":"2""#), "unexpected probe output: {probe_stdout}");
   assert!(probe_stdout.contains("route-client-script-hotpatch-probe"), "unexpected probe output: {probe_stdout}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn component_client_script_edit_should_refresh_live_browser_and_apply_new_handler_without_page_reload() {
+  let _guard = hotpatch_test_guard();
+  if !playwright_probe_supported() {
+    eprintln!("skipping Playwright hotpatch browser test: local Playwright runtime is unavailable");
+    return;
+  }
+
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("component-client-script-browser-patch");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/index.trs", route_using_counter_button_source());
+  fixture.write("src/components/CounterButton.trs", counter_button_component_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("id=\"component-counter\""));
+
+  let probe = spawn_playwright_probe(
+    &component_client_script_hotpatch_probe_script(fixture_port),
+    &fixture.root().join("src/components/CounterButton.trs"),
+    updated_counter_button_component_source(),
+  );
+  let probe_output = probe
+    .wait_with_output()
+    .expect("Playwright component client script hotpatch probe should complete");
+  assert_playwright_probe_success(&probe_output, &output, "component client script hotpatch browser probe");
+
+  let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
+  assert!(probe_stdout.contains(r#""beforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""refreshCount":1"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""initialHandlerCount":"1""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""postPatchCount":"2""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("component-client-script-hotpatch-probe"), "unexpected probe output: {probe_stdout}");
+
+  wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
+  assert!(child.try_wait().expect("child wait should succeed").is_none());
+
+  child.terminate();
+  for handle in output_threads {
+    let _ = handle.join();
+  }
+}
+
+#[test]
+fn layout_client_script_edit_should_refresh_live_browser_and_apply_new_handler_without_page_reload() {
+  let _guard = hotpatch_test_guard();
+  if !playwright_probe_supported() {
+    eprintln!("skipping Playwright hotpatch browser test: local Playwright runtime is unavailable");
+    return;
+  }
+
+  let fixture_port = reserve_port();
+  let fixture = TestProject::new("layout-client-script-browser-patch");
+  fixture.write("Cargo.toml", &fixture_cargo_toml());
+  fixture.write("src/main.rs", &fixture_main_rs(fixture_port));
+  fixture.write("src/routes/_layout.trs", initial_layout_client_script_source());
+  fixture.write("src/routes/index.trs", layout_client_script_route_source());
+
+  let mut child = spawn_hotpatch_process(fixture.root());
+  let output = Arc::new(Mutex::new(Vec::<String>::new()));
+  let output_threads = spawn_output_collectors(&mut child, Arc::clone(&output));
+
+  wait_for_app_ready_with_output(fixture_port, &output);
+  assert!(fetch_page(fixture_port, "/").contains("id=\"layout-counter\""));
+
+  let probe = spawn_playwright_probe(
+    &layout_client_script_hotpatch_probe_script(fixture_port),
+    &fixture.root().join("src/routes/_layout.trs"),
+    updated_layout_client_script_source(),
+  );
+  let probe_output = probe
+    .wait_with_output()
+    .expect("Playwright layout client script hotpatch probe should complete");
+  assert_playwright_probe_success(&probe_output, &output, "layout client script hotpatch browser probe");
+
+  let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
+  assert!(probe_stdout.contains(r#""beforeUnloadCount":"0""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""refreshCount":1"#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""initialHandlerCount":"1""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains(r#""postPatchCount":"2""#), "unexpected probe output: {probe_stdout}");
+  assert!(probe_stdout.contains("layout-client-script-hotpatch-probe"), "unexpected probe output: {probe_stdout}");
 
   wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
   assert!(child.try_wait().expect("child wait should succeed").is_none());
@@ -1357,6 +1564,25 @@ function increment() {
 "#
 }
 
+fn updated_counter_button_component_source() -> &'static str {
+  r#"<script>
+pub struct Props {
+  pub count: i32,
+}
+</script>
+
+<script lang="ts">
+let props = getProps<Props>();
+
+function increment() {
+  props.count += 2;
+}
+</script>
+
+<button id="component-counter" onclick="increment">{{ props.count }}</button>
+"#
+}
+
 fn stat_card_component_source() -> &'static str {
   r#"<script>
 pub struct Props {
@@ -1440,6 +1666,52 @@ fn updated_layout_head_source() -> &'static str {
 <div>
   <slot />
 </div>
+"#
+}
+
+fn initial_layout_client_script_source() -> &'static str {
+  r#"<script lang="ts">
+let props = getProps<Props>();
+
+function increment() {
+  props.count += 1;
+}
+</script>
+
+<div>
+  <slot />
+</div>
+"#
+}
+
+fn updated_layout_client_script_source() -> &'static str {
+  r#"<script lang="ts">
+let props = getProps<Props>();
+
+function increment() {
+  props.count += 2;
+}
+</script>
+
+<div>
+  <slot />
+</div>
+"#
+}
+
+fn layout_client_script_route_source() -> &'static str {
+  r#"<script setup>
+struct Props {
+  count: i32,
+}
+
+#[thebe::get]
+pub fn index() -> Props {
+  Props { count: 0 }
+}
+</script>
+
+<button id="layout-counter" onclick="increment">{{ count }}</button>
 "#
 }
 
@@ -1861,6 +2133,216 @@ const beforeUnloadKey = "__thebe_route_client_script_beforeunload__";
         initialHandlerCount: "1",
         postPatchCount: button ? button.textContent.trim() : null,
         probeToken: window.__thebeRouteClientScriptProbeToken || null
+      };
+    }, beforeUnloadKey);
+
+    console.log(JSON.stringify(result));
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exitCode = 1;
+  } finally {
+    await browser.close();
+  }
+})();
+"##;
+
+const COMPONENT_CLIENT_SCRIPT_HOTPATCH_PROBE_SCRIPT: &str = r##"
+const fs = require("node:fs");
+const { chromium } = require("playwright");
+
+const targetUrl = "__TARGET_URL__";
+const patchFile = process.env.THEBE_HOTPATCH_FILE;
+const patchSource = process.env.THEBE_HOTPATCH_SOURCE;
+const beforeUnloadKey = "__thebe_component_client_script_hotpatch_beforeunload__";
+
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  try {
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      () => typeof window.__thebe_dev_refresh === "function",
+      null,
+      { timeout: 30000 }
+    );
+    await page.locator("#component-counter").waitFor({ state: "attached", timeout: 30000 });
+    await page.waitForFunction(
+      () => {
+        const button = document.querySelector("#component-counter");
+        return button && button.textContent.trim() === "0";
+      },
+      null,
+      { timeout: 30000 }
+    );
+
+    await page.evaluate((key) => {
+      const originalRefresh = window.__thebe_dev_refresh;
+      window.sessionStorage.removeItem(key);
+      window.__thebeComponentClientScriptHotpatchRefreshCount = 0;
+      window.addEventListener("beforeunload", () => {
+        const count = Number(window.sessionStorage.getItem(key) || "0");
+        window.sessionStorage.setItem(key, String(count + 1));
+      });
+      window.__thebe_dev_refresh = function (...args) {
+        window.__thebeComponentClientScriptHotpatchRefreshCount += 1;
+        return originalRefresh.apply(this, args);
+      };
+      window.__thebeComponentClientScriptHotpatchProbeToken = "component-client-script-hotpatch-probe";
+    }, beforeUnloadKey);
+
+    await page.locator("#component-counter").click();
+    await page.waitForFunction(
+      () => {
+        const button = document.querySelector("#component-counter");
+        return button && button.textContent.trim() === "1";
+      },
+      null,
+      { timeout: 30000 }
+    );
+
+    fs.writeFileSync(patchFile, patchSource);
+
+    await page.waitForFunction(
+      (beforeUnloadKey) => {
+        const button = document.querySelector("#component-counter");
+
+        return Boolean(
+          button &&
+            button.textContent.trim() === "0" &&
+            window.__thebeComponentClientScriptHotpatchProbeToken === "component-client-script-hotpatch-probe" &&
+            (window.sessionStorage.getItem(beforeUnloadKey) || "0") === "0" &&
+            (window.__thebeComponentClientScriptHotpatchRefreshCount || 0) >= 1
+        );
+      },
+      beforeUnloadKey,
+      { timeout: 30000 }
+    );
+
+    await page.locator("#component-counter").click();
+    await page.waitForFunction(
+      () => {
+        const button = document.querySelector("#component-counter");
+        return button && button.textContent.trim() === "2";
+      },
+      null,
+      { timeout: 30000 }
+    );
+
+    const result = await page.evaluate((key) => {
+      const button = document.querySelector("#component-counter");
+
+      return {
+        beforeUnloadCount: window.sessionStorage.getItem(key) || "0",
+        refreshCount: window.__thebeComponentClientScriptHotpatchRefreshCount || 0,
+        initialHandlerCount: "1",
+        postPatchCount: button ? button.textContent.trim() : null,
+        probeToken: window.__thebeComponentClientScriptHotpatchProbeToken || null
+      };
+    }, beforeUnloadKey);
+
+    console.log(JSON.stringify(result));
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exitCode = 1;
+  } finally {
+    await browser.close();
+  }
+})();
+"##;
+
+const LAYOUT_CLIENT_SCRIPT_HOTPATCH_PROBE_SCRIPT: &str = r##"
+const fs = require("node:fs");
+const { chromium } = require("playwright");
+
+const targetUrl = "__TARGET_URL__";
+const patchFile = process.env.THEBE_HOTPATCH_FILE;
+const patchSource = process.env.THEBE_HOTPATCH_SOURCE;
+const beforeUnloadKey = "__thebe_layout_client_script_hotpatch_beforeunload__";
+
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  try {
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      () => typeof window.__thebe_dev_refresh === "function",
+      null,
+      { timeout: 30000 }
+    );
+    await page.locator("#layout-counter").waitFor({ state: "attached", timeout: 30000 });
+    await page.waitForFunction(
+      () => {
+        const button = document.querySelector("#layout-counter");
+        return button && button.textContent.trim() === "0";
+      },
+      null,
+      { timeout: 30000 }
+    );
+
+    await page.evaluate((key) => {
+      const originalRefresh = window.__thebe_dev_refresh;
+      window.sessionStorage.removeItem(key);
+      window.__thebeLayoutClientScriptHotpatchRefreshCount = 0;
+      window.addEventListener("beforeunload", () => {
+        const count = Number(window.sessionStorage.getItem(key) || "0");
+        window.sessionStorage.setItem(key, String(count + 1));
+      });
+      window.__thebe_dev_refresh = function (...args) {
+        window.__thebeLayoutClientScriptHotpatchRefreshCount += 1;
+        return originalRefresh.apply(this, args);
+      };
+      window.__thebeLayoutClientScriptHotpatchProbeToken = "layout-client-script-hotpatch-probe";
+    }, beforeUnloadKey);
+
+    await page.locator("#layout-counter").click();
+    await page.waitForFunction(
+      () => {
+        const button = document.querySelector("#layout-counter");
+        return button && button.textContent.trim() === "1";
+      },
+      null,
+      { timeout: 30000 }
+    );
+
+    fs.writeFileSync(patchFile, patchSource);
+
+    await page.waitForFunction(
+      (beforeUnloadKey) => {
+        const button = document.querySelector("#layout-counter");
+
+        return Boolean(
+          button &&
+            button.textContent.trim() === "0" &&
+            window.__thebeLayoutClientScriptHotpatchProbeToken === "layout-client-script-hotpatch-probe" &&
+            (window.sessionStorage.getItem(beforeUnloadKey) || "0") === "0" &&
+            (window.__thebeLayoutClientScriptHotpatchRefreshCount || 0) >= 1
+        );
+      },
+      beforeUnloadKey,
+      { timeout: 30000 }
+    );
+
+    await page.locator("#layout-counter").click();
+    await page.waitForFunction(
+      () => {
+        const button = document.querySelector("#layout-counter");
+        return button && button.textContent.trim() === "2";
+      },
+      null,
+      { timeout: 30000 }
+    );
+
+    const result = await page.evaluate((key) => {
+      const button = document.querySelector("#layout-counter");
+
+      return {
+        beforeUnloadCount: window.sessionStorage.getItem(key) || "0",
+        refreshCount: window.__thebeLayoutClientScriptHotpatchRefreshCount || 0,
+        initialHandlerCount: "1",
+        postPatchCount: button ? button.textContent.trim() : null,
+        probeToken: window.__thebeLayoutClientScriptHotpatchProbeToken || null
       };
     }, beforeUnloadKey);
 
@@ -2301,6 +2783,16 @@ fn route_template_hotpatch_probe_script(port: u16) -> String {
 
 fn route_client_script_hotpatch_probe_script(port: u16) -> String {
   ROUTE_CLIENT_SCRIPT_HOTPATCH_PROBE_SCRIPT
+    .replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
+}
+
+fn component_client_script_hotpatch_probe_script(port: u16) -> String {
+  COMPONENT_CLIENT_SCRIPT_HOTPATCH_PROBE_SCRIPT
+    .replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
+}
+
+fn layout_client_script_hotpatch_probe_script(port: u16) -> String {
+  LAYOUT_CLIENT_SCRIPT_HOTPATCH_PROBE_SCRIPT
     .replace("__TARGET_URL__", &format!("http://127.0.0.1:{port}/"))
 }
 
