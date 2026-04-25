@@ -69,5 +69,21 @@
       "</script>"
     ],
     "description": "Insert a Thebe client script block"
+  },
+  "Named Slot": {
+    "prefix": "thebe-slot",
+    "body": [
+      "<slot name=\"$1\" />"
+    ],
+    "description": "Declare a named slot in a Thebe component"
+  },
+  "Named Slot Template": {
+    "prefix": "thebe-slot-template",
+    "body": [
+      "<template slot=\"$1\">",
+      "  $0",
+      "</template>"
+    ],
+    "description": "Fill a named component slot from a route or parent component"
   }
 }

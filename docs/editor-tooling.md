@@ -21,7 +21,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
 `thebe-lsp` currently supports:
 
 - Diagnostics sourced from `.thebe/diagnostics.json`.
-- Hover for route handlers, precise nested `Props` fields inside template bindings, component tags/import aliases, and component props.
+- Hover for route handlers, precise nested `Props` fields inside template bindings, component tags/import aliases, component props, and named-slot attributes on `<template slot="...">` / `<slot name="..." />`.
 - Document highlights for Thebe-owned symbols in the current `.trs` file.
 - Document symbols for route handlers, template bindings, and component props.
 - Go-to-definition between `.trs` source files and generated Rust/TypeScript artifacts, plus exact nested `Props` field targets, component tag/prop targets, and component import aliases.
@@ -38,7 +38,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
   - event-handler name completions from the current `<script lang="ts">` block
   - component tag completions, including missing component import insertion when a matching Rust block is present
   - component prop completions
-  - template attribute completions for bound attributes such as `:class`, generic `:attr`, and common `on*` handlers
+  - template attribute completions for bound attributes such as `:class`, generic `:attr`, common `on*` handlers, and named-slot attributes on `<template>` / `<slot>`
 
 ## Editor Behavior Already Implemented
 
@@ -65,7 +65,8 @@ If you open a route-oriented Thebe project in an editor today, the expected tool
 - compiler diagnostics work
 - generated TypeScript mirrors work
 - route/layout navigation works
-- semantic highlighting, formatting, rename, and code actions work for the currently supported Thebe surface
-- template, attribute, event, and component completions work
+- semantic highlighting, formatting, rename, hover, and code actions work for the currently supported Thebe surface
+- template, attribute, event, component, and named-slot completions work
+- the VS Code extension ships snippets for route/component boilerplate plus named-slot declaration and fill patterns
 
 If you want polished language ergonomics comparable to a mature framework, that is still future work.

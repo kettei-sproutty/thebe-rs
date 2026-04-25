@@ -1940,7 +1940,43 @@ fn hover_for_document(
     return Some(component_hover(component, range));
   }
 
+  if let Some(hover) = named_slot_attribute_hover_at_position(source, position) {
+    return Some(hover);
+  }
+
   None
+}
+
+fn named_slot_attribute_hover_at_position(source: &str, position: Position) -> Option<Hover> {
+  let offset = byte_offset_from_position(source, position)?;
+  let (tag_name, _, _) = tag_name_at_offset(source, offset)?;
+  let (attribute_name, start, end) = attribute_name_at_offset(source, offset)?;
+  let value = match (tag_name.as_str(), attribute_name.as_str()) {
+    ("template", "slot") => concat!(
+      "**Named slot attribute** `slot`\n\n",
+      "- Tag: `template`\n",
+      "- Meaning: routes this template block into a component's named slot\n",
+      "- Example: `<template slot=\"accent\">...</template>`"
+    )
+    .to_owned(),
+    ("slot", "name") => concat!(
+      "**Named slot attribute** `name`\n\n",
+      "- Tag: `slot`\n",
+      "- Meaning: declares a named placeholder in a component template\n",
+      "- Example: `<slot name=\"accent\" />`\n",
+      "- Omit `name` to keep using the default slot"
+    )
+    .to_owned(),
+    _ => return None,
+  };
+
+  Some(Hover {
+    contents: HoverContents::Markup(MarkupContent {
+      kind: MarkupKind::Markdown,
+      value,
+    }),
+    range: Some(range_from_offsets(source, start, end)),
+  })
 }
 
 fn document_symbols_for_document(
@@ -6635,6 +6671,58 @@ fn handler() -> Props {
     assert_eq!(
       hover.range.expect("hover range").start,
       position_from_byte_offset(aliased_route_source, prop_name_start),
+    );
+  }
+
+  #[test]
+  fn hover_for_document_returns_named_slot_hover_for_template_slot_attribute() {
+    let source = r#"<Card>
+  <template slot="accent">content</template>
+</Card>
+"#;
+    let attribute_start = source.find("slot").expect("slot attribute");
+
+    let hover = hover_for_document(
+      source,
+      &fixture_manifest(),
+      "src/routes/slots.trs",
+      position_from_byte_offset(source, attribute_start + 1),
+    )
+    .expect("hover");
+    let HoverContents::Markup(contents) = hover.contents else {
+      panic!("expected markdown hover");
+    };
+
+    assert!(contents.value.contains("**Named slot attribute** `slot`"));
+    assert!(contents.value.contains("routes this template block into a component's named slot"));
+    assert_eq!(
+      hover.range.expect("hover range").start,
+      position_from_byte_offset(source, attribute_start),
+    );
+  }
+
+  #[test]
+  fn hover_for_document_returns_named_slot_hover_for_slot_name_attribute() {
+    let source = r#"<slot name="accent" />
+"#;
+    let attribute_start = source.find("name").expect("name attribute");
+
+    let hover = hover_for_document(
+      source,
+      &fixture_manifest(),
+      "src/components/Card.trs",
+      position_from_byte_offset(source, attribute_start + 1),
+    )
+    .expect("hover");
+    let HoverContents::Markup(contents) = hover.contents else {
+      panic!("expected markdown hover");
+    };
+
+    assert!(contents.value.contains("**Named slot attribute** `name`"));
+    assert!(contents.value.contains("declares a named placeholder in a component template"));
+    assert_eq!(
+      hover.range.expect("hover range").start,
+      position_from_byte_offset(source, attribute_start),
     );
   }
 
