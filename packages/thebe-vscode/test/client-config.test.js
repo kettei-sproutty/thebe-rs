@@ -20,6 +20,7 @@ const {
 } = require("../generated-client");
 const {
   INLINE_TYPESCRIPT_COMMAND_ID,
+  INLINE_TYPESCRIPT_SCHEME,
   resolveInlineSourcePositionRange,
   resolveInlineSourceRange,
   resolveInlineTypeScriptView,
@@ -133,6 +134,10 @@ test("inline rust command id stays stable", () => {
 
 test("inline typescript command id stays stable", () => {
   assert.strictEqual(INLINE_TYPESCRIPT_COMMAND_ID, "thebe.openInlineTypeScriptView");
+});
+
+test("inline typescript scheme stays stable", () => {
+  assert.strictEqual(INLINE_TYPESCRIPT_SCHEME, "thebe-inline-ts");
 });
 
 test("generated types command id stays stable", () => {

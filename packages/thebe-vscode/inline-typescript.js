@@ -7,6 +7,7 @@ const {
 } = require("./generated-client");
 
 const INLINE_TYPESCRIPT_COMMAND_ID = "thebe.openInlineTypeScriptView";
+const INLINE_TYPESCRIPT_SCHEME = "thebe-inline-ts";
 
 function resolveInlineTypeScriptView({
   documentPath,
@@ -291,6 +292,7 @@ function skipWhitespace(source, startOffset) {
 
 module.exports = {
   INLINE_TYPESCRIPT_COMMAND_ID,
+  INLINE_TYPESCRIPT_SCHEME,
   resolveInlineSourcePositionRange,
   resolveInlineSourceRange,
   resolveInlineTypeScriptView,

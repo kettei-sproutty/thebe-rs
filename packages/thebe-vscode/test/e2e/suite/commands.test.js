@@ -30,17 +30,34 @@ suite("Thebe extension commands", () => {
     assert.ok(editor.document.uri.fsPath.endsWith(path.join(".thebe", "types", "routes", "index.ts")));
   });
 
-  test("inline typescript view command opens untitled typescript snapshot", async () => {
-    await openFixtureRouteAt("increment");
+  test("inline typescript view command opens provider-backed typescript snapshot", async () => {
+    const sourceEditor = await openFixtureRouteAt("increment");
 
     await vscode.commands.executeCommand("thebe.openInlineTypeScriptView");
 
     const editor = vscode.window.activeTextEditor;
     assert.ok(editor);
-    assert.strictEqual(editor.document.uri.scheme, "untitled");
+    assert.strictEqual(editor.document.uri.scheme, "thebe-inline-ts");
+    assert.ok(editor.document.uri.path.endsWith(path.join(".thebe", "client", "routes", "index.ts")));
     assert.strictEqual(editor.document.languageId, "typescript");
     assert.match(editor.document.getText(), /declare function getProps<T = unknown>\(\): T;/);
     assert.match(editor.document.getText(), /function increment\(\)/);
+
+    await sourceEditor.edit((editBuilder) => {
+      const start = sourceEditor.document.positionAt(sourceEditor.document.getText().indexOf("increment"));
+      const end = sourceEditor.document.positionAt(sourceEditor.document.getText().indexOf("increment") + "increment".length);
+      editBuilder.replace(new vscode.Range(start, end), "incrementLater");
+    });
+
+    await waitFor(() => editor.document.getText().includes("incrementLater"));
+
+    await sourceEditor.edit((editBuilder) => {
+      const start = sourceEditor.document.positionAt(sourceEditor.document.getText().indexOf("incrementLater"));
+      const end = sourceEditor.document.positionAt(sourceEditor.document.getText().indexOf("incrementLater") + "incrementLater".length);
+      editBuilder.replace(new vscode.Range(start, end), "increment");
+    });
+
+    await waitFor(() => editor.document.getText().includes("function increment()"));
   });
 
   test("inline rust view command opens untitled rust snapshot", async () => {
@@ -125,5 +142,17 @@ suite("Thebe extension commands", () => {
     const position = document.positionAt(offset);
     editor.selection = new vscode.Selection(position, position);
     return editor;
+  }
+
+  async function waitFor(predicate, timeoutMs = 5000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (predicate()) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    assert.fail("timed out waiting for inline snapshot update");
   }
 });

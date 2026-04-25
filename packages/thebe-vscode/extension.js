@@ -15,6 +15,7 @@ const {
 } = require("./generated-client");
 const {
   INLINE_TYPESCRIPT_COMMAND_ID,
+  INLINE_TYPESCRIPT_SCHEME,
   resolveInlineSourcePositionRange,
   resolveInlineTypeScriptView,
 } = require("./inline-typescript");
@@ -27,8 +28,10 @@ const {
 let client;
 const inlineRustSnapshots = new Map();
 const inlineTypeScriptSnapshots = new Map();
+const inlineTypeScriptSnapshotSourcePaths = new Map();
+const inlineTypeScriptSnapshotChanges = new vscode.EventEmitter();
 const INLINE_RUST_SELECTOR = [{ language: "rust", scheme: "untitled" }];
-const INLINE_TYPESCRIPT_SELECTOR = [{ language: "typescript", scheme: "untitled" }];
+const INLINE_TYPESCRIPT_SELECTOR = [{ scheme: INLINE_TYPESCRIPT_SCHEME }];
 
 async function activate(context) {
   const command = resolveServerCommand({
@@ -55,6 +58,11 @@ async function activate(context) {
 
   context.subscriptions.push(
     client.start(),
+    inlineTypeScriptSnapshotChanges,
+    vscode.workspace.registerTextDocumentContentProvider(INLINE_TYPESCRIPT_SCHEME, {
+      onDidChange: inlineTypeScriptSnapshotChanges.event,
+      provideTextDocumentContent: provideInlineTypeScriptContent,
+    }),
     vscode.languages.registerDefinitionProvider(INLINE_RUST_SELECTOR, {
       provideDefinition: provideInlineRustDefinition,
     }),
@@ -70,9 +78,12 @@ async function activate(context) {
     vscode.languages.registerReferenceProvider(INLINE_TYPESCRIPT_SELECTOR, {
       provideReferences: provideInlineTypeScriptReferences,
     }),
+    vscode.workspace.onDidChangeTextDocument((event) => {
+      refreshInlineTypeScriptSnapshot(event.document);
+    }),
     vscode.workspace.onDidCloseTextDocument((document) => {
       inlineRustSnapshots.delete(document.uri.toString());
-      inlineTypeScriptSnapshots.delete(document.uri.toString());
+      deleteInlineTypeScriptSnapshot(document.uri);
     }),
     vscode.commands.registerCommand(GENERATED_CLIENT_COMMAND_ID, openGeneratedClientMirror),
     vscode.commands.registerCommand(GENERATED_TYPES_COMMAND_ID, openGeneratedTypesMirror),
@@ -147,11 +158,11 @@ async function openInlineTypeScriptView() {
   }
 
   try {
-    const document = await vscode.workspace.openTextDocument({
-      language: "typescript",
-      content: view.content,
-    });
-    inlineTypeScriptSnapshots.set(document.uri.toString(), view);
+    const documentUri = rememberInlineTypeScriptSnapshot(view);
+    let document = await vscode.workspace.openTextDocument(documentUri);
+    if (document.languageId !== "typescript") {
+      document = await vscode.languages.setTextDocumentLanguage(document, "typescript");
+    }
     const targetEditor = await vscode.window.showTextDocument(document, {
       preview: false,
       viewColumn: vscode.ViewColumn.Beside,
@@ -164,6 +175,68 @@ async function openInlineTypeScriptView() {
     targetEditor.revealRange(selection);
   } catch {
     void vscode.window.showErrorMessage("Unable to open the inline TypeScript snapshot for this route.");
+  }
+}
+
+function provideInlineTypeScriptContent(uri) {
+  return inlineTypeScriptSnapshots.get(uri.toString())?.content ?? "";
+}
+
+function rememberInlineTypeScriptSnapshot(view) {
+  const documentUri = vscode.Uri.file(view.targetPath).with({ scheme: INLINE_TYPESCRIPT_SCHEME });
+  const uriString = documentUri.toString();
+  inlineTypeScriptSnapshots.set(uriString, view);
+  inlineTypeScriptSnapshotSourcePaths.set(view.sourcePath, uriString);
+  inlineTypeScriptSnapshotChanges.fire(documentUri);
+  return documentUri;
+}
+
+function refreshInlineTypeScriptSnapshot(document) {
+  if (!document || document.languageId !== "thebe" || document.uri.scheme !== "file") {
+    return;
+  }
+
+  const snapshotUriString = inlineTypeScriptSnapshotSourcePaths.get(document.uri.fsPath);
+  if (!snapshotUriString) {
+    return;
+  }
+
+  const sourceEditor = vscode.window.visibleTextEditors.find(
+    (editor) => editor.document.uri.toString() === document.uri.toString(),
+  );
+  const selectionStartOffset = sourceEditor ? document.offsetAt(sourceEditor.selection.start) : 0;
+  const selectionEndOffset = sourceEditor ? document.offsetAt(sourceEditor.selection.end) : selectionStartOffset;
+  const view = resolveInlineTypeScriptView({
+    documentPath: document.uri.fsPath,
+    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+    source: document.getText(),
+    selectionStartOffset,
+    selectionEndOffset,
+  });
+
+  const snapshotUri = vscode.Uri.parse(snapshotUriString);
+  if (!view.ok) {
+    inlineTypeScriptSnapshots.delete(snapshotUriString);
+    inlineTypeScriptSnapshotChanges.fire(snapshotUri);
+    return;
+  }
+
+  inlineTypeScriptSnapshots.set(snapshotUriString, view);
+  inlineTypeScriptSnapshotChanges.fire(snapshotUri);
+}
+
+function deleteInlineTypeScriptSnapshot(documentUri) {
+  if (!documentUri || documentUri.scheme !== INLINE_TYPESCRIPT_SCHEME) {
+    return;
+  }
+
+  const uriString = documentUri.toString();
+  inlineTypeScriptSnapshots.delete(uriString);
+  for (const [sourcePath, snapshotUriString] of inlineTypeScriptSnapshotSourcePaths.entries()) {
+    if (snapshotUriString === uriString) {
+      inlineTypeScriptSnapshotSourcePaths.delete(sourcePath);
+      break;
+    }
   }
 }
 
