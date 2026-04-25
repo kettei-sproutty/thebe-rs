@@ -59,6 +59,11 @@
     ],
     "commands": [
       {
+        "command": "thebe.openInlineRustView",
+        "title": "Open Inline Rust View",
+        "category": "Thebe"
+      },
+      {
         "command": "thebe.openInlineTypeScriptView",
         "title": "Open Inline TypeScript View",
         "category": "Thebe"
@@ -77,6 +82,10 @@
     "menus": {
       "commandPalette": [
         {
+          "command": "thebe.openInlineRustView",
+          "when": "editorLangId == thebe"
+        },
+        {
           "command": "thebe.openInlineTypeScriptView",
           "when": "editorLangId == thebe"
         },
@@ -90,6 +99,11 @@
         }
       ],
       "editor/title": [
+        {
+          "command": "thebe.openInlineRustView",
+          "when": "editorLangId == thebe && resourceScheme == file",
+          "group": "navigation@9"
+        },
         {
           "command": "thebe.openInlineTypeScriptView",
           "when": "editorLangId == thebe && resourceScheme == file",
@@ -107,6 +121,11 @@
         }
       ],
       "editor/context": [
+        {
+          "command": "thebe.openInlineRustView",
+          "when": "editorLangId == thebe && resourceScheme == file",
+          "group": "navigation@9"
+        },
         {
           "command": "thebe.openInlineTypeScriptView",
           "when": "editorLangId == thebe && resourceScheme == file",

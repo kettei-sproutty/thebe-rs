@@ -28,12 +28,24 @@ function resolveInlineTypeScriptView({
   }
 
   const typesPath = resolveGeneratedTypesMirrorPath({ documentPath, workspaceFolders });
-  const prefix = buildInlineTypeScriptPrefix({ targetPath, typesPath, fileExists, readFile });
+  const hasGeneratedTypes = Boolean(typesPath && fileExists(typesPath));
+  const prefix = buildInlineTypeScriptPrefix({
+    targetPath,
+    typesPath,
+    fileExists,
+    readFile,
+  });
 
   return {
     ok: true,
     targetPath,
+    sourcePath: documentPath,
+    sourceText: source,
+    generatedTypesPath: hasGeneratedTypes ? typesPath : null,
     content: prefix + scriptBlock.content,
+    prefixLength: prefix.length,
+    scriptStartOffset: scriptBlock.start,
+    scriptEndOffset: scriptBlock.end,
     selectionStartOffset: mapSourceOffsetToInlineOffset({
       sourceOffset: selectionStartOffset,
       scriptBlock,
@@ -76,6 +88,76 @@ function mapSourceOffsetToInlineOffset({ sourceOffset, scriptBlock, prefixLength
 
   const clampedOffset = Math.min(Math.max(sourceOffset, scriptBlock.start), scriptBlock.end);
   return prefixLength + clampedOffset - scriptBlock.start;
+}
+
+function mapInlineOffsetToSourceOffset({ inlineOffset, view }) {
+  if (typeof inlineOffset !== "number") {
+    return null;
+  }
+
+  const contentLength = view.scriptEndOffset - view.scriptStartOffset;
+  if (inlineOffset < view.prefixLength || inlineOffset > view.prefixLength + contentLength) {
+    return null;
+  }
+
+  return view.scriptStartOffset + inlineOffset - view.prefixLength;
+}
+
+function resolveInlineSourceRange({ view, startOffset, endOffset }) {
+  const sourceStartOffset = mapInlineOffsetToSourceOffset({ inlineOffset: startOffset, view });
+  const sourceEndOffset = mapInlineOffsetToSourceOffset({ inlineOffset: endOffset, view });
+  if (sourceStartOffset === null || sourceEndOffset === null) {
+    return null;
+  }
+
+  return {
+    startOffset: sourceStartOffset,
+    endOffset: sourceEndOffset,
+  };
+}
+
+function resolveInlineSourcePositionRange({ view, startOffset, endOffset }) {
+  if (typeof view.sourceText !== "string") {
+    return null;
+  }
+
+  const sourceRange = resolveInlineSourceRange({ view, startOffset, endOffset });
+  if (!sourceRange) {
+    return null;
+  }
+
+  return {
+    start: positionAtOffset(view.sourceText, sourceRange.startOffset),
+    end: positionAtOffset(view.sourceText, sourceRange.endOffset),
+  };
+}
+
+function positionAtOffset(source, offset) {
+  const targetOffset = Math.min(Math.max(offset, 0), source.length);
+  let line = 0;
+  let character = 0;
+
+  for (let index = 0; index < targetOffset; index += 1) {
+    const code = source.charCodeAt(index);
+    if (code === 13) {
+      if (source.charCodeAt(index + 1) === 10) {
+        index += 1;
+      }
+      line += 1;
+      character = 0;
+      continue;
+    }
+
+    if (code === 10) {
+      line += 1;
+      character = 0;
+      continue;
+    }
+
+    character += 1;
+  }
+
+  return { line, character };
 }
 
 function findTypeScriptBlock(source) {
@@ -209,5 +291,7 @@ function skipWhitespace(source, startOffset) {
 
 module.exports = {
   INLINE_TYPESCRIPT_COMMAND_ID,
+  resolveInlineSourcePositionRange,
+  resolveInlineSourceRange,
   resolveInlineTypeScriptView,
 };

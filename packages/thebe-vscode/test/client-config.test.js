@@ -20,8 +20,17 @@ const {
 } = require("../generated-client");
 const {
   INLINE_TYPESCRIPT_COMMAND_ID,
+  resolveInlineSourcePositionRange,
+  resolveInlineSourceRange,
   resolveInlineTypeScriptView,
 } = require("../inline-typescript");
+const {
+  INLINE_RUST_COMMAND_ID,
+  resolveGeneratedServerMirrorPath,
+  resolveInlineRustSourcePositionRange,
+  resolveInlineRustSourceRange,
+  resolveInlineRustView,
+} = require("../inline-rust");
 
 test("thebe document selector includes untitled editors", () => {
   const selector = createDocumentSelector();
@@ -118,6 +127,10 @@ test("generated client command id stays stable", () => {
   assert.strictEqual(GENERATED_CLIENT_COMMAND_ID, "thebe.openGeneratedClientMirror");
 });
 
+test("inline rust command id stays stable", () => {
+  assert.strictEqual(INLINE_RUST_COMMAND_ID, "thebe.openInlineRustView");
+});
+
 test("inline typescript command id stays stable", () => {
   assert.strictEqual(INLINE_TYPESCRIPT_COMMAND_ID, "thebe.openInlineTypeScriptView");
 });
@@ -178,6 +191,36 @@ test("generated types resolver ignores layouts and non-route files", () => {
     workspaceFolders: [workspacePath],
   });
   const componentPath = resolveGeneratedTypesMirrorPath({
+    documentPath: path.join(workspacePath, "src", "components", "Card.trs"),
+    workspaceFolders: [workspacePath],
+  });
+
+  assert.strictEqual(layoutPath, null);
+  assert.strictEqual(componentPath, null);
+});
+
+test("generated server resolver maps route files into .thebe/server mirrors", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+
+  const mirrorPath = resolveGeneratedServerMirrorPath({
+    documentPath: path.join(workspacePath, "src", "routes", "blog", "[slug].trs"),
+    workspaceFolders: [workspacePath],
+  });
+
+  assert.strictEqual(
+    mirrorPath,
+    path.join(workspacePath, ".thebe", "server", "routes", "blog", "[slug].rs"),
+  );
+});
+
+test("generated server resolver ignores layouts and non-route files", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+
+  const layoutPath = resolveGeneratedServerMirrorPath({
+    documentPath: path.join(workspacePath, "src", "routes", "_layout.trs"),
+    workspaceFolders: [workspacePath],
+  });
+  const componentPath = resolveGeneratedServerMirrorPath({
     documentPath: path.join(workspacePath, "src", "components", "Card.trs"),
     workspaceFolders: [workspacePath],
   });
@@ -282,6 +325,29 @@ test("inline typescript view builds route snapshot with type import", () => {
   assert.ok(view.selectionStartOffset > view.content.indexOf("function increment"));
 });
 
+test("inline rust view builds route snapshot from script setup", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<script setup>\n#[thebe::get]\nfn handler() -> Props {\n  Props {}\n}\n</script>\n`;
+  const selectionOffset = source.indexOf("handler") + 2;
+
+  const view = resolveInlineRustView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    selectionStartOffset: selectionOffset,
+    selectionEndOffset: selectionOffset,
+  });
+
+  assert.ok(view.ok);
+  assert.strictEqual(
+    view.targetPath,
+    path.join(workspacePath, ".thebe", "server", "routes", "counter.rs"),
+  );
+  assert.match(view.content, /inline Rust view/);
+  assert.match(view.content, /fn handler\(\) -> Props/);
+  assert.ok(view.selectionStartOffset > view.content.indexOf("fn handler"));
+});
+
 test("inline typescript view falls back to unknown props without generated types", () => {
   const workspacePath = path.join("/tmp", "thebe-app");
   const source = `<script lang="ts">\nconst props = getProps<Props>();\n</script>\n`;
@@ -299,12 +365,148 @@ test("inline typescript view falls back to unknown props without generated types
   assert.match(view.content, /type Props = unknown;/);
 });
 
+test("inline typescript source range maps snapshot offsets back into the route script", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<script lang="ts">\nconst props = getProps<Props>();\nfunction increment() {\n  return props.count;\n}\n</script>\n`;
+  const view = resolveInlineTypeScriptView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    selectionStartOffset: source.indexOf("increment") + 2,
+    selectionEndOffset: source.indexOf("increment") + 8,
+    fileExists: () => false,
+  });
+  const inlineStart = view.content.indexOf("increment") + 2;
+  const inlineEnd = view.content.indexOf("increment") + 8;
+
+  const sourceRange = resolveInlineSourceRange({
+    view,
+    startOffset: inlineStart,
+    endOffset: inlineEnd,
+  });
+
+  assert.deepStrictEqual(sourceRange, {
+    startOffset: source.indexOf("increment") + 2,
+    endOffset: source.indexOf("increment") + 8,
+  });
+});
+
+test("inline typescript source range ignores snapshot prefix offsets", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<script lang="ts">\nconst props = getProps<Props>();\n</script>\n`;
+  const view = resolveInlineTypeScriptView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    selectionStartOffset: 0,
+    selectionEndOffset: 0,
+    fileExists: () => false,
+  });
+
+  const sourceRange = resolveInlineSourceRange({
+    view,
+    startOffset: 0,
+    endOffset: 4,
+  });
+
+  assert.strictEqual(sourceRange, null);
+});
+
+test("inline typescript source positions preserve the route line and column", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<div />\n<script lang="ts">\nfunction increment() {}\n</script>\n`;
+  const view = resolveInlineTypeScriptView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    selectionStartOffset: 0,
+    selectionEndOffset: 0,
+    fileExists: () => false,
+  });
+  const inlineStart = view.content.indexOf("increment");
+  const inlineEnd = inlineStart + "increment".length;
+
+  const sourceRange = resolveInlineSourcePositionRange({
+    view,
+    startOffset: inlineStart,
+    endOffset: inlineEnd,
+  });
+
+  assert.deepStrictEqual(sourceRange, {
+    start: { line: 2, character: 9 },
+    end: { line: 2, character: 18 },
+  });
+});
+
+test("inline rust source range maps snapshot offsets back into the route script", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<script setup>\n#[thebe::get]\nfn handler() -> Props {\n  Props {}\n}\n</script>\n`;
+  const view = resolveInlineRustView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    selectionStartOffset: source.indexOf("handler") + 2,
+    selectionEndOffset: source.indexOf("handler") + 7,
+  });
+  const inlineStart = view.content.indexOf("handler") + 2;
+  const inlineEnd = view.content.indexOf("handler") + 7;
+
+  const sourceRange = resolveInlineRustSourceRange({
+    view,
+    startOffset: inlineStart,
+    endOffset: inlineEnd,
+  });
+
+  assert.deepStrictEqual(sourceRange, {
+    startOffset: source.indexOf("handler") + 2,
+    endOffset: source.indexOf("handler") + 7,
+  });
+});
+
+test("inline rust source positions preserve the route line and column", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<div />\n<script setup>\nfn handler() {}\n</script>\n`;
+  const view = resolveInlineRustView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    selectionStartOffset: 0,
+    selectionEndOffset: 0,
+  });
+  const inlineStart = view.content.indexOf("handler");
+  const inlineEnd = inlineStart + "handler".length;
+
+  const sourceRange = resolveInlineRustSourcePositionRange({
+    view,
+    startOffset: inlineStart,
+    endOffset: inlineEnd,
+  });
+
+  assert.deepStrictEqual(sourceRange, {
+    start: { line: 2, character: 3 },
+    end: { line: 2, character: 10 },
+  });
+});
+
 test("inline typescript view rejects non-route files", () => {
   const workspacePath = path.join("/tmp", "thebe-app");
   const view = resolveInlineTypeScriptView({
     documentPath: path.join(workspacePath, "src", "components", "Card.trs"),
     workspaceFolders: [workspacePath],
     source: `<script lang="ts">\nconst count = 1;\n</script>`,
+    selectionStartOffset: 0,
+    selectionEndOffset: 0,
+  });
+
+  assert.deepStrictEqual(view, { ok: false, reason: "not-route" });
+});
+
+test("inline rust view rejects non-route files", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const view = resolveInlineRustView({
+    documentPath: path.join(workspacePath, "src", "components", "Card.trs"),
+    workspaceFolders: [workspacePath],
+    source: `<script setup>\nfn handler() {}\n</script>`,
     selectionStartOffset: 0,
     selectionEndOffset: 0,
   });
@@ -325,7 +527,30 @@ test("inline typescript view rejects routes without client script", () => {
   assert.deepStrictEqual(view, { ok: false, reason: "no-script" });
 });
 
+test("inline rust view rejects routes without script setup", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const view = resolveInlineRustView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source: `<script lang="ts">\nfunction increment() {}\n</script>`,
+    selectionStartOffset: 0,
+    selectionEndOffset: 0,
+  });
+
+  assert.deepStrictEqual(view, { ok: false, reason: "no-script" });
+});
+
 test("package manifest contributes generated artifact commands", () => {
+  assert.ok(
+    packageJson.contributes.commands.some(
+      (command) => command.command === INLINE_RUST_COMMAND_ID,
+    ),
+  );
+  assert.ok(
+    packageJson.contributes.menus.commandPalette.some(
+      (item) => item.command === INLINE_RUST_COMMAND_ID,
+    ),
+  );
   assert.ok(
     packageJson.contributes.commands.some(
       (command) => command.command === INLINE_TYPESCRIPT_COMMAND_ID,
@@ -358,6 +583,11 @@ test("package manifest contributes generated artifact commands", () => {
   );
   assert.ok(
     packageJson.contributes.menus["editor/title"].some(
+      (item) => item.command === INLINE_RUST_COMMAND_ID,
+    ),
+  );
+  assert.ok(
+    packageJson.contributes.menus["editor/title"].some(
       (item) => item.command === INLINE_TYPESCRIPT_COMMAND_ID,
     ),
   );
@@ -369,6 +599,11 @@ test("package manifest contributes generated artifact commands", () => {
   assert.ok(
     packageJson.contributes.menus["editor/title"].some(
       (item) => item.command === GENERATED_TYPES_COMMAND_ID,
+    ),
+  );
+  assert.ok(
+    packageJson.contributes.menus["editor/context"].some(
+      (item) => item.command === INLINE_RUST_COMMAND_ID,
     ),
   );
   assert.ok(

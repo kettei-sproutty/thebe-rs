@@ -13,7 +13,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
   - `.thebe/tsconfig.json` gives editors a self-contained TypeScript project without forcing a root `tsconfig.json`.
 - `.thebe/manifest.json` is currently version 6 and records route/layout/component metadata, generated paths, handler signatures, direct component dependencies, template bindings, exact field-level template symbol definitions, source spans, and route template symbols derived from `Props`.
 - `.thebe/diagnostics.json` is currently version 1 and records structured project and file diagnostics with relative paths and source spans.
-- `packages/thebe-vscode/` ships a packaged VS Code extension with `.trs` language registration, snippets, TextMate highlighting, automatic `thebe-lsp` startup, command palette plus editor title/context actions for opening a route's generated `.thebe/client/**` and `.thebe/types/**` mirrors beside the source `.trs` file while preserving matching locations when available, and an `Open Inline TypeScript View` command that opens the current `<script lang="ts">` block as an untitled TypeScript snapshot.
+- `packages/thebe-vscode/` ships a packaged VS Code extension with `.trs` language registration, snippets, TextMate highlighting, automatic `thebe-lsp` startup, command palette plus editor title/context actions for opening a route's generated `.thebe/client/**` and `.thebe/types/**` mirrors beside the source `.trs` file while preserving matching locations when available, an `Open Inline TypeScript View` command that opens the current `<script lang="ts">` block as an untitled TypeScript snapshot with local definition/reference jumps back into the source route and `Props` type definition jumps into the generated `.thebe/types/**` mirror, and an `Open Inline Rust View` command that opens the current `<script setup>` block as an untitled Rust snapshot with local definition/reference jumps back into the source route.
 - `packages/tree-sitter-thebe/` ships an initial tree-sitter grammar for `.trs` block tags, nested generic component/html template elements, HTML comments, attributes, template bindings, and raw script/style injection points.
 
 ## Current LSP Features
@@ -50,7 +50,7 @@ The editor loop is not disk-only anymore.
 - `didChange` refreshes are debounced.
 - The LSP keeps last-good artifacts so hover, definition, and references can keep working during transient invalid edits.
 - Diagnostics publishing is coalesced so unchanged diagnostics are not republished on every refresh.
-- The extension package now has a lightweight extension-host harness that validates the generated client/types commands plus the inline TypeScript snapshot command against a real VS Code instance.
+- The extension package now has a lightweight extension-host harness that validates the generated client/types commands plus the inline TypeScript and inline Rust snapshot commands and their source round-trips against a real VS Code instance.
 
 ## Remaining Gaps
 
@@ -62,15 +62,14 @@ The editor story is broader now, but a few edges are still intentionally narrow:
 
 ## Planned Rust Analyzer Bridge
 
-The Rust-side bridge should follow the same virtual-document pattern now used to start the TypeScript side, but it needs one extra layer of generated server context.
+The first Rust-side virtual-document step now exists in the VS Code extension as an explicit `Open Inline Rust View` command, but deeper `rust-analyzer` integration still needs one extra layer of generated server context.
 
 - Source of truth should stay the current `.trs` buffer plus the overlay-backed `thebe-project` refresh path, not stale disk content.
-- The first virtual Rust target should mirror the route's generated `.thebe/server/routes/**` path so the snapshot stays aligned with the existing generated server module layout and Cargo context.
-- The virtual Rust snapshot should be built from the active `<script setup>` block plus the deterministic wrapper/import/module scaffolding that `thebe-codegen` already emits around route handlers.
-- The source map should record UTF-16 offset conversions in both directions: `.trs` `<script setup>` range to virtual Rust snapshot range, and virtual Rust locations back to the original `.trs` span.
-- The initial refresh model should be explicit-command or on-demand open first, then graduate to debounced live regeneration once the offset map is stable.
-- Diagnostics, definition, hover, and rename should round-trip through that source map instead of trying to infer relationships from generated file text after the fact.
-- Once that virtual Rust layer is stable, `rust-analyzer` integration can ride on top of it the same way the inline TypeScript phase now rides on an untitled TypeScript snapshot.
+- The current inline Rust snapshot already mirrors the route's deterministic `.thebe/server/routes/**` target path and records a source map back into the original `<script setup>` span.
+- The next step is to replace the bare extracted block with the deterministic wrapper/import/module scaffolding that `thebe-codegen` emits around route handlers so the virtual document matches generated server context more closely.
+- After that wrapper is stable, diagnostics, definition, hover, and rename should round-trip through the virtual Rust source map instead of inferring relationships from generated file text after the fact.
+- The initial refresh model can stay explicit-command or on-demand open first, then graduate to debounced live regeneration once the offset map is stable.
+- Once that fuller virtual Rust layer is stable, `rust-analyzer` integration can ride on top of it the same way the inline TypeScript phase now rides on an untitled TypeScript snapshot.
 
 ## Practical Scope Today
 
@@ -78,6 +77,7 @@ If you open a route-oriented Thebe project in an editor today, the expected tool
 
 - compiler diagnostics work
 - generated TypeScript mirrors work
+- inline Rust and TypeScript snapshots work as explicit opt-in editor bridges
 - route/layout navigation works
 - semantic highlighting, formatting, rename, hover, and code actions work for the currently supported Thebe surface
 - template, attribute, event, component, and named-slot completions work
