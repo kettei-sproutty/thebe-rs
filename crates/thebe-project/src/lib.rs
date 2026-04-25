@@ -1404,7 +1404,6 @@ fn prepare_generated_workspace(project_root: &Path, typecheck_enabled: bool) -> 
   reset_generated_dir(&project_root.join(THEBE_SERVER_ROUTES_DIR))?;
   reset_generated_dir(&project_root.join(THEBE_SOURCE_SNAPSHOTS_DIR))?;
   reset_generated_dir(&project_root.join(TYPECHECK_CLIENT_DIR))?;
-  reset_generated_dir(&project_root.join(TYPECHECK_TYPES_DIR))?;
   remove_generated_file(&project_root.join(THEBE_DIAGNOSTICS_FILE))?;
   remove_generated_file(&project_root.join(THEBE_HOTPATCH_FILE))?;
   remove_generated_file(&project_root.join(THEBE_MANIFEST_FILE))?;
@@ -2403,6 +2402,76 @@ fn handler() -> Props {
     );
     assert_eq!(artifacts.manifest.routes[0].handler.name, "handler");
     assert_eq!(artifacts.manifest.routes[0].template_symbols, vec!["title"]);
+  }
+
+  #[test]
+  fn refresh_project_for_editor_with_overlay_preserves_existing_type_exports() {
+    let project = TestProject::new("overlay-preserve-type-exports");
+    project.write("Cargo.toml", &fixture_cargo_toml(true));
+    project.write(
+      "src/routes/index.trs",
+      r#"<script setup>
+struct Props {
+  title: String,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {
+    title: String::from("Before"),
+  }
+}
+</script>
+
+<script lang="ts">
+let props = getProps<Props>();
+console.log(props.title);
+</script>
+
+<main>{{ title }}</main>
+"#,
+    );
+
+    let types_path = project.path().join(TYPECHECK_TYPES_DIR).join("routes/index.ts");
+    fs::create_dir_all(types_path.parent().expect("types path should have a parent"))
+      .expect("types directory should create");
+    let existing_types = "type Props = {\n  title: string;\n};\n\nexport default Props;\n";
+    fs::write(&types_path, existing_types).expect("existing type export should write");
+
+    let mut overlay = ProjectOverlay::new();
+    overlay.insert(
+      project.path().join("src/routes/index.trs"),
+      r#"<script setup>
+struct Props {
+  title: String,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {
+    title: String::from("After"),
+  }
+}
+</script>
+
+<script lang="ts">
+let props = getProps<Props>();
+console.log(props.title);
+</script>
+
+<main>{{ title }}</main>
+"#
+      .to_owned(),
+    );
+
+    let refresh = refresh_project_for_editor_with_overlay(project.path(), &overlay)
+      .expect("overlay refresh should succeed");
+
+    assert!(matches!(refresh, EditorRefresh::Generated(_)));
+    assert_eq!(
+      fs::read_to_string(&types_path).expect("type export should remain after refresh"),
+      existing_types
+    );
   }
 
   #[test]

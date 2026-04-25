@@ -87,6 +87,29 @@ test("server resolver prefers bundled binary before workspace debug build", () =
   assert.strictEqual(command, bundled);
 });
 
+test("server resolver prefers workspace debug build for development extensions", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "thebe-vscode-test-"));
+  const repoPath = path.join(root, "repo");
+  const workspacePath = path.join(root, "fixture-workspace");
+  const extensionPath = path.join(repoPath, "packages", "thebe-vscode");
+  const bundled = path.join(extensionPath, "bin", "thebe-lsp");
+  const workspaceBinary = path.join(repoPath, "target", "debug", "thebe-lsp");
+
+  fs.mkdirSync(path.dirname(bundled), { recursive: true });
+  fs.mkdirSync(path.dirname(workspaceBinary), { recursive: true });
+  fs.writeFileSync(bundled, "");
+  fs.writeFileSync(workspaceBinary, "");
+
+  const command = resolveServerCommand({
+    configuredPath: "",
+    extensionPath,
+    workspaceFolders: [workspacePath],
+    platform: "darwin",
+  });
+
+  assert.strictEqual(command, workspaceBinary);
+});
+
 test("server resolver falls back to workspace debug build before PATH", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "thebe-vscode-test-"));
   const workspacePath = path.join(root, "workspace");

@@ -10,6 +10,10 @@ This package wires Thebe `.trs` files into VS Code with:
 - an `Open Inline Rust View` command that opens the current route's `<script setup>` block as an untitled Rust snapshot with definition/reference jumps back into the source route
 - an `Open Inline TypeScript View` command that opens the current route's `<script lang="ts">` block as a stable provider-backed virtual TypeScript document with definition/reference jumps back into the source route, `Props` type definition jumps into the generated props mirror, built-in TypeScript hover, live refresh from source `.trs` edits, and source-side TypeScript completions plus mapped errors/warnings inside the original `.trs` editor
 
+The inline TypeScript snapshot now comes from `thebe-lsp` first through a `workspace/executeCommand` bridge, with the older extension-local resolver kept only as a compatibility fallback for older servers or startup timing gaps.
+
+Source-side TypeScript completions plus mapped errors and warnings now also come from `thebe-lsp` after startup through an embedded TypeScript bridge that uses VS Code's bundled runtime. The extension keeps the older source-side completion and diagnostics provider only until `client.onReady()` so authoring still works during server bootstrap.
+
 ## Local Development
 
 1. Install dependencies in this package with `npm install`.
@@ -18,7 +22,7 @@ This package wires Thebe `.trs` files into VS Code with:
 4. Run `npm test` in this package to validate the extension's focused smoke checks for the Thebe document selector, project input watch glob, LSP server resolution precedence, generated artifact commands, and inline Rust/TypeScript bridge helpers.
 5. Run `npm run test:e2e` in this package to launch the lightweight extension-host harness that verifies the generated artifact commands plus the inline Rust snapshot and provider-backed TypeScript virtual document's editor-opening, refresh, round-trip navigation behavior, source-side TypeScript completions, and mapped TypeScript diagnostics.
 
-When the setting is empty, the extension tries `target/debug/thebe-lsp` in the current workspace before falling back to `thebe-lsp` on `PATH`.
+When the setting is empty in a development checkout, the extension first looks for a nearby `target/debug/thebe-lsp` above the extension folder, then tries `target/debug/thebe-lsp` in the current workspace, and finally falls back to `thebe-lsp` on `PATH`.
 
 ## Packaging
 

@@ -165,6 +165,11 @@ fn route_client_script_edit_should_emit_template_event_without_runtime_restart()
   let page = fetch_page(fixture_port, "/");
   assert!(page.contains("id=\"counter\""));
 
+  let types_path = fixture.root().join(".thebe/types/routes/index.ts");
+  wait_for_file_contains(&types_path, "type Props = {", Duration::from_secs(20));
+  let initial_types = fs::read_to_string(&types_path)
+    .expect("route types export should exist before hotpatch");
+
   let (event_rx, sse_handle) = open_event_stream(browser_addr);
 
   thread::sleep(Duration::from_millis(150));
@@ -188,6 +193,11 @@ fn route_client_script_edit_should_emit_template_event_without_runtime_restart()
     });
   assert!(data_line.contains(r#""routePattern":"/""#));
   assert!(!data_line.contains("css"), "unexpected template payload: {data_line}");
+
+  wait_for_file_contains(&types_path, "type Props = {", Duration::from_secs(20));
+  let patched_types = fs::read_to_string(&types_path)
+    .expect("route types export should persist after hotpatch");
+  assert_eq!(patched_types, initial_types);
 
   wait_for_runtime_handshake_count(&output, 1, Duration::from_secs(5)).unwrap();
   assert!(child.try_wait().expect("child wait should succeed").is_none());
@@ -3131,6 +3141,26 @@ fn fetch_page(port: u16, path: &str) -> String {
 
 fn wait_for_page_contains(port: u16, path: &str, needle: &str, timeout: Duration) {
   wait_for_page_matching(port, path, |page| page.contains(needle), needle, timeout);
+}
+
+fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) {
+  let start = Instant::now();
+
+  loop {
+    if fs::read_to_string(path).is_ok_and(|source| source.contains(needle)) {
+      return;
+    }
+
+    if start.elapsed() >= timeout {
+      panic!(
+        "timed out waiting for {} to contain {:?}",
+        path.display(),
+        needle
+      );
+    }
+
+    thread::sleep(Duration::from_millis(50));
+  }
 }
 
 fn wait_for_page_matching<F>(

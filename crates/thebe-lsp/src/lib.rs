@@ -1,6 +1,8 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use serde_json::{Value, json};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -18,25 +20,30 @@ use tower_lsp::lsp_types::{
   CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
   CodeActionProviderCapability, CompletionItem, CompletionItemKind, CompletionOptions,
   CompletionParams, CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
+  DiagnosticTag,
   DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
   DidSaveTextDocumentParams, DocumentFormattingParams, DocumentHighlight,
   DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
-  DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-  HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-  InsertTextFormat, LinkedEditingRangeParams, LinkedEditingRangeServerCapabilities,
-  LinkedEditingRanges, Location, MarkupContent, MarkupKind, MessageType,
-  NumberOrString, OneOf, Position, PrepareRenameResponse, Range, ReferenceParams,
-  RenameOptions, RenameParams, SemanticToken, SemanticTokenModifier,
-  SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
-  SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-  SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
-  SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind,
-  TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
-  WorkspaceEdit, WorkspaceSymbolParams,
+  DocumentSymbolResponse, ExecuteCommandOptions, ExecuteCommandParams,
+  GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+  HoverProviderCapability, InitializeParams, InitializeResult, InsertTextFormat,
+  LinkedEditingRangeParams, LinkedEditingRangeServerCapabilities, LinkedEditingRanges,
+  Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, Position,
+  PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams,
+  SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
+  SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+  SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+  ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind,
+  TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+  TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
 const CHANGE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
+const INLINE_TYPESCRIPT_VIEW_COMMAND: &str = "thebe.inlineTypeScriptView";
+const INLINE_TYPESCRIPT_MAP_PROTOCOL_DIAGNOSTICS_COMMAND: &str =
+  "thebe.mapInlineTypeScriptProtocolDiagnostics";
+const TYPESCRIPT_BRIDGE_SCRIPT: &str = include_str!("typescript_bridge.js");
 
 type DiagnosticsByFile = BTreeMap<Url, Vec<Diagnostic>>;
 type DiagnosticPublishBatch = Vec<(Url, Vec<Diagnostic>)>;
@@ -106,6 +113,7 @@ impl OpenDocuments {
 struct BackendState {
   open_documents: OpenDocuments,
   projects: HashMap<PathBuf, ProjectState>,
+  typescript_runtime: Option<TypeScriptRuntimeConfig>,
 }
 
 impl BackendState {
@@ -199,6 +207,14 @@ impl BackendState {
     roots
   }
 
+  fn set_typescript_runtime(&mut self, runtime: Option<TypeScriptRuntimeConfig>) {
+    self.typescript_runtime = runtime;
+  }
+
+  fn typescript_runtime(&self) -> Option<TypeScriptRuntimeConfig> {
+    self.typescript_runtime.clone()
+  }
+
   fn bump_revision(&mut self, project_root: PathBuf) -> u64 {
     let project = self.projects.entry(project_root).or_default();
     project.revision += 1;
@@ -213,6 +229,12 @@ struct ProjectSnapshot {
   cached_artifacts: Option<ProjectArtifacts>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypeScriptRuntimeConfig {
+  node_path: PathBuf,
+  typescript_library_path: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 struct DocumentContext {
   project_root: PathBuf,
@@ -225,6 +247,27 @@ struct DocumentContext {
 struct ByteRange {
   start: usize,
   end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InlineTypeScriptSnapshot {
+  target_path: String,
+  source_path: String,
+  source_text: String,
+  generated_types_path: Option<String>,
+  content: String,
+  prefix_length: usize,
+  script_start_offset: usize,
+  script_end_offset: usize,
+  selection_start_offset: usize,
+  selection_end_offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InlineTypeScriptViewResolution {
+  Snapshot(InlineTypeScriptSnapshot),
+  NotRoute,
+  NoScript,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,15 +533,29 @@ impl Backend {
   }
 
   fn document_context(&self, uri: &Url) -> Option<DocumentContext> {
+    self.document_context_with_source(uri, None)
+  }
+
+  fn document_context_with_source(
+    &self,
+    uri: &Url,
+    source_override: Option<String>,
+  ) -> Option<DocumentContext> {
     let path = uri.to_file_path().ok()?;
     let project_root = thebe_project::find_project_root_from(&path).ok()?;
     let relative_path = relative_path_from_uri(&project_root, uri)?;
-    let source = read_backend_state(&self.state)
-      .open_documents
-      .files
-      .get(&path)
-      .cloned()
-      .or_else(|| std::fs::read_to_string(&path).ok())?;
+    let source = source_override.unwrap_or_else(|| {
+      read_backend_state(&self.state)
+        .open_documents
+        .files
+        .get(&path)
+        .cloned()
+        .or_else(|| std::fs::read_to_string(&path).ok())
+        .unwrap_or_default()
+    });
+    if source.is_empty() {
+      return None;
+    }
     let cached_artifacts = self
       .load_or_refresh_artifacts(uri)
       .map(|(_, artifacts)| artifacts);
@@ -598,7 +655,12 @@ async fn refresh_project(
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-  async fn initialize(&self, _: InitializeParams) -> LspResult<InitializeResult> {
+  async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
+    let typescript_runtime = parse_typescript_runtime_config(
+      params.initialization_options.as_ref(),
+    );
+    write_backend_state(&self.state).set_typescript_runtime(typescript_runtime);
+
     Ok(InitializeResult {
       server_info: Some(ServerInfo {
         name: "thebe-lsp".to_owned(),
@@ -617,6 +679,13 @@ impl LanguageServer for Backend {
         })),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
+        execute_command_provider: Some(ExecuteCommandOptions {
+          commands: vec![
+            INLINE_TYPESCRIPT_VIEW_COMMAND.to_owned(),
+            INLINE_TYPESCRIPT_MAP_PROTOCOL_DIAGNOSTICS_COMMAND.to_owned(),
+          ],
+          work_done_progress_options: Default::default(),
+        }),
         completion_provider: Some(CompletionOptions {
           resolve_provider: Some(false),
           trigger_characters: Some(
@@ -665,6 +734,47 @@ impl LanguageServer for Backend {
 
   async fn shutdown(&self) -> LspResult<()> {
     Ok(())
+  }
+
+  async fn execute_command(&self, params: ExecuteCommandParams) -> LspResult<Option<Value>> {
+    match params.command.as_str() {
+      INLINE_TYPESCRIPT_VIEW_COMMAND => {
+        let command_arguments =
+          parse_inline_typescript_view_command_arguments(&params.arguments)?;
+        let Some(document) = self.document_context_with_source(
+          &command_arguments.uri,
+          command_arguments.source,
+        ) else {
+          return Ok(Some(inline_typescript_view_resolution_value(
+            InlineTypeScriptViewResolution::NotRoute,
+          )));
+        };
+
+        Ok(Some(inline_typescript_view_resolution_value(
+          resolve_inline_typescript_view(
+            &document,
+            command_arguments.selection_start_offset,
+            command_arguments.selection_end_offset,
+          ),
+        )))
+      }
+      INLINE_TYPESCRIPT_MAP_PROTOCOL_DIAGNOSTICS_COMMAND => {
+        let command_arguments =
+          parse_inline_typescript_protocol_diagnostics_command_arguments(&params.arguments)?;
+        let Some(document) = self.document_context_with_source(
+          &command_arguments.uri,
+          command_arguments.source,
+        ) else {
+          return Ok(Some(Value::Array(Vec::new())));
+        };
+
+        Ok(Some(map_inline_typescript_protocol_diagnostics_value(
+          &document,
+          &command_arguments.diagnostics,
+        )))
+      }
+      _ => Err(tower_lsp::jsonrpc::Error::method_not_found()),
+    }
   }
 
   async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -721,7 +831,22 @@ impl LanguageServer for Backend {
       return Ok(None);
     }
 
-    let Some(context) = classify_completion_context(&document.source, position) else {
+    if let Some(runtime) = typescript_runtime_config(&self.state)
+      && let Some(response) = inline_typescript_completion_response_for_document(
+        &document,
+        position,
+        params
+          .context
+          .as_ref()
+          .and_then(|context| context.trigger_character.clone()),
+        &runtime,
+      )
+      .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?
+    {
+      return Ok(Some(response));
+    }
+
+    let Some(context) = completion_context_for_document(&document, position) else {
       return Ok(None);
     };
 
@@ -928,6 +1053,81 @@ fn find_project_root_from_uri(uri: &Url) -> Option<PathBuf> {
   thebe_project::find_project_root_from(&path).ok()
 }
 
+fn parse_typescript_runtime_config(value: Option<&Value>) -> Option<TypeScriptRuntimeConfig> {
+  let runtime = value.and_then(Value::as_object).and_then(|value| {
+    value
+      .get("typescriptRuntime")
+      .and_then(Value::as_object)
+      .or(Some(value))
+  })?;
+  let node_path = runtime.get("nodePath")?.as_str()?;
+  let typescript_library_path = runtime.get("typescriptLibraryPath")?.as_str()?;
+
+  Some(TypeScriptRuntimeConfig {
+    node_path: PathBuf::from(node_path),
+    typescript_library_path: PathBuf::from(typescript_library_path),
+  })
+}
+
+fn typescript_runtime_config(state: &Arc<RwLock<BackendState>>) -> Option<TypeScriptRuntimeConfig> {
+  read_backend_state(state).typescript_runtime()
+}
+
+fn ensure_typescript_bridge_script_path() -> Result<PathBuf> {
+  let script_path = std::env::temp_dir().join(format!(
+    "thebe-lsp-typescript-bridge-{}.js",
+    env!("CARGO_PKG_VERSION")
+  ));
+  if fs::read_to_string(&script_path).ok().as_deref() != Some(TYPESCRIPT_BRIDGE_SCRIPT) {
+    fs::write(&script_path, TYPESCRIPT_BRIDGE_SCRIPT)?;
+  }
+
+  Ok(script_path)
+}
+
+fn run_typescript_bridge(runtime: &TypeScriptRuntimeConfig, request: &Value) -> Result<Value> {
+  let script_path = ensure_typescript_bridge_script_path()?;
+  let mut command = Command::new(&runtime.node_path);
+  if typescript_runtime_needs_electron_run_as_node(runtime) {
+    command.env("ELECTRON_RUN_AS_NODE", "1");
+  }
+  let mut child = command
+    .arg(script_path)
+    .arg(&runtime.typescript_library_path)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+
+  let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("missing TypeScript bridge stdin"))?;
+  stdin.write_all(request.to_string().as_bytes())?;
+  drop(stdin);
+
+  let output = child.wait_with_output()?;
+  if !output.status.success() {
+    return Err(anyhow!(
+      "TypeScript bridge failed: {}",
+      String::from_utf8_lossy(&output.stderr).trim()
+    ));
+  }
+
+  Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn typescript_runtime_needs_electron_run_as_node(
+  runtime: &TypeScriptRuntimeConfig,
+) -> bool {
+  runtime
+    .node_path
+    .file_name()
+    .and_then(|value| value.to_str())
+    .map(|value| {
+      let value = value.to_ascii_lowercase();
+      value != "node" && value != "node.exe"
+    })
+    .unwrap_or(false)
+}
+
 fn read_backend_state(
   state: &Arc<RwLock<BackendState>>,
 ) -> std::sync::RwLockReadGuard<'_, BackendState> {
@@ -969,6 +1169,31 @@ fn classify_completion_context(source: &str, position: Position) -> Option<Compl
     .or_else(|| attribute_name_context(source, offset))
     .or_else(|| component_tag_context(source, offset))
     .or_else(|| block_tag_context(source, offset))
+}
+
+fn completion_context_for_document(
+  document: &DocumentContext,
+  position: Position,
+) -> Option<CompletionContext> {
+  if completion_blocked_by_embedded_block(document, position) {
+    return None;
+  }
+
+  classify_completion_context(&document.source, position)
+}
+
+fn completion_blocked_by_embedded_block(document: &DocumentContext, position: Position) -> bool {
+  let Some(offset) = byte_offset_from_position(&document.source, position) else {
+    return false;
+  };
+  let Ok(blocks) = parse_document_blocks(document) else {
+    return false;
+  };
+
+  [blocks.script_span, blocks.script_setup_span, blocks.script_ts_span, blocks.style_span]
+    .into_iter()
+    .flatten()
+    .any(|span| offset >= span.start && offset < span.end)
 }
 
 fn completion_items_for_context(
@@ -1568,6 +1793,20 @@ fn block_tag_context(source: &str, offset: usize) -> Option<CompletionContext> {
 
 fn is_component_path(relative_path: &str) -> bool {
   relative_path.starts_with("src/components/") && relative_path.ends_with(".trs")
+}
+
+fn route_source_relative_path(relative_path: &str) -> Option<&str> {
+  let relative_route_path = relative_path.strip_prefix("src/routes/")?;
+  if !relative_route_path.ends_with(".trs") {
+    return None;
+  }
+
+  let file_name = Path::new(relative_route_path).file_name()?.to_str()?;
+  if file_name.starts_with('_') {
+    return None;
+  }
+
+  Some(relative_route_path)
 }
 
 fn current_component_imports(document: &DocumentContext) -> Vec<ComponentImport> {
@@ -2183,6 +2422,645 @@ fn generated_client_definition_for_script_position(
   }
 
   file_start_definition(project_root, generated_client_path).map(Some)
+}
+
+fn parse_inline_typescript_view_command_arguments(
+  arguments: &[Value],
+) -> std::result::Result<InlineTypeScriptViewCommandArguments, tower_lsp::jsonrpc::Error> {
+  let Some(params) = arguments.first().and_then(Value::as_object) else {
+    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+      "expected inline TypeScript view arguments",
+    ));
+  };
+
+  let Some(uri_value) = params.get("uri").and_then(Value::as_str) else {
+    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+      "expected inline TypeScript view uri",
+    ));
+  };
+  let uri = Url::parse(uri_value)
+    .map_err(|_| tower_lsp::jsonrpc::Error::invalid_params("invalid inline TypeScript view uri"))?;
+
+  let selection_start_offset = parse_inline_typescript_view_offset_argument(
+    params.get("selectionStartOffset"),
+    "selectionStartOffset",
+  )?;
+  let selection_end_offset = match params.get("selectionEndOffset") {
+    Some(value) => parse_inline_typescript_view_offset_argument(Some(value), "selectionEndOffset")?,
+    None => selection_start_offset,
+  };
+  let source = match params.get("source") {
+    Some(Value::String(source)) => Some(source.clone()),
+    Some(_) => {
+      return Err(tower_lsp::jsonrpc::Error::invalid_params(
+        "expected inline TypeScript view source",
+      ));
+    }
+    None => None,
+  };
+
+  Ok(InlineTypeScriptViewCommandArguments {
+    uri,
+    selection_start_offset,
+    selection_end_offset,
+    source,
+  })
+}
+
+fn parse_inline_typescript_protocol_diagnostics_command_arguments(
+  arguments: &[Value],
+) -> std::result::Result<InlineTypeScriptProtocolDiagnosticsCommandArguments, tower_lsp::jsonrpc::Error> {
+  let Some(params) = arguments.first().and_then(Value::as_object) else {
+    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+      "expected inline TypeScript protocol diagnostics arguments",
+    ));
+  };
+
+  let Some(uri_value) = params.get("uri").and_then(Value::as_str) else {
+    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+      "expected inline TypeScript protocol diagnostics uri",
+    ));
+  };
+  let uri = Url::parse(uri_value).map_err(|_| {
+    tower_lsp::jsonrpc::Error::invalid_params(
+      "invalid inline TypeScript protocol diagnostics uri",
+    )
+  })?;
+
+  let source = match params.get("source") {
+    Some(Value::String(source)) => Some(source.clone()),
+    Some(_) => {
+      return Err(tower_lsp::jsonrpc::Error::invalid_params(
+        "expected inline TypeScript protocol diagnostics source",
+      ));
+    }
+    None => None,
+  };
+
+  let Some(diagnostics) = params.get("diagnostics").and_then(Value::as_array) else {
+    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+      "expected inline TypeScript protocol diagnostics array",
+    ));
+  };
+
+  Ok(InlineTypeScriptProtocolDiagnosticsCommandArguments {
+    uri,
+    source,
+    diagnostics: diagnostics.clone(),
+  })
+}
+
+fn parse_inline_typescript_view_offset_argument(
+  value: Option<&Value>,
+  name: &str,
+) -> std::result::Result<usize, tower_lsp::jsonrpc::Error> {
+  let Some(value) = value.and_then(Value::as_u64) else {
+    return Err(tower_lsp::jsonrpc::Error::invalid_params(format!(
+      "expected inline TypeScript view {name}",
+    )));
+  };
+
+  usize::try_from(value).map_err(|_| {
+    tower_lsp::jsonrpc::Error::invalid_params(format!(
+      "inline TypeScript view {name} is out of range",
+    ))
+  })
+}
+
+fn inline_typescript_view_resolution_value(
+  resolution: InlineTypeScriptViewResolution,
+) -> Value {
+  match resolution {
+    InlineTypeScriptViewResolution::Snapshot(snapshot) => json!({
+      "ok": true,
+      "targetPath": snapshot.target_path,
+      "sourcePath": snapshot.source_path,
+      "sourceText": snapshot.source_text,
+      "generatedTypesPath": snapshot.generated_types_path,
+      "content": snapshot.content,
+      "prefixLength": snapshot.prefix_length,
+      "scriptStartOffset": snapshot.script_start_offset,
+      "scriptEndOffset": snapshot.script_end_offset,
+      "selectionStartOffset": snapshot.selection_start_offset,
+      "selectionEndOffset": snapshot.selection_end_offset,
+    }),
+    InlineTypeScriptViewResolution::NotRoute => json!({
+      "ok": false,
+      "reason": "not-route",
+    }),
+    InlineTypeScriptViewResolution::NoScript => json!({
+      "ok": false,
+      "reason": "no-script",
+    }),
+  }
+}
+
+fn map_inline_typescript_protocol_diagnostics_value(
+  document: &DocumentContext,
+  diagnostics: &[Value],
+) -> Value {
+  Value::Array(mapped_inline_typescript_protocol_diagnostics(
+    document,
+    diagnostics,
+  ))
+}
+
+fn mapped_inline_typescript_protocol_diagnostics(
+  document: &DocumentContext,
+  diagnostics: &[Value],
+) -> Vec<Value> {
+  let InlineTypeScriptViewResolution::Snapshot(snapshot) =
+    resolve_inline_typescript_view(document, 0, 0)
+  else {
+    return Vec::new();
+  };
+
+  let mut seen = HashSet::new();
+  diagnostics
+    .iter()
+    .filter_map(|diagnostic| map_inline_typescript_protocol_diagnostic(&snapshot, diagnostic))
+    .filter(|diagnostic| seen.insert(inline_typescript_protocol_diagnostic_dedupe_key(diagnostic)))
+    .collect()
+}
+
+fn map_inline_typescript_protocol_diagnostic(
+  snapshot: &InlineTypeScriptSnapshot,
+  diagnostic: &Value,
+) -> Option<Value> {
+  let virtual_range = resolve_inline_typescript_protocol_diagnostic_virtual_range(
+    diagnostic,
+    &snapshot.content,
+  )?;
+  let source_range = resolve_inline_source_range_from_snapshot(
+    snapshot,
+    virtual_range.start,
+    virtual_range.end,
+  )?;
+  let start = position_from_byte_offset(&snapshot.source_text, source_range.start);
+  let end = position_from_byte_offset(&snapshot.source_text, source_range.end);
+
+  let mut mapped = serde_json::Map::new();
+  mapped.insert(
+    "range".to_owned(),
+    json!({
+      "start": { "line": start.line, "character": start.character },
+      "end": { "line": end.line, "character": end.character },
+    }),
+  );
+  mapped.insert(
+    "message".to_owned(),
+    Value::String(read_inline_typescript_protocol_diagnostic_message(diagnostic)),
+  );
+  mapped.insert(
+    "severity".to_owned(),
+    Value::String(resolve_inline_typescript_protocol_diagnostic_severity(
+      diagnostic.get("category").and_then(Value::as_str),
+    )),
+  );
+  mapped.insert(
+    "source".to_owned(),
+    Value::String(
+      diagnostic
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("ts")
+        .to_owned(),
+    ),
+  );
+  if let Some(code) = diagnostic.get("code")
+    && (code.is_string() || code.is_number())
+  {
+    mapped.insert("code".to_owned(), code.clone());
+  }
+
+  let mut tags = Vec::new();
+  if diagnostic
+    .get("reportsUnnecessary")
+    .and_then(Value::as_bool)
+    .unwrap_or(false)
+  {
+    tags.push(Value::String("unnecessary".to_owned()));
+  }
+  if diagnostic
+    .get("reportsDeprecated")
+    .and_then(Value::as_bool)
+    .unwrap_or(false)
+  {
+    tags.push(Value::String("deprecated".to_owned()));
+  }
+  if !tags.is_empty() {
+    mapped.insert("tags".to_owned(), Value::Array(tags));
+  }
+
+  Some(Value::Object(mapped))
+}
+
+fn inline_typescript_protocol_diagnostic_dedupe_key(diagnostic: &Value) -> String {
+  let code = diagnostic
+    .get("code")
+    .and_then(|value| {
+      value
+        .as_i64()
+        .map(|number| number.to_string())
+        .or_else(|| value.as_str().map(ToOwned::to_owned))
+    })
+    .unwrap_or_default();
+  let message = diagnostic
+    .get("message")
+    .and_then(Value::as_str)
+    .unwrap_or_default();
+  let range = diagnostic.get("range").and_then(Value::as_object);
+  let start = range
+    .and_then(|range| range.get("start"))
+    .and_then(Value::as_object);
+  let end = range
+    .and_then(|range| range.get("end"))
+    .and_then(Value::as_object);
+
+  format!(
+    "{}:{}:{}:{}:{}:{}",
+    code,
+    message,
+    start.and_then(|value| value.get("line")).and_then(Value::as_u64).unwrap_or_default(),
+    start.and_then(|value| value.get("character")).and_then(Value::as_u64).unwrap_or_default(),
+    end.and_then(|value| value.get("line")).and_then(Value::as_u64).unwrap_or_default(),
+    end.and_then(|value| value.get("character")).and_then(Value::as_u64).unwrap_or_default(),
+  )
+}
+
+fn resolve_inline_typescript_protocol_diagnostic_virtual_range(
+  diagnostic: &Value,
+  content: &str,
+) -> Option<ByteRange> {
+  let start_position = diagnostic.get("start").and_then(Value::as_object);
+  let end_position = diagnostic.get("end").and_then(Value::as_object);
+  if let (Some(start_position), Some(end_position)) = (start_position, end_position) {
+    let start = inline_typescript_protocol_position_to_offset(content, start_position)?;
+    let end = inline_typescript_protocol_position_to_offset(content, end_position)?;
+    return Some(ByteRange { start, end });
+  }
+
+  if let Some(start) = diagnostic.get("start").and_then(Value::as_u64) {
+    let start = usize::try_from(start).ok()?;
+    let length = diagnostic
+      .get("length")
+      .and_then(Value::as_u64)
+      .and_then(|value| usize::try_from(value).ok())
+      .unwrap_or(0);
+    return Some(ByteRange {
+      start,
+      end: start.saturating_add(length),
+    });
+  }
+
+  let text_span = diagnostic.get("textSpan").and_then(Value::as_object)?;
+  let start = text_span
+    .get("start")
+    .and_then(Value::as_u64)
+    .and_then(|value| usize::try_from(value).ok())?;
+  let length = text_span
+    .get("length")
+    .and_then(Value::as_u64)
+    .and_then(|value| usize::try_from(value).ok())
+    .unwrap_or(0);
+  Some(ByteRange {
+    start,
+    end: start.saturating_add(length),
+  })
+}
+
+fn inline_typescript_protocol_position_to_offset(
+  content: &str,
+  position: &serde_json::Map<String, Value>,
+) -> Option<usize> {
+  let line = position
+    .get("line")
+    .and_then(Value::as_u64)
+    .and_then(|value| u32::try_from(value.saturating_sub(1)).ok())?;
+  let character = position
+    .get("offset")
+    .and_then(Value::as_u64)
+    .and_then(|value| u32::try_from(value.saturating_sub(1)).ok())?;
+
+  byte_offset_from_position(content, Position::new(line, character))
+}
+
+fn resolve_inline_source_range_from_snapshot(
+  snapshot: &InlineTypeScriptSnapshot,
+  start_offset: usize,
+  end_offset: usize,
+) -> Option<ByteRange> {
+  let start = map_inline_offset_to_source_offset(snapshot, start_offset)?;
+  let end = map_inline_offset_to_source_offset(snapshot, end_offset)?;
+  Some(ByteRange { start, end })
+}
+
+fn map_inline_offset_to_source_offset(
+  snapshot: &InlineTypeScriptSnapshot,
+  inline_offset: usize,
+) -> Option<usize> {
+  let content_length = snapshot
+    .script_end_offset
+    .saturating_sub(snapshot.script_start_offset);
+  if inline_offset < snapshot.prefix_length
+    || inline_offset > snapshot.prefix_length.saturating_add(content_length)
+  {
+    return None;
+  }
+
+  Some(
+    snapshot
+      .script_start_offset
+      .saturating_add(inline_offset.saturating_sub(snapshot.prefix_length)),
+  )
+}
+
+fn read_inline_typescript_protocol_diagnostic_message(diagnostic: &Value) -> String {
+  if let Some(message) = diagnostic.get("text").and_then(Value::as_str)
+    && !message.is_empty()
+  {
+    return message.to_owned();
+  }
+
+  let message = diagnostic
+    .get("messageText")
+    .map(flatten_inline_typescript_diagnostic_message_text)
+    .unwrap_or_default();
+  if message.is_empty() {
+    "TypeScript diagnostic".to_owned()
+  } else {
+    message
+  }
+}
+
+fn flatten_inline_typescript_diagnostic_message_text(value: &Value) -> String {
+  if let Some(message) = value.as_str() {
+    return message.to_owned();
+  }
+
+  let Some(message) = value.get("messageText").and_then(Value::as_str) else {
+    return String::new();
+  };
+  let next_messages = value
+    .get("next")
+    .and_then(Value::as_array)
+    .map(|items| {
+      items
+        .iter()
+        .map(flatten_inline_typescript_diagnostic_message_text)
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+  if next_messages.is_empty() {
+    message.to_owned()
+  } else {
+    format!("{} {}", message, next_messages.join(" "))
+  }
+}
+
+fn resolve_inline_typescript_protocol_diagnostic_severity(category: Option<&str>) -> String {
+  match category {
+    Some("error") => "error",
+    Some("warning") => "warning",
+    Some("suggestion") => "hint",
+    _ => "information",
+  }
+  .to_owned()
+}
+
+fn resolve_inline_typescript_view(
+  document: &DocumentContext,
+  selection_start_offset: usize,
+  selection_end_offset: usize,
+) -> InlineTypeScriptViewResolution {
+  let Some(generated_client_path) = generated_route_typescript_artifact_path(
+    &document.relative_path,
+    thebe_project::TYPECHECK_CLIENT_DIR,
+  ) else {
+    return InlineTypeScriptViewResolution::NotRoute;
+  };
+
+  let Ok(blocks) = parse_source_blocks(&document.source) else {
+    return InlineTypeScriptViewResolution::NoScript;
+  };
+  let Some(script_ts) = blocks.script_ts.as_deref() else {
+    return InlineTypeScriptViewResolution::NoScript;
+  };
+  let Some(script_span) = blocks.script_ts_span else {
+    return InlineTypeScriptViewResolution::NoScript;
+  };
+
+  let generated_types_path = generated_route_typescript_artifact_path(
+    &document.relative_path,
+    TYPECHECK_TYPES_DIR,
+  );
+  let prefix = inline_typescript_prefix(
+    &document.project_root,
+    generated_types_path.as_deref(),
+  );
+  let prefix_length = prefix.len();
+
+  InlineTypeScriptViewResolution::Snapshot(InlineTypeScriptSnapshot {
+    target_path: document
+      .project_root
+      .join(&generated_client_path)
+      .to_string_lossy()
+      .into_owned(),
+    source_path: document
+      .project_root
+      .join(&document.relative_path)
+      .to_string_lossy()
+      .into_owned(),
+    source_text: document.source.clone(),
+    generated_types_path: generated_types_path.as_ref().and_then(|relative_path| {
+      let absolute_path = document.project_root.join(relative_path);
+      absolute_path.is_file().then(|| absolute_path.to_string_lossy().into_owned())
+    }),
+    content: format!("{prefix}{script_ts}"),
+    prefix_length,
+    script_start_offset: script_span.start,
+    script_end_offset: script_span.end,
+    selection_start_offset: map_source_offset_to_inline_offset(
+      selection_start_offset,
+      script_span.start,
+      script_span.end,
+      prefix_length,
+    ),
+    selection_end_offset: map_source_offset_to_inline_offset(
+      selection_end_offset,
+      script_span.start,
+      script_span.end,
+      prefix_length,
+    ),
+  })
+}
+
+fn generated_route_typescript_artifact_path(
+  relative_path: &str,
+  artifact_dir: &str,
+) -> Option<String> {
+  let relative_route_path = route_source_relative_path(relative_path)?;
+  let artifact_path = Path::new(relative_route_path).with_extension("ts");
+
+  Some(format!(
+    "{artifact_dir}/routes/{}",
+    artifact_path.to_string_lossy().replace('\\', "/")
+  ))
+}
+
+fn inline_typescript_prefix(project_root: &Path, generated_types_path: Option<&str>) -> String {
+  let mut lines = vec![
+    "// AUTOGENERATED by thebe — inline TypeScript view".to_owned(),
+    "declare function getProps<T = unknown>(): T;".to_owned(),
+  ];
+
+  let inline_props_types = generated_types_path.and_then(|relative_path| {
+    let source = std::fs::read_to_string(project_root.join(relative_path)).ok()?;
+    let source = source.trim();
+    (!source.is_empty()).then(|| source.to_owned())
+  });
+  lines.push(inline_props_types.unwrap_or_else(|| "type Props = unknown;".to_owned()));
+  lines.push(String::new());
+
+  format!("{}\n", lines.join("\n"))
+}
+
+fn map_source_offset_to_inline_offset(
+  source_offset: usize,
+  script_start_offset: usize,
+  script_end_offset: usize,
+  prefix_length: usize,
+) -> usize {
+  let clamped_offset = source_offset.clamp(script_start_offset, script_end_offset);
+  prefix_length + clamped_offset.saturating_sub(script_start_offset)
+}
+
+fn inline_typescript_completion_response_for_document(
+  document: &DocumentContext,
+  position: Position,
+  trigger_character: Option<String>,
+  runtime: &TypeScriptRuntimeConfig,
+) -> Result<Option<CompletionResponse>> {
+  let Some(source_offset) = byte_offset_from_position(&document.source, position) else {
+    return Ok(None);
+  };
+  let InlineTypeScriptViewResolution::Snapshot(snapshot) =
+    resolve_inline_typescript_view(document, source_offset, source_offset)
+  else {
+    return Ok(None);
+  };
+  if source_offset < snapshot.script_start_offset || source_offset > snapshot.script_end_offset {
+    return Ok(None);
+  }
+
+  let response = run_typescript_bridge(
+    runtime,
+    &json!({
+      "command": "completions",
+      "filePath": snapshot.target_path,
+      "content": snapshot.content,
+      "offset": snapshot.selection_start_offset,
+      "triggerCharacter": trigger_character,
+    }),
+  )?;
+  let Some(entries) = response.as_array() else {
+    return Ok(None);
+  };
+
+  let items = entries
+    .iter()
+    .filter_map(|entry| inline_typescript_completion_item(document, &snapshot, entry, source_offset))
+    .collect::<Vec<_>>();
+  if items.is_empty() {
+    Ok(None)
+  } else {
+    Ok(Some(CompletionResponse::Array(items)))
+  }
+}
+
+fn inline_typescript_completion_item(
+  document: &DocumentContext,
+  snapshot: &InlineTypeScriptSnapshot,
+  entry: &Value,
+  source_offset: usize,
+) -> Option<CompletionItem> {
+  let name = entry.get("name")?.as_str()?;
+  let insert_text = entry
+    .get("insertText")
+    .and_then(Value::as_str)
+    .unwrap_or(name)
+    .to_owned();
+  let replace = entry
+    .get("replacementSpan")
+    .and_then(resolve_inline_typescript_replacement_span)
+    .and_then(|replace| resolve_inline_source_range_from_snapshot(snapshot, replace.start, replace.end))
+    .unwrap_or(ByteRange {
+      start: source_offset,
+      end: source_offset,
+    });
+
+  Some(CompletionItem {
+    label: name.to_owned(),
+    kind: Some(inline_typescript_completion_item_kind(
+      entry.get("kind").and_then(Value::as_str),
+    )),
+    sort_text: entry.get("sortText").and_then(Value::as_str).map(ToOwned::to_owned),
+    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+      range: range_from_offsets(&document.source, replace.start, replace.end),
+      new_text: insert_text,
+    })),
+    ..CompletionItem::default()
+  })
+}
+
+fn resolve_inline_typescript_replacement_span(value: &Value) -> Option<ByteRange> {
+  let start = value
+    .get("start")
+    .and_then(Value::as_u64)
+    .and_then(|value| usize::try_from(value).ok())?;
+  let length = value
+    .get("length")
+    .and_then(Value::as_u64)
+    .and_then(|value| usize::try_from(value).ok())
+    .unwrap_or(0);
+  Some(ByteRange {
+    start,
+    end: start.saturating_add(length),
+  })
+}
+
+fn inline_typescript_completion_item_kind(kind: Option<&str>) -> CompletionItemKind {
+  match kind.unwrap_or_default() {
+    "classElement" | "localClassElement" => CompletionItemKind::CLASS,
+    "interfaceElement" | "typeElement" => CompletionItemKind::INTERFACE,
+    "functionElement" | "localFunctionElement" | "memberFunctionElement" => CompletionItemKind::FUNCTION,
+    "constElement" | "letElement" | "variableElement" | "localVariableElement" => {
+      CompletionItemKind::VARIABLE
+    }
+    "memberVariableElement" | "property" | "getterElement" | "setterElement" => {
+      CompletionItemKind::PROPERTY
+    }
+    "enumElement" => CompletionItemKind::ENUM,
+    "keyword" => CompletionItemKind::KEYWORD,
+    "alias" => CompletionItemKind::REFERENCE,
+    _ => CompletionItemKind::TEXT,
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InlineTypeScriptViewCommandArguments {
+  uri: Url,
+  selection_start_offset: usize,
+  selection_end_offset: usize,
+  source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct InlineTypeScriptProtocolDiagnosticsCommandArguments {
+  uri: Url,
+  source: Option<String>,
+  diagnostics: Vec<Value>,
 }
 
 fn generated_client_mirror_source(script_ts: &str, generated_types_path: &str) -> String {
@@ -4335,7 +5213,20 @@ async fn publish_project_diagnostics(
   project_root: &Path,
   artifacts: &ProjectArtifacts,
 ) -> Result<()> {
-  let diagnostics_by_file = artifact_diagnostics_by_file(project_root, artifacts)?;
+  let mut diagnostics_by_file = artifact_diagnostics_by_file(project_root, artifacts)?;
+  if let Err(err) = merge_inline_typescript_diagnostics_by_file(
+    project_root,
+    state,
+    artifacts,
+    &mut diagnostics_by_file,
+  ) {
+    client
+      .log_message(
+        MessageType::WARNING,
+        format!("thebe-lsp: failed to collect inline TypeScript diagnostics: {err:#}"),
+      )
+      .await;
+  }
   publish_diagnostic_batch(client, state, project_root, diagnostics_by_file).await;
 
   Ok(())
@@ -4399,6 +5290,130 @@ fn diagnostics_by_file(
   }
 
   Ok(diagnostics_by_file)
+}
+
+fn merge_inline_typescript_diagnostics_by_file(
+  project_root: &Path,
+  state: &Arc<RwLock<BackendState>>,
+  artifacts: &ProjectArtifacts,
+  diagnostics_by_file: &mut DiagnosticsByFile,
+) -> Result<()> {
+  let Some(runtime) = typescript_runtime_config(state) else {
+    return Ok(());
+  };
+
+  for route in artifacts.manifest.routes.iter().filter(|route| route.has_client_script) {
+    let Some(source) = source_text_for_relative_path(project_root, state, &route.source_path) else {
+      continue;
+    };
+    let document = DocumentContext {
+      project_root: project_root.to_path_buf(),
+      relative_path: route.source_path.clone(),
+      source,
+      cached_artifacts: None,
+    };
+    let diagnostics = inline_typescript_diagnostics_for_document(&document, &runtime)?;
+    let file_url = file_url(project_root, &route.source_path)?;
+    diagnostics_by_file
+      .entry(file_url)
+      .or_default()
+      .extend(diagnostics);
+  }
+
+  Ok(())
+}
+
+fn source_text_for_relative_path(
+  project_root: &Path,
+  state: &Arc<RwLock<BackendState>>,
+  relative_path: &str,
+) -> Option<String> {
+  let path = project_root.join(relative_path);
+  read_backend_state(state)
+    .open_documents
+    .files
+    .get(&path)
+    .cloned()
+    .or_else(|| fs::read_to_string(path).ok())
+}
+
+fn inline_typescript_diagnostics_for_document(
+  document: &DocumentContext,
+  runtime: &TypeScriptRuntimeConfig,
+) -> Result<Vec<Diagnostic>> {
+  let InlineTypeScriptViewResolution::Snapshot(snapshot) =
+    resolve_inline_typescript_view(document, 0, 0)
+  else {
+    return Ok(Vec::new());
+  };
+
+  let response = run_typescript_bridge(
+    runtime,
+    &json!({
+      "command": "diagnostics",
+      "filePath": snapshot.target_path,
+      "content": snapshot.content,
+    }),
+  )?;
+  let Some(protocol_diagnostics) = response.as_array() else {
+    return Ok(Vec::new());
+  };
+
+  Ok(mapped_inline_typescript_protocol_diagnostics(document, protocol_diagnostics)
+    .iter()
+    .filter_map(mapped_inline_typescript_value_to_lsp_diagnostic)
+    .collect())
+}
+
+fn mapped_inline_typescript_value_to_lsp_diagnostic(value: &Value) -> Option<Diagnostic> {
+  let range = value.get("range")?.as_object()?;
+  let start = range.get("start")?.as_object()?;
+  let end = range.get("end")?.as_object()?;
+  let start = Position::new(
+    u32::try_from(start.get("line")?.as_u64()?).ok()?,
+    u32::try_from(start.get("character")?.as_u64()?).ok()?,
+  );
+  let end = Position::new(
+    u32::try_from(end.get("line")?.as_u64()?).ok()?,
+    u32::try_from(end.get("character")?.as_u64()?).ok()?,
+  );
+  let severity = match value.get("severity").and_then(Value::as_str) {
+    Some("error") => DiagnosticSeverity::ERROR,
+    Some("warning") => DiagnosticSeverity::WARNING,
+    Some("hint") => DiagnosticSeverity::HINT,
+    _ => DiagnosticSeverity::INFORMATION,
+  };
+  let code = value.get("code").and_then(|value| {
+    value
+      .as_i64()
+      .and_then(|number| i32::try_from(number).ok())
+      .map(NumberOrString::Number)
+      .or_else(|| value.as_str().map(|text| NumberOrString::String(text.to_owned())))
+  });
+  let tags = value
+    .get("tags")
+    .and_then(Value::as_array)
+    .map(|tags| {
+      tags
+        .iter()
+        .filter_map(|tag| match tag.as_str() {
+          Some("unnecessary") => Some(DiagnosticTag::UNNECESSARY),
+          Some("deprecated") => Some(DiagnosticTag::DEPRECATED),
+          _ => None,
+        })
+        .collect::<Vec<_>>()
+    })
+    .filter(|tags| !tags.is_empty());
+
+  Some(Diagnostic {
+    range: Range::new(start, end),
+    severity: Some(severity),
+    code,
+    source: value.get("source").and_then(Value::as_str).map(ToOwned::to_owned),
+    message: value.get("message")?.as_str()?.to_owned(),
+    tags,
+    ..Diagnostic::default()
+  })
 }
 
 fn known_source_paths(manifest: &ThebeManifest) -> Vec<String> {
@@ -5135,6 +6150,57 @@ mod tests {
         prefix: "sc".to_owned(),
         replace: ByteRange { start: 0, end: 3 },
       }
+    );
+  }
+
+  #[test]
+  fn completion_context_for_document_ignores_client_script_positions() {
+    let source = r#"<script setup>
+struct Props {
+  count: i64,
+}
+</script>
+
+<script lang="ts">
+<sc
+</script>
+
+<main>{{ count }}</main>
+"#;
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: source.to_owned(),
+      cached_artifacts: None,
+    };
+    let script_prefix = source.rfind("<sc").expect("script prefix");
+    let position = position_from_byte_offset(source, script_prefix + 2);
+    let blocks = parse_document_blocks(&document).expect("valid blocks");
+    let script_span = blocks.script_ts_span.expect("script ts span");
+    let offset = byte_offset_from_position(source, position).expect("offset");
+
+    assert!(
+      offset >= script_span.start && offset < script_span.end,
+      "offset {offset} should be inside script span {script_span:?}"
+    );
+
+    assert_eq!(completion_context_for_document(&document, position), None);
+  }
+
+  #[test]
+  fn completion_context_for_document_keeps_top_level_block_tag_completions() {
+    let source = "<sc";
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/index.trs".to_owned(),
+      source: source.to_owned(),
+      cached_artifacts: None,
+    };
+    let position = position_from_byte_offset(source, source.len());
+
+    assert_eq!(
+      completion_context_for_document(&document, position),
+      classify_completion_context(source, position)
     );
   }
 
@@ -6048,6 +7114,302 @@ function increment() {{
     assert!(location.uri.path().ends_with("/.thebe/client/routes/profile.ts"));
     assert_eq!(location.range.start, expected_position);
     assert_eq!(location.range.end, expected_position);
+  }
+
+  #[test]
+  fn inline_typescript_view_for_document_builds_route_snapshot_with_generated_types() {
+    let project = TempProject::new();
+    let source = r#"<script setup>
+struct Props {
+  count: i64,
+}
+</script>
+
+<script lang="ts">
+const props = getProps<Props>();
+
+function increment() {
+  return props.count;
+}
+</script>
+"#;
+    let selection_offset = source.find("increment").expect("increment") + 2;
+
+    project.write("src/routes/counter.trs", source);
+    project.write(
+      ".thebe/types/routes/counter.ts",
+      "type Props = {\n  count: number;\n};\n\nexport default Props;\n",
+    );
+
+    let document = DocumentContext {
+      project_root: project.root.clone(),
+      relative_path: "src/routes/counter.trs".to_owned(),
+      source: source.to_owned(),
+      cached_artifacts: None,
+    };
+
+    let InlineTypeScriptViewResolution::Snapshot(snapshot) = resolve_inline_typescript_view(
+      &document,
+      selection_offset,
+      selection_offset,
+    ) else {
+      panic!("expected inline TypeScript snapshot");
+    };
+
+    assert!(snapshot.target_path.ends_with("/.thebe/client/routes/counter.ts"));
+    assert_eq!(
+      snapshot.generated_types_path.as_deref(),
+      Some(
+        project
+          .root
+          .join(".thebe/types/routes/counter.ts")
+          .to_string_lossy()
+          .as_ref(),
+      ),
+    );
+    assert!(snapshot.content.contains("declare function getProps<T = unknown>(): T;"));
+    assert!(snapshot.content.contains("type Props = {"));
+    assert!(snapshot.content.contains("export default Props;"));
+    assert!(snapshot.selection_start_offset > snapshot.content.find("function increment").unwrap_or(0));
+  }
+
+  #[test]
+  fn inline_typescript_view_for_document_falls_back_to_unknown_props_without_generated_types() {
+    let project = TempProject::new();
+    let source = r#"<script lang="ts">
+const props = getProps<Props>();
+</script>
+"#;
+    project.write("src/routes/counter.trs", source);
+
+    let document = DocumentContext {
+      project_root: project.root.clone(),
+      relative_path: "src/routes/counter.trs".to_owned(),
+      source: source.to_owned(),
+      cached_artifacts: None,
+    };
+
+    let InlineTypeScriptViewResolution::Snapshot(snapshot) = resolve_inline_typescript_view(
+      &document,
+      0,
+      0,
+    ) else {
+      panic!("expected inline TypeScript snapshot");
+    };
+
+    assert!(snapshot.generated_types_path.is_none());
+    assert!(snapshot.content.contains("type Props = unknown;"));
+  }
+
+  #[test]
+  fn inline_typescript_view_for_document_rejects_layout_routes() {
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/_layout.trs".to_owned(),
+      source: "<script lang=\"ts\">const x = 1;</script>".to_owned(),
+      cached_artifacts: None,
+    };
+
+    assert_eq!(
+      resolve_inline_typescript_view(&document, 0, 0),
+      InlineTypeScriptViewResolution::NotRoute,
+    );
+  }
+
+  #[test]
+  fn inline_typescript_protocol_diagnostics_map_back_into_source_ranges() {
+    let project = TempProject::new();
+    let source = r#"<script setup>
+struct Props {
+  count: i64,
+}
+</script>
+
+<script lang="ts">
+const props = getProps<Props>();
+
+function increment() {
+  return props.count + 1;
+}
+</script>
+"#;
+    project.write("src/routes/counter.trs", source);
+
+    let document = DocumentContext {
+      project_root: project.root.clone(),
+      relative_path: "src/routes/counter.trs".to_owned(),
+      source: source.to_owned(),
+      cached_artifacts: None,
+    };
+    let InlineTypeScriptViewResolution::Snapshot(snapshot) =
+      resolve_inline_typescript_view(&document, 0, 0)
+    else {
+      panic!("expected inline TypeScript snapshot");
+    };
+    let virtual_start = snapshot
+      .content
+      .find("count + 1")
+      .expect("virtual diagnostic start");
+    let virtual_end = virtual_start + "count".len();
+    let start = position_from_byte_offset(&snapshot.content, virtual_start);
+    let end = position_from_byte_offset(&snapshot.content, virtual_end);
+
+    let mapped = map_inline_typescript_protocol_diagnostics_value(
+      &document,
+      &[json!({
+        "start": {
+          "line": start.line + 1,
+          "offset": start.character + 1,
+        },
+        "end": {
+          "line": end.line + 1,
+          "offset": end.character + 1,
+        },
+        "messageText": {
+          "messageText": "Operator '+' cannot be applied.",
+          "next": [{ "messageText": "Count should stay bigint." }],
+        },
+        "category": "error",
+        "source": "ts",
+        "code": 2365,
+        "reportsUnnecessary": true,
+      })],
+    );
+
+    let Value::Array(mapped) = mapped else {
+      panic!("expected mapped diagnostics array");
+    };
+    assert_eq!(mapped.len(), 1);
+
+    let Value::Object(mapped) = &mapped[0] else {
+      panic!("expected mapped diagnostic object");
+    };
+    assert_eq!(
+      mapped.get("message").and_then(Value::as_str),
+      Some("Operator '+' cannot be applied. Count should stay bigint.")
+    );
+    assert_eq!(mapped.get("severity").and_then(Value::as_str), Some("error"));
+    assert_eq!(mapped.get("source").and_then(Value::as_str), Some("ts"));
+    assert_eq!(mapped.get("code").and_then(Value::as_i64), Some(2365));
+    assert_eq!(
+      mapped
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|tags| tags.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+      Some(vec!["unnecessary"])
+    );
+
+    let range = mapped
+      .get("range")
+      .and_then(Value::as_object)
+      .expect("mapped range");
+    let start = range
+      .get("start")
+      .and_then(Value::as_object)
+      .expect("mapped range start");
+    let end = range
+      .get("end")
+      .and_then(Value::as_object)
+      .expect("mapped range end");
+    let source_start = source.find("count + 1").expect("source diagnostic start");
+    let source_end = source_start + "count".len();
+    let expected_start = position_from_byte_offset(source, source_start);
+    let expected_end = position_from_byte_offset(source, source_end);
+
+    assert_eq!(start.get("line").and_then(Value::as_u64), Some(u64::from(expected_start.line)));
+    assert_eq!(
+      start.get("character").and_then(Value::as_u64),
+      Some(u64::from(expected_start.character))
+    );
+    assert_eq!(end.get("line").and_then(Value::as_u64), Some(u64::from(expected_end.line)));
+    assert_eq!(
+      end.get("character").and_then(Value::as_u64),
+      Some(u64::from(expected_end.character))
+    );
+  }
+
+  #[test]
+  fn inline_typescript_protocol_diagnostics_dedupe_duplicates() {
+    let project = TempProject::new();
+    let source = r#"<script lang="ts">
+const props = getProps<Props>();
+</script>
+"#;
+    project.write("src/routes/counter.trs", source);
+
+    let document = DocumentContext {
+      project_root: project.root.clone(),
+      relative_path: "src/routes/counter.trs".to_owned(),
+      source: source.to_owned(),
+      cached_artifacts: None,
+    };
+    let InlineTypeScriptViewResolution::Snapshot(snapshot) =
+      resolve_inline_typescript_view(&document, 0, 0)
+    else {
+      panic!("expected inline TypeScript snapshot");
+    };
+    let start = snapshot.content.find("props").expect("virtual diagnostic start");
+
+    let mapped = map_inline_typescript_protocol_diagnostics_value(
+      &document,
+      &[
+        json!({
+          "textSpan": { "start": start, "length": 5 },
+          "text": "Duplicate diagnostic",
+          "category": "warning",
+          "code": 1001,
+        }),
+        json!({
+          "textSpan": { "start": start, "length": 5 },
+          "text": "Duplicate diagnostic",
+          "category": "warning",
+          "code": 1001,
+        }),
+      ],
+    );
+
+    let Value::Array(mapped) = mapped else {
+      panic!("expected mapped diagnostics array");
+    };
+    assert_eq!(mapped.len(), 1);
+  }
+
+  #[test]
+  fn parse_typescript_runtime_config_accepts_nested_runtime_object() {
+    let runtime = parse_typescript_runtime_config(Some(&json!({
+      "typescriptRuntime": {
+        "nodePath": "/Applications/Visual Studio Code.app/Contents/MacOS/Code",
+        "typescriptLibraryPath": "/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/node_modules/typescript/lib/typescript.js",
+      },
+    })));
+
+    assert_eq!(
+      runtime,
+      Some(TypeScriptRuntimeConfig {
+        node_path: PathBuf::from("/Applications/Visual Studio Code.app/Contents/MacOS/Code"),
+        typescript_library_path: PathBuf::from(
+          "/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/node_modules/typescript/lib/typescript.js",
+        ),
+      })
+    );
+  }
+
+  #[test]
+  fn parse_typescript_runtime_config_accepts_direct_runtime_object() {
+    let runtime = parse_typescript_runtime_config(Some(&json!({
+      "nodePath": "/Applications/Visual Studio Code.app/Contents/MacOS/Code",
+      "typescriptLibraryPath": "/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/node_modules/typescript/lib/typescript.js",
+    })));
+
+    assert_eq!(
+      runtime,
+      Some(TypeScriptRuntimeConfig {
+        node_path: PathBuf::from("/Applications/Visual Studio Code.app/Contents/MacOS/Code"),
+        typescript_library_path: PathBuf::from(
+          "/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/node_modules/typescript/lib/typescript.js",
+        ),
+      })
+    );
   }
 
   #[test]

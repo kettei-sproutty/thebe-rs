@@ -155,6 +155,7 @@ fn classify_trs_path(project_root: &Path, snapshots: &SourceSnapshots, path: &Pa
       let client_script_changed = previous_blocks.script_ts != current_blocks.script_ts;
       let restart_change = previous_blocks.script != current_blocks.script
         || previous_blocks.script_setup != current_blocks.script_setup
+        || route_client_script_presence_changed(project_root, path, &previous_blocks, &current_blocks)
         || (client_script_changed && !path_supports_client_script_hotpatch(project_root, path));
 
       if restart_change {
@@ -187,6 +188,7 @@ pub(crate) fn trs_patch_kind_with_snapshots(
   let client_script_changed = previous_blocks.script_ts != current_blocks.script_ts;
   let restart_change = previous_blocks.script != current_blocks.script
     || previous_blocks.script_setup != current_blocks.script_setup
+    || route_client_script_presence_changed(project_root, path, &previous_blocks, &current_blocks)
     || (client_script_changed && !path_supports_client_script_hotpatch(project_root, path));
   let style_changed = previous_blocks.style != current_blocks.style;
   let template_like_change = previous_blocks.head != current_blocks.head
@@ -209,6 +211,31 @@ fn path_supports_client_script_hotpatch(project_root: &Path, path: &Path) -> boo
 
   (path.starts_with(&routes_dir) || path.starts_with(&components_dir))
     && path.extension().is_some_and(|extension| extension == "trs")
+}
+
+fn route_client_script_presence_changed(
+  project_root: &Path,
+  path: &Path,
+  previous_blocks: &SfcBlocks,
+  current_blocks: &SfcBlocks,
+) -> bool {
+  is_direct_route_source_path(project_root, path)
+    && has_client_script(previous_blocks) != has_client_script(current_blocks)
+}
+
+fn is_direct_route_source_path(project_root: &Path, path: &Path) -> bool {
+  let routes_dir = project_root.join("src").join("routes");
+
+  path.starts_with(&routes_dir)
+    && path.extension().is_some_and(|extension| extension == "trs")
+    && path.file_name().is_none_or(|file_name| file_name != "_layout.trs")
+}
+
+fn has_client_script(blocks: &SfcBlocks) -> bool {
+  blocks
+    .script_ts
+    .as_deref()
+    .is_some_and(|script| !script.trim().is_empty())
 }
 
 fn load_snapshot_blocks_from_snapshots(
@@ -405,6 +432,29 @@ mod tests {
     let action = classify_paths(&project_root, &[route_path]);
 
     assert_eq!(action, HotpatchAction::AttemptPatch);
+
+    let _ = fs::remove_dir_all(project_root);
+  }
+
+  #[test]
+  fn classify_paths_should_restart_when_route_client_script_presence_changes() {
+    let project_root = temp_project_root("patch-route-client-script-presence");
+    let route_path = project_root.join("src/routes/index.trs");
+
+    write_snapshot(
+      &project_root,
+      &route_path,
+      "<script setup>fn index() -> Props { Props {} }</script>\n<div>same</div>",
+    );
+    fs::write(
+      &route_path,
+      "<script setup>fn index() -> Props { Props {} }</script>\n<script lang=\"ts\">window.__probe = \"after\";</script>\n<div>same</div>",
+    )
+    .expect("current route should write");
+
+    let action = classify_paths(&project_root, &[route_path]);
+
+    assert_eq!(action, HotpatchAction::Restart(RestartReason::GeneratedInput));
 
     let _ = fs::remove_dir_all(project_root);
   }

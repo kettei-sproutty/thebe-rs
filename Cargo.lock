@@ -3226,6 +3226,7 @@ name = "thebe-lsp"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "serde_json",
  "thebe-analyzer",
  "thebe-codegen",
  "thebe-css",

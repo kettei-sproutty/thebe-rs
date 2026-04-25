@@ -1,3 +1,4 @@
+const fs = require("node:fs");
 const path = require("node:path");
 const vscode = require("vscode");
 const { LanguageClient } = require("vscode-languageclient/node");
@@ -18,7 +19,6 @@ const {
   INLINE_TYPESCRIPT_COMMAND_ID,
   INLINE_TYPESCRIPT_SCHEME,
   resolveInlineSourcePositionRange,
-  resolveInlineTargetPositionRange,
   resolveInlineTypeScriptView,
 } = require("./inline-typescript");
 const {
@@ -45,8 +45,31 @@ const INLINE_TYPESCRIPT_DIAGNOSTIC_COMMANDS = [
   "semanticDiagnosticsSync",
   "suggestionDiagnosticsSync",
 ];
+const INLINE_TYPESCRIPT_VIEW_LSP_COMMAND_ID = "thebe.inlineTypeScriptView";
+const INLINE_TYPESCRIPT_MAP_PROTOCOL_DIAGNOSTICS_LSP_COMMAND_ID = "thebe.mapInlineTypeScriptProtocolDiagnostics";
 const TYPESCRIPT_TSSERVER_REQUEST_COMMAND_ID = "typescript.tsserverRequest";
 const TYPESCRIPT_EXTENSION_ID = "vscode.typescript-language-features";
+
+function resolveTypeScriptRuntimeConfig() {
+  const extension = vscode.extensions.getExtension(TYPESCRIPT_EXTENSION_ID);
+  if (!extension) {
+    return null;
+  }
+
+  const libraryPathCandidates = [
+    path.join(extension.extensionPath, "node_modules", "typescript", "lib", "typescript.js"),
+    path.join(extension.extensionPath, "..", "node_modules", "typescript", "lib", "typescript.js"),
+  ];
+  const typescriptLibraryPath = libraryPathCandidates.find((filePath) => fs.existsSync(filePath));
+  if (!typescriptLibraryPath) {
+    return null;
+  }
+
+  return {
+    nodePath: process.execPath,
+    typescriptLibraryPath,
+  };
+}
 
 async function activate(context) {
   const command = resolveServerCommand({
@@ -54,8 +77,12 @@ async function activate(context) {
     extensionPath: context.extensionPath,
     workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
   });
+  const typescriptRuntime = resolveTypeScriptRuntimeConfig();
+  const inlineTypeScriptLspBridgeEnabled = Boolean(typescriptRuntime);
+  let inlineTypeScriptLspBridgeReady = !inlineTypeScriptLspBridgeEnabled;
   const clientOptions = {
     documentSelector: createDocumentSelector(),
+    initializationOptions: typescriptRuntime ? { typescriptRuntime } : undefined,
     synchronize: {
       fileEvents: vscode.workspace.createFileSystemWatcher(FILE_WATCH_GLOB),
     },
@@ -71,17 +98,11 @@ async function activate(context) {
     clientOptions,
   );
 
-  context.subscriptions.push(
-    client.start(),
-    inlineTypeScriptSnapshotChanges,
+  const inlineTypeScriptFallbackDisposables = [
     inlineTypeScriptDiagnostics,
     {
       dispose: clearInlineTypeScriptDiagnosticRefreshes,
     },
-    vscode.workspace.registerTextDocumentContentProvider(INLINE_TYPESCRIPT_SCHEME, {
-      onDidChange: inlineTypeScriptSnapshotChanges.event,
-      provideTextDocumentContent: provideInlineTypeScriptContent,
-    }),
     vscode.languages.registerCompletionItemProvider(
       createDocumentSelector(),
       {
@@ -89,6 +110,18 @@ async function activate(context) {
       },
       ...INLINE_TYPESCRIPT_COMPLETION_TRIGGERS,
     ),
+    vscode.languages.onDidChangeDiagnostics((event) => {
+      updateInlineTypeScriptDiagnostics(event.uris);
+    }),
+  ];
+
+  const subscriptions = [
+    client.start(),
+    inlineTypeScriptSnapshotChanges,
+    vscode.workspace.registerTextDocumentContentProvider(INLINE_TYPESCRIPT_SCHEME, {
+      onDidChange: inlineTypeScriptSnapshotChanges.event,
+      provideTextDocumentContent: provideInlineTypeScriptContent,
+    }),
     vscode.languages.registerDefinitionProvider(INLINE_RUST_SELECTOR, {
       provideDefinition: provideInlineRustDefinition,
     }),
@@ -106,15 +139,16 @@ async function activate(context) {
     }),
     vscode.workspace.onDidOpenTextDocument((document) => {
       void ensureInlineTypeScriptSnapshotDocument({ document });
-      scheduleInlineTypeScriptDiagnosticsRefresh(document);
+      if (!inlineTypeScriptLspBridgeReady) {
+        scheduleInlineTypeScriptDiagnosticsRefresh(document);
+      }
     }),
     vscode.workspace.onDidChangeTextDocument((event) => {
-      refreshInlineTypeScriptSnapshot(event.document);
+      void refreshInlineTypeScriptSnapshot(event.document);
       void ensureInlineTypeScriptSnapshotDocument({ document: event.document });
-      scheduleInlineTypeScriptDiagnosticsRefresh(event.document);
-    }),
-    vscode.languages.onDidChangeDiagnostics((event) => {
-      updateInlineTypeScriptDiagnostics(event.uris);
+      if (!inlineTypeScriptLspBridgeReady) {
+        scheduleInlineTypeScriptDiagnosticsRefresh(event.document);
+      }
     }),
     vscode.workspace.onDidCloseTextDocument((document) => {
       inlineRustSnapshots.delete(document.uri.toString());
@@ -128,12 +162,48 @@ async function activate(context) {
     vscode.commands.registerCommand(GENERATED_TYPES_COMMAND_ID, openGeneratedTypesMirror),
     vscode.commands.registerCommand(INLINE_RUST_COMMAND_ID, openInlineRustView),
     vscode.commands.registerCommand(INLINE_TYPESCRIPT_COMMAND_ID, openInlineTypeScriptView),
-  );
+    ...inlineTypeScriptFallbackDisposables,
+  ];
+
+  context.subscriptions.push(...subscriptions);
+
+  if (inlineTypeScriptLspBridgeEnabled) {
+    void client.onReady().then(async () => {
+      await syncOpenThebeDocumentsToLsp();
+      inlineTypeScriptLspBridgeReady = true;
+      clearInlineTypeScriptDiagnosticRefreshes();
+      inlineTypeScriptDiagnostics.clear();
+      for (const disposable of inlineTypeScriptFallbackDisposables) {
+        disposable.dispose();
+      }
+    }).catch(() => {});
+  }
 
   for (const document of vscode.workspace.textDocuments) {
     void ensureInlineTypeScriptSnapshotDocument({ document });
-    scheduleInlineTypeScriptDiagnosticsRefresh(document);
+    if (!inlineTypeScriptLspBridgeReady) {
+      scheduleInlineTypeScriptDiagnosticsRefresh(document);
+    }
   }
+}
+
+async function syncOpenThebeDocumentsToLsp() {
+  if (!client) {
+    return;
+  }
+
+  const documents = vscode.workspace.textDocuments.filter(
+    (document) => document.languageId === "thebe" && document.uri.scheme === "file",
+  );
+  await Promise.all(documents.map((document) => client.sendNotification("textDocument/didChange", {
+    textDocument: {
+      uri: document.uri.toString(),
+      version: document.version,
+    },
+    contentChanges: [{
+      text: document.getText(),
+    }],
+  })));
 }
 
 async function openInlineRustView() {
@@ -186,18 +256,19 @@ async function openInlineTypeScriptView() {
     return;
   }
 
+  const selectionStartOffset = editor.document.offsetAt(editor.selection.start);
+  const selectionEndOffset = editor.document.offsetAt(editor.selection.end);
+
   const bridge = await ensureInlineTypeScriptSnapshotDocument({
     document: editor.document,
-    selectionStartOffset: editor.document.offsetAt(editor.selection.start),
-    selectionEndOffset: editor.document.offsetAt(editor.selection.end),
+    selectionStartOffset,
+    selectionEndOffset,
   });
   if (!bridge) {
-    const view = resolveInlineTypeScriptView({
-      documentPath: editor.document.uri.fsPath,
-      workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
-      source: editor.document.getText(),
-      selectionStartOffset: editor.document.offsetAt(editor.selection.start),
-      selectionEndOffset: editor.document.offsetAt(editor.selection.end),
+    const view = await resolveInlineTypeScriptViewForDocument({
+      document: editor.document,
+      selectionStartOffset,
+      selectionEndOffset,
     });
     const message = view.reason === "no-script"
       ? "No <script lang=\"ts\"> block was found in this route."
@@ -231,6 +302,92 @@ function provideInlineTypeScriptContent(uri) {
   return inlineTypeScriptSnapshots.get(uri.toString())?.content ?? "";
 }
 
+async function resolveInlineTypeScriptViewForDocument({
+  document,
+  selectionStartOffset = 0,
+  selectionEndOffset = selectionStartOffset,
+}) {
+  if (!document || document.languageId !== "thebe" || document.uri.scheme !== "file") {
+    return null;
+  }
+
+  const serverView = await requestInlineTypeScriptViewFromServer({
+    document,
+    selectionStartOffset,
+    selectionEndOffset,
+  });
+  if (serverView) {
+    return serverView;
+  }
+
+  return resolveInlineTypeScriptView({
+    documentPath: document.uri.fsPath,
+    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+    source: document.getText(),
+    selectionStartOffset,
+    selectionEndOffset,
+  });
+}
+
+async function requestInlineTypeScriptViewFromServer({
+  document,
+  selectionStartOffset,
+  selectionEndOffset,
+}) {
+  if (!client) {
+    return null;
+  }
+
+  try {
+    await client.onReady();
+    const response = await client.sendRequest("workspace/executeCommand", {
+      command: INLINE_TYPESCRIPT_VIEW_LSP_COMMAND_ID,
+      arguments: [{
+        uri: document.uri.toString(),
+        source: document.getText(),
+        selectionStartOffset,
+        selectionEndOffset,
+      }],
+    });
+    return normalizeInlineTypeScriptView(response);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeInlineTypeScriptView(response) {
+  if (!response || typeof response !== "object" || typeof response.ok !== "boolean") {
+    return null;
+  }
+
+  if (!response.ok) {
+    return typeof response.reason === "string" ? response : null;
+  }
+
+  if (
+    typeof response.targetPath !== "string"
+    || typeof response.sourcePath !== "string"
+    || typeof response.sourceText !== "string"
+    || typeof response.content !== "string"
+    || typeof response.prefixLength !== "number"
+    || typeof response.scriptStartOffset !== "number"
+    || typeof response.scriptEndOffset !== "number"
+    || typeof response.selectionStartOffset !== "number"
+    || typeof response.selectionEndOffset !== "number"
+  ) {
+    return null;
+  }
+
+  if (
+    response.generatedTypesPath !== null
+    && typeof response.generatedTypesPath !== "string"
+  ) {
+    return null;
+  }
+
+  return response;
+}
+
 async function ensureInlineTypeScriptSnapshotDocument({
   document,
   selectionStartOffset = 0,
@@ -240,10 +397,8 @@ async function ensureInlineTypeScriptSnapshotDocument({
     return null;
   }
 
-  const view = resolveInlineTypeScriptView({
-    documentPath: document.uri.fsPath,
-    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
-    source: document.getText(),
+  const view = await resolveInlineTypeScriptViewForDocument({
+    document,
     selectionStartOffset,
     selectionEndOffset,
   });
@@ -293,7 +448,7 @@ function createInlineTypeScriptTsserverUri({ targetPath, sourceVersion }) {
   return vscode.Uri.file(versionedPath).with({ scheme: INLINE_TYPESCRIPT_SCHEME });
 }
 
-function refreshInlineTypeScriptSnapshot(document) {
+async function refreshInlineTypeScriptSnapshot(document) {
   if (!document || document.languageId !== "thebe" || document.uri.scheme !== "file") {
     return;
   }
@@ -308,10 +463,8 @@ function refreshInlineTypeScriptSnapshot(document) {
   );
   const selectionStartOffset = sourceEditor ? document.offsetAt(sourceEditor.selection.start) : 0;
   const selectionEndOffset = sourceEditor ? document.offsetAt(sourceEditor.selection.end) : selectionStartOffset;
-  const view = resolveInlineTypeScriptView({
-    documentPath: document.uri.fsPath,
-    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
-    source: document.getText(),
+  const view = await resolveInlineTypeScriptViewForDocument({
+    document,
     selectionStartOffset,
     selectionEndOffset,
   });
@@ -337,16 +490,7 @@ async function provideThebeTypeScriptCompletionItems(document, position, token, 
     return undefined;
   }
 
-  const virtualRange = resolveInlineTargetPositionRange({
-    view: bridge.view,
-    startOffset: selectionOffset,
-    endOffset: selectionOffset,
-  });
-  if (!virtualRange) {
-    return undefined;
-  }
-
-  const virtualPosition = new vscode.Position(virtualRange.start.line, virtualRange.start.character);
+  const virtualPosition = bridge.virtualDocument.positionAt(bridge.view.selectionStartOffset);
   const completions = await vscode.commands.executeCommand(
     "vscode.executeCompletionItemProvider",
     bridge.virtualUri,
@@ -536,13 +680,23 @@ async function collectInlineTypeScriptDiagnostics({ bridge, sourceDocument, expe
     }
 
     const protocolDiagnostics = await requestInlineTypeScriptProtocolDiagnostics(bridge.virtualUri);
-    const mappedDiagnostics = Array.isArray(protocolDiagnostics)
-      ? protocolDiagnostics
-        .map((diagnostic) => mapInlineTypeScriptProtocolDiagnostic(diagnostic, bridge.view, bridge.virtualDocument))
-        .filter(Boolean)
-      : vscode.languages.getDiagnostics(bridge.virtualUri)
+    let mappedDiagnostics;
+    if (Array.isArray(protocolDiagnostics)) {
+      mappedDiagnostics = await mapInlineTypeScriptProtocolDiagnosticsThroughServer({
+        diagnostics: protocolDiagnostics,
+        sourceDocument,
+      });
+      if (!Array.isArray(mappedDiagnostics)) {
+        mappedDiagnostics = protocolDiagnostics
+          .map((diagnostic) => mapInlineTypeScriptProtocolDiagnostic(diagnostic, bridge.view, bridge.virtualDocument))
+          .filter(Boolean);
+      }
+    } else {
+      mappedDiagnostics = vscode.languages.getDiagnostics(bridge.virtualUri)
         .map((diagnostic) => mapInlineTypeScriptDiagnostic(diagnostic, bridge.view, bridge.virtualDocument))
         .filter(Boolean);
+    }
+
     const dedupedDiagnostics = dedupeInlineTypeScriptDiagnostics(mappedDiagnostics);
     if (dedupedDiagnostics.length > 0 || attempt === INLINE_TYPESCRIPT_DIAGNOSTIC_MAX_ATTEMPTS - 1) {
       return dedupedDiagnostics;
@@ -581,6 +735,104 @@ async function requestInlineTypeScriptProtocolDiagnostics(virtualUri) {
   } catch {
     return null;
   }
+}
+
+async function mapInlineTypeScriptProtocolDiagnosticsThroughServer({ diagnostics, sourceDocument }) {
+  if (!client || !sourceDocument || !Array.isArray(diagnostics)) {
+    return null;
+  }
+
+  try {
+    await client.onReady();
+    const response = await client.sendRequest("workspace/executeCommand", {
+      command: INLINE_TYPESCRIPT_MAP_PROTOCOL_DIAGNOSTICS_LSP_COMMAND_ID,
+      arguments: [{
+        uri: sourceDocument.uri.toString(),
+        source: sourceDocument.getText(),
+        diagnostics,
+      }],
+    });
+    if (!Array.isArray(response)) {
+      return null;
+    }
+
+    return response
+      .map(normalizeMappedInlineTypeScriptProtocolDiagnostic)
+      .filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeMappedInlineTypeScriptProtocolDiagnostic(diagnostic) {
+  if (!diagnostic || typeof diagnostic !== "object") {
+    return null;
+  }
+
+  const start = diagnostic.range?.start;
+  const end = diagnostic.range?.end;
+  if (
+    typeof start?.line !== "number"
+    || typeof start?.character !== "number"
+    || typeof end?.line !== "number"
+    || typeof end?.character !== "number"
+    || typeof diagnostic.message !== "string"
+    || typeof diagnostic.severity !== "string"
+  ) {
+    return null;
+  }
+
+  const mapped = new vscode.Diagnostic(
+    new vscode.Range(
+      new vscode.Position(start.line, start.character),
+      new vscode.Position(end.line, end.character),
+    ),
+    diagnostic.message,
+    resolveMappedInlineTypeScriptDiagnosticSeverity(diagnostic.severity),
+  );
+  mapped.source = typeof diagnostic.source === "string" ? diagnostic.source : "ts";
+  if (typeof diagnostic.code === "number" || typeof diagnostic.code === "string") {
+    mapped.code = diagnostic.code;
+  }
+
+  const tags = resolveMappedInlineTypeScriptDiagnosticTags(diagnostic.tags);
+  if (tags) {
+    mapped.tags = tags;
+  }
+
+  return mapped;
+}
+
+function resolveMappedInlineTypeScriptDiagnosticSeverity(severity) {
+  switch (severity) {
+    case "error":
+      return vscode.DiagnosticSeverity.Error;
+    case "warning":
+      return vscode.DiagnosticSeverity.Warning;
+    case "hint":
+      return vscode.DiagnosticSeverity.Hint;
+    default:
+      return vscode.DiagnosticSeverity.Information;
+  }
+}
+
+function resolveMappedInlineTypeScriptDiagnosticTags(tags) {
+  if (!Array.isArray(tags) || tags.length === 0) {
+    return undefined;
+  }
+
+  const mappedTags = tags.flatMap((tag) => {
+    switch (tag) {
+      case "unnecessary":
+        return vscode.DiagnosticTag.Unnecessary;
+      case "deprecated":
+        return vscode.DiagnosticTag.Deprecated;
+      default:
+        return [];
+    }
+  });
+
+  return mappedTags.length > 0 ? mappedTags : undefined;
 }
 
 function mapInlineTypeScriptProtocolDiagnostic(diagnostic, snapshot, virtualDocument) {
