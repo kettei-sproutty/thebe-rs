@@ -5,46 +5,50 @@
     "source_file": {
       "type": "REPEAT",
       "content": {
-        "type": "CHOICE",
-        "members": [
-          {
-            "type": "SYMBOL",
-            "name": "script_setup_element"
-          },
-          {
-            "type": "SYMBOL",
-            "name": "script_ts_element"
-          },
-          {
-            "type": "SYMBOL",
-            "name": "script_element"
-          },
-          {
-            "type": "SYMBOL",
-            "name": "style_element"
-          },
-          {
-            "type": "SYMBOL",
-            "name": "template_binding"
-          },
-          {
-            "type": "SYMBOL",
-            "name": "start_tag"
-          },
-          {
-            "type": "SYMBOL",
-            "name": "end_tag"
-          },
-          {
-            "type": "SYMBOL",
-            "name": "self_closing_tag"
-          },
-          {
-            "type": "SYMBOL",
-            "name": "text"
-          }
-        ]
+        "type": "SYMBOL",
+        "name": "_node"
       }
+    },
+    "_node": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "script_setup_element"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "script_ts_element"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "script_element"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "style_element"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "comment"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "element"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "self_closing_tag"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "template_binding"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "text"
+        }
+      ]
     },
     "template_binding": {
       "type": "SEQ",
@@ -95,6 +99,13 @@
     "identifier": {
       "type": "PATTERN",
       "value": "[A-Za-z_][A-Za-z0-9_]*"
+    },
+    "comment": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PATTERN",
+        "value": "<!--([^-]|-[^-]|--[^>])*-->"
+      }
     },
     "script_setup_element": {
       "type": "PREC",
@@ -381,6 +392,26 @@
         {
           "type": "STRING",
           "value": ">"
+        }
+      ]
+    },
+    "element": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "start_tag"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_node"
+          }
+        },
+        {
+          "type": "SYMBOL",
+          "name": "end_tag"
         }
       ]
     },

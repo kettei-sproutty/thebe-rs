@@ -5,13 +5,15 @@ This package wires Thebe `.trs` files into VS Code with:
 - `.trs` language registration
 - TextMate highlighting for Thebe block tags, template bindings, directives, events, component tags, and named-slot attributes
 - snippet contributions for routes, components, named slots, and common blocks
-- automatic `thebe-lsp` startup
+- automatic `thebe-lsp` startup for saved and untitled `.trs` editors
+- command palette, editor title, and editor context menu actions for opening a route's generated `.thebe/client/**` mirror and `.thebe/types/**` props mirror beside the source `.trs` file, reusing Thebe definition results to preserve matching positions when available
 
 ## Local Development
 
 1. Install dependencies in this package with `npm install`.
 2. Build the workspace `thebe-lsp` binary with `cargo build -p thebe-lsp`.
 3. If needed, set `thebe.lsp.path` in VS Code to the absolute path of the binary.
+4. Run `npm test` in this package to validate the extension's focused smoke checks for the Thebe document selector, project input watch glob, LSP server resolution precedence, and generated artifact commands.
 
 When the setting is empty, the extension tries `target/debug/thebe-lsp` in the current workspace before falling back to `thebe-lsp` on `PATH`.
 

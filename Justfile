@@ -72,10 +72,18 @@ update-cli:
 update-lsp:
   cargo install --path crates/thebe-lsp --force
 
+# Run the VS Code extension smoke tests
+test-vscode:
+    npm --prefix packages/thebe-vscode test
+
 # Build `thebe-lsp` and copy it into the VS Code extension's bin/ directory
 bundle-lsp:
   cargo build -p thebe-lsp --release
   cp target/release/thebe-lsp packages/thebe-vscode/bin/thebe-lsp
+
+# Package the VS Code extension as a VSIX
+package-vscode:
+    npm --prefix packages/thebe-vscode run package:vsix
 
 # Scaffold a new project (usage: just new my-app)
 new name:

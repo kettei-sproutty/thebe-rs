@@ -1,0 +1,25 @@
+=================
+template comments
+=================
+
+<main>
+  <!-- note -->
+  <Card />
+</main>
+
+---
+
+(source_file
+  (text)
+  (element
+    (start_tag
+      (html_tag_name))
+    (text)
+    (comment)
+    (text)
+    (self_closing_tag
+      (component_tag_name))
+    (text)
+    (end_tag
+      (html_tag_name)))
+  (text))

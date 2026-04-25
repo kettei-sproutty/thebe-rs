@@ -4,19 +4,19 @@ module.exports = grammar({
   extras: ($) => [/\s+/],
 
   rules: {
-    source_file: ($) =>
-      repeat(
-        choice(
-          $.script_setup_element,
-          $.script_ts_element,
-          $.script_element,
-          $.style_element,
-          $.template_binding,
-          $.start_tag,
-          $.end_tag,
-          $.self_closing_tag,
-          $.text,
-        ),
+    source_file: ($) => repeat($._node),
+
+    _node: ($) =>
+      choice(
+        $.script_setup_element,
+        $.script_ts_element,
+        $.script_element,
+        $.style_element,
+        $.comment,
+        $.element,
+        $.self_closing_tag,
+        $.template_binding,
+        $.text,
       ),
 
     template_binding: ($) => seq("{{", field("path", $.binding_path), "}}"),
@@ -24,6 +24,8 @@ module.exports = grammar({
     binding_path: ($) => seq($.identifier, repeat(seq(".", $.identifier))),
 
     identifier: () => /[A-Za-z_][A-Za-z0-9_]*/,
+
+    comment: () => token(/<!--([^-]|-[^-]|--[^>])*-->/),
 
     script_setup_element: ($) =>
       prec(
@@ -72,6 +74,8 @@ module.exports = grammar({
     style_start_tag: ($) => seq("<", field("name", alias("style", $.html_tag_name)), ">"),
 
     style_end_tag: ($) => seq("</", field("name", alias("style", $.html_tag_name)), ">"),
+
+    element: ($) => seq($.start_tag, repeat($._node), $.end_tag),
 
     start_tag: ($) =>
       seq(

@@ -1,5 +1,7 @@
 (template_binding) @string.special
 
+(comment) @comment
+
 (binding_path
   (identifier) @variable)
 

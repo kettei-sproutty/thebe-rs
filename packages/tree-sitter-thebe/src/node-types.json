@@ -49,6 +49,61 @@
     }
   },
   {
+    "type": "element",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "comment",
+          "named": true
+        },
+        {
+          "type": "element",
+          "named": true
+        },
+        {
+          "type": "end_tag",
+          "named": true
+        },
+        {
+          "type": "script_element",
+          "named": true
+        },
+        {
+          "type": "script_setup_element",
+          "named": true
+        },
+        {
+          "type": "script_ts_element",
+          "named": true
+        },
+        {
+          "type": "self_closing_tag",
+          "named": true
+        },
+        {
+          "type": "start_tag",
+          "named": true
+        },
+        {
+          "type": "style_element",
+          "named": true
+        },
+        {
+          "type": "template_binding",
+          "named": true
+        },
+        {
+          "type": "text",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "end_tag",
     "named": true,
     "fields": {
@@ -322,7 +377,11 @@
       "required": false,
       "types": [
         {
-          "type": "end_tag",
+          "type": "comment",
+          "named": true
+        },
+        {
+          "type": "element",
           "named": true
         },
         {
@@ -339,10 +398,6 @@
         },
         {
           "type": "self_closing_tag",
-          "named": true
-        },
-        {
-          "type": "start_tag",
           "named": true
         },
         {
@@ -491,6 +546,10 @@
   },
   {
     "type": "block_text",
+    "named": true
+  },
+  {
+    "type": "comment",
     "named": true
   },
   {

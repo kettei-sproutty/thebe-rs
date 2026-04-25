@@ -17,6 +17,7 @@
   ],
   "main": "./extension.js",
   "scripts": {
+    "test": "node --test test/*.test.js",
     "package:vsix": "node ./scripts/package-vsix.js"
   },
   "extensionKind": [
@@ -55,6 +56,54 @@
         "path": "./snippets/thebe.code-snippets"
       }
     ],
+    "commands": [
+      {
+        "command": "thebe.openGeneratedClientMirror",
+        "title": "Open Generated Client Mirror",
+        "category": "Thebe"
+      },
+      {
+        "command": "thebe.openGeneratedTypesMirror",
+        "title": "Open Generated Props Types",
+        "category": "Thebe"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "thebe.openGeneratedClientMirror",
+          "when": "editorLangId == thebe"
+        },
+        {
+          "command": "thebe.openGeneratedTypesMirror",
+          "when": "editorLangId == thebe"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "thebe.openGeneratedClientMirror",
+          "when": "editorLangId == thebe && resourceScheme == file",
+          "group": "navigation@20"
+        },
+        {
+          "command": "thebe.openGeneratedTypesMirror",
+          "when": "editorLangId == thebe && resourceScheme == file",
+          "group": "navigation@21"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "thebe.openGeneratedClientMirror",
+          "when": "editorLangId == thebe && resourceScheme == file",
+          "group": "navigation@20"
+        },
+        {
+          "command": "thebe.openGeneratedTypesMirror",
+          "when": "editorLangId == thebe && resourceScheme == file",
+          "group": "navigation@21"
+        }
+      ]
+    },
     "configuration": {
       "title": "Thebe",
       "properties": {

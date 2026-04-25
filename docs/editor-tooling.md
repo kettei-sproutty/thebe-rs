@@ -13,8 +13,8 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
   - `.thebe/tsconfig.json` gives editors a self-contained TypeScript project without forcing a root `tsconfig.json`.
 - `.thebe/manifest.json` is currently version 6 and records route/layout/component metadata, generated paths, handler signatures, direct component dependencies, template bindings, exact field-level template symbol definitions, source spans, and route template symbols derived from `Props`.
 - `.thebe/diagnostics.json` is currently version 1 and records structured project and file diagnostics with relative paths and source spans.
-- `packages/thebe-vscode/` ships a packaged VS Code extension with `.trs` language registration, snippets, TextMate highlighting, and automatic `thebe-lsp` startup.
-- `packages/tree-sitter-thebe/` ships an initial tree-sitter grammar for `.trs` block tags, component/html tags, attributes, template bindings, and raw script/style injection points.
+- `packages/thebe-vscode/` ships a packaged VS Code extension with `.trs` language registration, snippets, TextMate highlighting, automatic `thebe-lsp` startup, and command palette plus editor title/context actions for opening a route's generated `.thebe/client/**` and `.thebe/types/**` mirrors beside the source `.trs` file while preserving matching locations when available.
+- `packages/tree-sitter-thebe/` ships an initial tree-sitter grammar for `.trs` block tags, nested generic component/html template elements, HTML comments, attributes, template bindings, and raw script/style injection points.
 
 ## Current LSP Features
 
@@ -25,6 +25,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
 - Document highlights for Thebe-owned symbols in the current `.trs` file.
 - Document symbols for route handlers, template bindings, and component props.
 - Go-to-definition between `.trs` source files and generated Rust/TypeScript artifacts, plus exact nested `Props` field targets, component tag/prop targets, and component import aliases.
+- Go-to-definition from a route `<script lang="ts">` block into its generated `.thebe/client/**` mirror, preserving the corresponding script position so it can act as a concrete bridge into external TypeScript tooling before full inline `tsserver` integration exists.
 - References for route handlers, template bindings, precise nested `Props` field paths, and component tag/prop usages across known `.trs` sources, including component import aliases as starting points.
 - Workspace symbol search across loaded Thebe project manifests for routes, handlers, template symbols, layouts, components, and component props.
 - Semantic tokens for block tags, template bindings, component tags, directives, and event attributes.
@@ -54,7 +55,7 @@ The editor loop is not disk-only anymore.
 
 The editor story is broader now, but a few edges are still intentionally narrow:
 
-- The tree-sitter grammar is still initial and does not yet model full HTML-aware nesting or full embedded Rust/TypeScript/CSS subgrammars, even though it now exposes script/style raw-content injection queries.
+- The tree-sitter grammar is still initial and does not yet model full HTML-aware tag matching or full embedded Rust/TypeScript/CSS subgrammars, even though it now exposes nested generic template elements plus script/style raw-content injection queries.
 - Rename support is currently scoped to route handlers, route template symbols, component prop definitions/usages, component tag/import relationships across known `.trs` sources, and client event handlers rather than arbitrary Rust or TypeScript symbols.
 - Formatting now normalizes top-level `.trs` structure and uses best-effort block formatters for embedded Rust, TypeScript, and CSS, but it still does not provide full language-service formatting semantics inside those blocks.
 
