@@ -18,6 +18,7 @@
   "main": "./extension.js",
   "scripts": {
     "test": "node --test test/*.test.js",
+    "test:e2e": "node ./test/e2e/run-test.js",
     "package:vsix": "node ./scripts/package-vsix.js"
   },
   "extensionKind": [
@@ -58,6 +59,11 @@
     ],
     "commands": [
       {
+        "command": "thebe.openInlineTypeScriptView",
+        "title": "Open Inline TypeScript View",
+        "category": "Thebe"
+      },
+      {
         "command": "thebe.openGeneratedClientMirror",
         "title": "Open Generated Client Mirror",
         "category": "Thebe"
@@ -71,6 +77,10 @@
     "menus": {
       "commandPalette": [
         {
+          "command": "thebe.openInlineTypeScriptView",
+          "when": "editorLangId == thebe"
+        },
+        {
           "command": "thebe.openGeneratedClientMirror",
           "when": "editorLangId == thebe"
         },
@@ -80,6 +90,11 @@
         }
       ],
       "editor/title": [
+        {
+          "command": "thebe.openInlineTypeScriptView",
+          "when": "editorLangId == thebe && resourceScheme == file",
+          "group": "navigation@10"
+        },
         {
           "command": "thebe.openGeneratedClientMirror",
           "when": "editorLangId == thebe && resourceScheme == file",
@@ -92,6 +107,11 @@
         }
       ],
       "editor/context": [
+        {
+          "command": "thebe.openInlineTypeScriptView",
+          "when": "editorLangId == thebe && resourceScheme == file",
+          "group": "navigation@10"
+        },
         {
           "command": "thebe.openGeneratedClientMirror",
           "when": "editorLangId == thebe && resourceScheme == file",
@@ -114,6 +134,10 @@
         }
       }
     }
+  },
+  "devDependencies": {
+    "@vscode/test-electron": "^2.5.2",
+    "mocha": "^10.8.2"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"

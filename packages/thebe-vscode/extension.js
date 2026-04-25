@@ -13,6 +13,10 @@ const {
   selectGeneratedClientLocation,
   selectGeneratedTypesLocation,
 } = require("./generated-client");
+const {
+  INLINE_TYPESCRIPT_COMMAND_ID,
+  resolveInlineTypeScriptView,
+} = require("./inline-typescript");
 
 let client;
 
@@ -43,7 +47,50 @@ async function activate(context) {
     client.start(),
     vscode.commands.registerCommand(GENERATED_CLIENT_COMMAND_ID, openGeneratedClientMirror),
     vscode.commands.registerCommand(GENERATED_TYPES_COMMAND_ID, openGeneratedTypesMirror),
+    vscode.commands.registerCommand(INLINE_TYPESCRIPT_COMMAND_ID, openInlineTypeScriptView),
   );
+}
+
+async function openInlineTypeScriptView() {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.languageId !== "thebe" || editor.document.uri.scheme !== "file") {
+    void vscode.window.showErrorMessage("Open a saved Thebe route to view its inline TypeScript snapshot.");
+    return;
+  }
+
+  const view = resolveInlineTypeScriptView({
+    documentPath: editor.document.uri.fsPath,
+    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+    source: editor.document.getText(),
+    selectionStartOffset: editor.document.offsetAt(editor.selection.start),
+    selectionEndOffset: editor.document.offsetAt(editor.selection.end),
+  });
+  if (!view.ok) {
+    const message = view.reason === "no-script"
+      ? "No <script lang=\"ts\"> block was found in this route."
+      : "Inline TypeScript snapshots are only available for route .trs files under src/routes.";
+    void vscode.window.showErrorMessage(message);
+    return;
+  }
+
+  try {
+    const document = await vscode.workspace.openTextDocument({
+      language: "typescript",
+      content: view.content,
+    });
+    const targetEditor = await vscode.window.showTextDocument(document, {
+      preview: false,
+      viewColumn: vscode.ViewColumn.Beside,
+    });
+    const selection = new vscode.Selection(
+      document.positionAt(view.selectionStartOffset),
+      document.positionAt(view.selectionEndOffset),
+    );
+    targetEditor.selection = selection;
+    targetEditor.revealRange(selection);
+  } catch {
+    void vscode.window.showErrorMessage("Unable to open the inline TypeScript snapshot for this route.");
+  }
 }
 
 async function openGeneratedClientMirror() {

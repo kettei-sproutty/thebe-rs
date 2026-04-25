@@ -18,6 +18,10 @@ const {
   selectGeneratedClientLocation,
   selectGeneratedTypesLocation,
 } = require("../generated-client");
+const {
+  INLINE_TYPESCRIPT_COMMAND_ID,
+  resolveInlineTypeScriptView,
+} = require("../inline-typescript");
 
 test("thebe document selector includes untitled editors", () => {
   const selector = createDocumentSelector();
@@ -112,6 +116,10 @@ test("server resolver falls back to platform executable name when nothing exists
 
 test("generated client command id stays stable", () => {
   assert.strictEqual(GENERATED_CLIENT_COMMAND_ID, "thebe.openGeneratedClientMirror");
+});
+
+test("inline typescript command id stays stable", () => {
+  assert.strictEqual(INLINE_TYPESCRIPT_COMMAND_ID, "thebe.openInlineTypeScriptView");
 });
 
 test("generated types command id stays stable", () => {
@@ -247,7 +255,87 @@ test("generated types selector keeps the matching location range", () => {
   });
 });
 
+test("inline typescript view builds route snapshot with type import", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<script setup>\nstruct Props {}\n</script>\n\n<script lang="ts">\nconst props = getProps<Props>();\nfunction increment() {\n  return props.count;\n}\n</script>\n`;
+  const selectionOffset = source.indexOf("increment") + 2;
+
+  const view = resolveInlineTypeScriptView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    selectionStartOffset: selectionOffset,
+    selectionEndOffset: selectionOffset,
+    fileExists: (filePath) => filePath.endsWith(path.join(".thebe", "types", "routes", "counter.ts")),
+    readFile: () => "type Props = {\n  count: number;\n};\n\nexport default Props;\n",
+  });
+
+  assert.ok(view.ok);
+  assert.strictEqual(
+    view.targetPath,
+    path.join(workspacePath, ".thebe", "client", "routes", "counter.ts"),
+  );
+  assert.match(view.content, /declare function getProps<T = unknown>\(\): T;/);
+  assert.match(view.content, /type Props = \{/);
+  assert.match(view.content, /export default Props;/);
+  assert.match(view.content, /function increment\(\)/);
+  assert.ok(view.selectionStartOffset > view.content.indexOf("function increment"));
+});
+
+test("inline typescript view falls back to unknown props without generated types", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<script lang="ts">\nconst props = getProps<Props>();\n</script>\n`;
+
+  const view = resolveInlineTypeScriptView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    selectionStartOffset: 0,
+    selectionEndOffset: 0,
+    fileExists: () => false,
+  });
+
+  assert.ok(view.ok);
+  assert.match(view.content, /type Props = unknown;/);
+});
+
+test("inline typescript view rejects non-route files", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const view = resolveInlineTypeScriptView({
+    documentPath: path.join(workspacePath, "src", "components", "Card.trs"),
+    workspaceFolders: [workspacePath],
+    source: `<script lang="ts">\nconst count = 1;\n</script>`,
+    selectionStartOffset: 0,
+    selectionEndOffset: 0,
+  });
+
+  assert.deepStrictEqual(view, { ok: false, reason: "not-route" });
+});
+
+test("inline typescript view rejects routes without client script", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const view = resolveInlineTypeScriptView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source: `<script setup>\nstruct Props {}\n</script>`,
+    selectionStartOffset: 0,
+    selectionEndOffset: 0,
+  });
+
+  assert.deepStrictEqual(view, { ok: false, reason: "no-script" });
+});
+
 test("package manifest contributes generated artifact commands", () => {
+  assert.ok(
+    packageJson.contributes.commands.some(
+      (command) => command.command === INLINE_TYPESCRIPT_COMMAND_ID,
+    ),
+  );
+  assert.ok(
+    packageJson.contributes.menus.commandPalette.some(
+      (item) => item.command === INLINE_TYPESCRIPT_COMMAND_ID,
+    ),
+  );
   assert.ok(
     packageJson.contributes.commands.some(
       (command) => command.command === GENERATED_CLIENT_COMMAND_ID,
@@ -270,12 +358,22 @@ test("package manifest contributes generated artifact commands", () => {
   );
   assert.ok(
     packageJson.contributes.menus["editor/title"].some(
+      (item) => item.command === INLINE_TYPESCRIPT_COMMAND_ID,
+    ),
+  );
+  assert.ok(
+    packageJson.contributes.menus["editor/title"].some(
       (item) => item.command === GENERATED_CLIENT_COMMAND_ID,
     ),
   );
   assert.ok(
     packageJson.contributes.menus["editor/title"].some(
       (item) => item.command === GENERATED_TYPES_COMMAND_ID,
+    ),
+  );
+  assert.ok(
+    packageJson.contributes.menus["editor/context"].some(
+      (item) => item.command === INLINE_TYPESCRIPT_COMMAND_ID,
     ),
   );
   assert.ok(

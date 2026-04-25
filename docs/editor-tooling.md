@@ -13,7 +13,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
   - `.thebe/tsconfig.json` gives editors a self-contained TypeScript project without forcing a root `tsconfig.json`.
 - `.thebe/manifest.json` is currently version 6 and records route/layout/component metadata, generated paths, handler signatures, direct component dependencies, template bindings, exact field-level template symbol definitions, source spans, and route template symbols derived from `Props`.
 - `.thebe/diagnostics.json` is currently version 1 and records structured project and file diagnostics with relative paths and source spans.
-- `packages/thebe-vscode/` ships a packaged VS Code extension with `.trs` language registration, snippets, TextMate highlighting, automatic `thebe-lsp` startup, and command palette plus editor title/context actions for opening a route's generated `.thebe/client/**` and `.thebe/types/**` mirrors beside the source `.trs` file while preserving matching locations when available.
+- `packages/thebe-vscode/` ships a packaged VS Code extension with `.trs` language registration, snippets, TextMate highlighting, automatic `thebe-lsp` startup, command palette plus editor title/context actions for opening a route's generated `.thebe/client/**` and `.thebe/types/**` mirrors beside the source `.trs` file while preserving matching locations when available, and an `Open Inline TypeScript View` command that opens the current `<script lang="ts">` block as an untitled TypeScript snapshot.
 - `packages/tree-sitter-thebe/` ships an initial tree-sitter grammar for `.trs` block tags, nested generic component/html template elements, HTML comments, attributes, template bindings, and raw script/style injection points.
 
 ## Current LSP Features
@@ -50,6 +50,7 @@ The editor loop is not disk-only anymore.
 - `didChange` refreshes are debounced.
 - The LSP keeps last-good artifacts so hover, definition, and references can keep working during transient invalid edits.
 - Diagnostics publishing is coalesced so unchanged diagnostics are not republished on every refresh.
+- The extension package now has a lightweight extension-host harness that validates the generated client/types commands plus the inline TypeScript snapshot command against a real VS Code instance.
 
 ## Remaining Gaps
 
@@ -58,6 +59,18 @@ The editor story is broader now, but a few edges are still intentionally narrow:
 - The tree-sitter grammar is still initial and does not yet model full HTML-aware tag matching or full embedded Rust/TypeScript/CSS subgrammars, even though it now exposes nested generic template elements plus script/style raw-content injection queries.
 - Rename support is currently scoped to route handlers, route template symbols, component prop definitions/usages, component tag/import relationships across known `.trs` sources, and client event handlers rather than arbitrary Rust or TypeScript symbols.
 - Formatting now normalizes top-level `.trs` structure and uses best-effort block formatters for embedded Rust, TypeScript, and CSS, but it still does not provide full language-service formatting semantics inside those blocks.
+
+## Planned Rust Analyzer Bridge
+
+The Rust-side bridge should follow the same virtual-document pattern now used to start the TypeScript side, but it needs one extra layer of generated server context.
+
+- Source of truth should stay the current `.trs` buffer plus the overlay-backed `thebe-project` refresh path, not stale disk content.
+- The first virtual Rust target should mirror the route's generated `.thebe/server/routes/**` path so the snapshot stays aligned with the existing generated server module layout and Cargo context.
+- The virtual Rust snapshot should be built from the active `<script setup>` block plus the deterministic wrapper/import/module scaffolding that `thebe-codegen` already emits around route handlers.
+- The source map should record UTF-16 offset conversions in both directions: `.trs` `<script setup>` range to virtual Rust snapshot range, and virtual Rust locations back to the original `.trs` span.
+- The initial refresh model should be explicit-command or on-demand open first, then graduate to debounced live regeneration once the offset map is stable.
+- Diagnostics, definition, hover, and rename should round-trip through that source map instead of trying to infer relationships from generated file text after the fact.
+- Once that virtual Rust layer is stable, `rust-analyzer` integration can ride on top of it the same way the inline TypeScript phase now rides on an untitled TypeScript snapshot.
 
 ## Practical Scope Today
 
