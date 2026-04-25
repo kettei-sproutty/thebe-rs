@@ -1,3 +1,4 @@
+const path = require("node:path");
 const vscode = require("vscode");
 const { LanguageClient } = require("vscode-languageclient/node");
 const {
@@ -17,6 +18,7 @@ const {
   INLINE_TYPESCRIPT_COMMAND_ID,
   INLINE_TYPESCRIPT_SCHEME,
   resolveInlineSourcePositionRange,
+  resolveInlineTargetPositionRange,
   resolveInlineTypeScriptView,
 } = require("./inline-typescript");
 const {
@@ -30,8 +32,21 @@ const inlineRustSnapshots = new Map();
 const inlineTypeScriptSnapshots = new Map();
 const inlineTypeScriptSnapshotSourcePaths = new Map();
 const inlineTypeScriptSnapshotChanges = new vscode.EventEmitter();
+const inlineTypeScriptDiagnostics = vscode.languages.createDiagnosticCollection("thebe-inline-typescript");
+const inlineTypeScriptDiagnosticRefreshes = new Map();
 const INLINE_RUST_SELECTOR = [{ language: "rust", scheme: "untitled" }];
 const INLINE_TYPESCRIPT_SELECTOR = [{ scheme: INLINE_TYPESCRIPT_SCHEME }];
+const INLINE_TYPESCRIPT_COMPLETION_TRIGGERS = [".", "\"", "'", "/", "@"];
+const INLINE_TYPESCRIPT_DIAGNOSTIC_REFRESH_DELAY_MS = 75;
+const INLINE_TYPESCRIPT_DIAGNOSTIC_RETRY_DELAY_MS = 150;
+const INLINE_TYPESCRIPT_DIAGNOSTIC_MAX_ATTEMPTS = 8;
+const INLINE_TYPESCRIPT_DIAGNOSTIC_COMMANDS = [
+  "syntacticDiagnosticsSync",
+  "semanticDiagnosticsSync",
+  "suggestionDiagnosticsSync",
+];
+const TYPESCRIPT_TSSERVER_REQUEST_COMMAND_ID = "typescript.tsserverRequest";
+const TYPESCRIPT_EXTENSION_ID = "vscode.typescript-language-features";
 
 async function activate(context) {
   const command = resolveServerCommand({
@@ -59,10 +74,21 @@ async function activate(context) {
   context.subscriptions.push(
     client.start(),
     inlineTypeScriptSnapshotChanges,
+    inlineTypeScriptDiagnostics,
+    {
+      dispose: clearInlineTypeScriptDiagnosticRefreshes,
+    },
     vscode.workspace.registerTextDocumentContentProvider(INLINE_TYPESCRIPT_SCHEME, {
       onDidChange: inlineTypeScriptSnapshotChanges.event,
       provideTextDocumentContent: provideInlineTypeScriptContent,
     }),
+    vscode.languages.registerCompletionItemProvider(
+      createDocumentSelector(),
+      {
+        provideCompletionItems: provideThebeTypeScriptCompletionItems,
+      },
+      ...INLINE_TYPESCRIPT_COMPLETION_TRIGGERS,
+    ),
     vscode.languages.registerDefinitionProvider(INLINE_RUST_SELECTOR, {
       provideDefinition: provideInlineRustDefinition,
     }),
@@ -78,11 +104,24 @@ async function activate(context) {
     vscode.languages.registerReferenceProvider(INLINE_TYPESCRIPT_SELECTOR, {
       provideReferences: provideInlineTypeScriptReferences,
     }),
+    vscode.workspace.onDidOpenTextDocument((document) => {
+      void ensureInlineTypeScriptSnapshotDocument({ document });
+      scheduleInlineTypeScriptDiagnosticsRefresh(document);
+    }),
     vscode.workspace.onDidChangeTextDocument((event) => {
       refreshInlineTypeScriptSnapshot(event.document);
+      void ensureInlineTypeScriptSnapshotDocument({ document: event.document });
+      scheduleInlineTypeScriptDiagnosticsRefresh(event.document);
+    }),
+    vscode.languages.onDidChangeDiagnostics((event) => {
+      updateInlineTypeScriptDiagnostics(event.uris);
     }),
     vscode.workspace.onDidCloseTextDocument((document) => {
       inlineRustSnapshots.delete(document.uri.toString());
+      if (document.languageId === "thebe" && document.uri.scheme === "file") {
+        clearInlineTypeScriptDiagnosticRefresh(document.uri.fsPath);
+        clearInlineTypeScriptSnapshotForSourcePath(document.uri.fsPath);
+      }
       deleteInlineTypeScriptSnapshot(document.uri);
     }),
     vscode.commands.registerCommand(GENERATED_CLIENT_COMMAND_ID, openGeneratedClientMirror),
@@ -90,6 +129,11 @@ async function activate(context) {
     vscode.commands.registerCommand(INLINE_RUST_COMMAND_ID, openInlineRustView),
     vscode.commands.registerCommand(INLINE_TYPESCRIPT_COMMAND_ID, openInlineTypeScriptView),
   );
+
+  for (const document of vscode.workspace.textDocuments) {
+    void ensureInlineTypeScriptSnapshotDocument({ document });
+    scheduleInlineTypeScriptDiagnosticsRefresh(document);
+  }
 }
 
 async function openInlineRustView() {
@@ -142,14 +186,19 @@ async function openInlineTypeScriptView() {
     return;
   }
 
-  const view = resolveInlineTypeScriptView({
-    documentPath: editor.document.uri.fsPath,
-    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
-    source: editor.document.getText(),
+  const bridge = await ensureInlineTypeScriptSnapshotDocument({
+    document: editor.document,
     selectionStartOffset: editor.document.offsetAt(editor.selection.start),
     selectionEndOffset: editor.document.offsetAt(editor.selection.end),
   });
-  if (!view.ok) {
+  if (!bridge) {
+    const view = resolveInlineTypeScriptView({
+      documentPath: editor.document.uri.fsPath,
+      workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+      source: editor.document.getText(),
+      selectionStartOffset: editor.document.offsetAt(editor.selection.start),
+      selectionEndOffset: editor.document.offsetAt(editor.selection.end),
+    });
     const message = view.reason === "no-script"
       ? "No <script lang=\"ts\"> block was found in this route."
       : "Inline TypeScript snapshots are only available for route .trs files under src/routes.";
@@ -158,18 +207,18 @@ async function openInlineTypeScriptView() {
   }
 
   try {
-    const documentUri = rememberInlineTypeScriptSnapshot(view);
-    let document = await vscode.workspace.openTextDocument(documentUri);
-    if (document.languageId !== "typescript") {
-      document = await vscode.languages.setTextDocumentLanguage(document, "typescript");
+    let displayDocument = await vscode.workspace.openTextDocument(bridge.displayUri);
+    if (displayDocument.languageId !== "typescript") {
+      displayDocument = await vscode.languages.setTextDocumentLanguage(displayDocument, "typescript");
     }
-    const targetEditor = await vscode.window.showTextDocument(document, {
+
+    const targetEditor = await vscode.window.showTextDocument(displayDocument, {
       preview: false,
       viewColumn: vscode.ViewColumn.Beside,
     });
     const selection = new vscode.Selection(
-      document.positionAt(view.selectionStartOffset),
-      document.positionAt(view.selectionEndOffset),
+      displayDocument.positionAt(bridge.view.selectionStartOffset),
+      displayDocument.positionAt(bridge.view.selectionEndOffset),
     );
     targetEditor.selection = selection;
     targetEditor.revealRange(selection);
@@ -182,13 +231,66 @@ function provideInlineTypeScriptContent(uri) {
   return inlineTypeScriptSnapshots.get(uri.toString())?.content ?? "";
 }
 
-function rememberInlineTypeScriptSnapshot(view) {
-  const documentUri = vscode.Uri.file(view.targetPath).with({ scheme: INLINE_TYPESCRIPT_SCHEME });
+async function ensureInlineTypeScriptSnapshotDocument({
+  document,
+  selectionStartOffset = 0,
+  selectionEndOffset = selectionStartOffset,
+}) {
+  if (!document || document.languageId !== "thebe" || document.uri.scheme !== "file") {
+    return null;
+  }
+
+  const view = resolveInlineTypeScriptView({
+    documentPath: document.uri.fsPath,
+    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+    source: document.getText(),
+    selectionStartOffset,
+    selectionEndOffset,
+  });
+  if (!view.ok) {
+    clearInlineTypeScriptSnapshotForSourcePath(document.uri.fsPath);
+    return null;
+  }
+
+  const displayUri = rememberInlineTypeScriptSnapshot(view);
+  const tsserverUri = rememberInlineTypeScriptSnapshot(
+    view,
+    createInlineTypeScriptTsserverUri({
+      targetPath: view.targetPath,
+      sourceVersion: document.version,
+    }),
+  );
+  let virtualDocument = await vscode.workspace.openTextDocument(tsserverUri);
+  if (virtualDocument.languageId !== "typescript") {
+    virtualDocument = await vscode.languages.setTextDocumentLanguage(virtualDocument, "typescript");
+  }
+
+  return {
+    displayUri,
+    view,
+    virtualDocument,
+    virtualUri: tsserverUri,
+  };
+}
+
+function rememberInlineTypeScriptSnapshot(view, documentUri = createInlineTypeScriptSnapshotUri(view.targetPath)) {
   const uriString = documentUri.toString();
   inlineTypeScriptSnapshots.set(uriString, view);
-  inlineTypeScriptSnapshotSourcePaths.set(view.sourcePath, uriString);
+  if (documentUri.fragment.length === 0) {
+    inlineTypeScriptSnapshotSourcePaths.set(view.sourcePath, uriString);
+  }
   inlineTypeScriptSnapshotChanges.fire(documentUri);
   return documentUri;
+}
+
+function createInlineTypeScriptSnapshotUri(targetPath) {
+  return vscode.Uri.file(targetPath).with({ scheme: INLINE_TYPESCRIPT_SCHEME });
+}
+
+function createInlineTypeScriptTsserverUri({ targetPath, sourceVersion }) {
+  const parsed = path.parse(targetPath);
+  const versionedPath = path.join(parsed.dir, `${parsed.name}.inline-${sourceVersion}${parsed.ext}`);
+  return vscode.Uri.file(versionedPath).with({ scheme: INLINE_TYPESCRIPT_SCHEME });
 }
 
 function refreshInlineTypeScriptSnapshot(document) {
@@ -216,13 +318,460 @@ function refreshInlineTypeScriptSnapshot(document) {
 
   const snapshotUri = vscode.Uri.parse(snapshotUriString);
   if (!view.ok) {
-    inlineTypeScriptSnapshots.delete(snapshotUriString);
-    inlineTypeScriptSnapshotChanges.fire(snapshotUri);
+    clearInlineTypeScriptSnapshotForSourcePath(document.uri.fsPath);
     return;
   }
 
   inlineTypeScriptSnapshots.set(snapshotUriString, view);
   inlineTypeScriptSnapshotChanges.fire(snapshotUri);
+}
+
+async function provideThebeTypeScriptCompletionItems(document, position, token, context) {
+  const selectionOffset = document.offsetAt(position);
+  const bridge = await ensureInlineTypeScriptSnapshotDocument({
+    document,
+    selectionStartOffset: selectionOffset,
+    selectionEndOffset: selectionOffset,
+  });
+  if (!bridge || token.isCancellationRequested) {
+    return undefined;
+  }
+
+  const virtualRange = resolveInlineTargetPositionRange({
+    view: bridge.view,
+    startOffset: selectionOffset,
+    endOffset: selectionOffset,
+  });
+  if (!virtualRange) {
+    return undefined;
+  }
+
+  const virtualPosition = new vscode.Position(virtualRange.start.line, virtualRange.start.character);
+  const completions = await vscode.commands.executeCommand(
+    "vscode.executeCompletionItemProvider",
+    bridge.virtualUri,
+    virtualPosition,
+    context.triggerCharacter,
+  );
+  if (!completions || token.isCancellationRequested) {
+    return undefined;
+  }
+
+  const fallbackRange = document.getWordRangeAtPosition(position) ?? new vscode.Range(position, position);
+  return mapInlineTypeScriptCompletionList({
+    completionList: completions,
+    snapshot: bridge.view,
+    sourceDocument: document,
+    virtualDocument: bridge.virtualDocument,
+    fallbackRange,
+  });
+}
+
+function mapInlineTypeScriptCompletionList({
+  completionList,
+  snapshot,
+  sourceDocument,
+  virtualDocument,
+  fallbackRange,
+}) {
+  const items = completionList.items.map((item) => mapInlineTypeScriptCompletionItem({
+    item,
+    snapshot,
+    sourceDocument,
+    virtualDocument,
+    fallbackRange,
+  }));
+  return new vscode.CompletionList(items, completionList.isIncomplete);
+}
+
+function mapInlineTypeScriptCompletionItem({
+  item,
+  snapshot,
+  sourceDocument,
+  virtualDocument,
+  fallbackRange,
+}) {
+  const mapped = new vscode.CompletionItem(item.label, item.kind);
+  Object.assign(mapped, item);
+
+  const mappedRange = mapInlineTypeScriptCompletionRange(item.range, snapshot, virtualDocument);
+  const mappedTextEdit = mapInlineTypeScriptTextEdit(item.textEdit, snapshot, virtualDocument);
+  const mappedAdditionalTextEdits = Array.isArray(item.additionalTextEdits)
+    ? item.additionalTextEdits
+      .map((edit) => mapInlineTypeScriptTextEdit(edit, snapshot, virtualDocument))
+      .filter(Boolean)
+    : undefined;
+
+  if (mappedRange) {
+    mapped.range = mappedRange;
+  } else if (!mappedTextEdit) {
+    mapped.range = fallbackRange;
+  }
+
+  if (mappedTextEdit) {
+    mapped.textEdit = mappedTextEdit;
+  } else {
+    delete mapped.textEdit;
+  }
+
+  if (mappedAdditionalTextEdits) {
+    mapped.additionalTextEdits = mappedAdditionalTextEdits;
+  } else {
+    delete mapped.additionalTextEdits;
+  }
+
+  return mapped;
+}
+
+function mapInlineTypeScriptCompletionRange(range, snapshot, virtualDocument) {
+  if (!range) {
+    return null;
+  }
+
+  if (range.start && range.end) {
+    return mapInlineTypeScriptVirtualRange(range, snapshot, virtualDocument);
+  }
+
+  if (range.inserting && range.replacing) {
+    const inserting = mapInlineTypeScriptVirtualRange(range.inserting, snapshot, virtualDocument);
+    const replacing = mapInlineTypeScriptVirtualRange(range.replacing, snapshot, virtualDocument);
+    if (!inserting || !replacing) {
+      return null;
+    }
+
+    return { inserting, replacing };
+  }
+
+  return null;
+}
+
+function mapInlineTypeScriptTextEdit(edit, snapshot, virtualDocument) {
+  if (!edit || !edit.range) {
+    return null;
+  }
+
+  const range = mapInlineTypeScriptVirtualRange(edit.range, snapshot, virtualDocument);
+  if (!range) {
+    return null;
+  }
+
+  return new vscode.TextEdit(range, edit.newText);
+}
+
+function mapInlineTypeScriptVirtualRange(range, snapshot, virtualDocument) {
+  const sourceRange = resolveInlineSourcePositionRange({
+    view: snapshot,
+    startOffset: virtualDocument.offsetAt(range.start),
+    endOffset: virtualDocument.offsetAt(range.end),
+  });
+  if (!sourceRange) {
+    return null;
+  }
+
+  return new vscode.Range(
+    new vscode.Position(sourceRange.start.line, sourceRange.start.character),
+    new vscode.Position(sourceRange.end.line, sourceRange.end.character),
+  );
+}
+
+function scheduleInlineTypeScriptDiagnosticsRefresh(document) {
+  if (!document || document.languageId !== "thebe" || document.uri.scheme !== "file") {
+    return;
+  }
+
+  clearInlineTypeScriptDiagnosticRefresh(document.uri.fsPath);
+  const expectedVersion = document.version;
+  const timeout = setTimeout(() => {
+    inlineTypeScriptDiagnosticRefreshes.delete(document.uri.fsPath);
+    if (document.version !== expectedVersion) {
+      return;
+    }
+
+    void refreshInlineTypeScriptDiagnosticsForDocument(document, expectedVersion);
+  }, INLINE_TYPESCRIPT_DIAGNOSTIC_REFRESH_DELAY_MS);
+  inlineTypeScriptDiagnosticRefreshes.set(document.uri.fsPath, timeout);
+}
+
+function clearInlineTypeScriptDiagnosticRefresh(sourcePath) {
+  const timeout = inlineTypeScriptDiagnosticRefreshes.get(sourcePath);
+  if (!timeout) {
+    return;
+  }
+
+  clearTimeout(timeout);
+  inlineTypeScriptDiagnosticRefreshes.delete(sourcePath);
+}
+
+function clearInlineTypeScriptDiagnosticRefreshes() {
+  for (const timeout of inlineTypeScriptDiagnosticRefreshes.values()) {
+    clearTimeout(timeout);
+  }
+
+  inlineTypeScriptDiagnosticRefreshes.clear();
+}
+
+async function refreshInlineTypeScriptDiagnosticsForDocument(document, expectedVersion = document.version) {
+  const bridge = await ensureInlineTypeScriptSnapshotDocument({ document });
+  if (!bridge) {
+    inlineTypeScriptDiagnostics.delete(document.uri);
+    return;
+  }
+
+  const mappedDiagnostics = await collectInlineTypeScriptDiagnostics({
+    bridge,
+    sourceDocument: document,
+    expectedVersion,
+  });
+  if (!mappedDiagnostics) {
+    return;
+  }
+
+  inlineTypeScriptDiagnostics.set(vscode.Uri.file(bridge.view.sourcePath), mappedDiagnostics);
+}
+
+async function collectInlineTypeScriptDiagnostics({ bridge, sourceDocument, expectedVersion }) {
+  for (let attempt = 0; attempt < INLINE_TYPESCRIPT_DIAGNOSTIC_MAX_ATTEMPTS; attempt += 1) {
+    if (!sourceDocument || sourceDocument.version !== expectedVersion) {
+      return null;
+    }
+
+    const protocolDiagnostics = await requestInlineTypeScriptProtocolDiagnostics(bridge.virtualUri);
+    const mappedDiagnostics = Array.isArray(protocolDiagnostics)
+      ? protocolDiagnostics
+        .map((diagnostic) => mapInlineTypeScriptProtocolDiagnostic(diagnostic, bridge.view, bridge.virtualDocument))
+        .filter(Boolean)
+      : vscode.languages.getDiagnostics(bridge.virtualUri)
+        .map((diagnostic) => mapInlineTypeScriptDiagnostic(diagnostic, bridge.view, bridge.virtualDocument))
+        .filter(Boolean);
+    const dedupedDiagnostics = dedupeInlineTypeScriptDiagnostics(mappedDiagnostics);
+    if (dedupedDiagnostics.length > 0 || attempt === INLINE_TYPESCRIPT_DIAGNOSTIC_MAX_ATTEMPTS - 1) {
+      return dedupedDiagnostics;
+    }
+
+    await waitForInlineTypeScriptDiagnosticsRetry();
+  }
+
+  return [];
+}
+
+async function requestInlineTypeScriptProtocolDiagnostics(virtualUri) {
+  const extension = vscode.extensions.getExtension(TYPESCRIPT_EXTENSION_ID);
+  if (extension && !extension.isActive) {
+    try {
+      await extension.activate();
+    } catch {
+      return null;
+    }
+  }
+
+  try {
+    const responses = await Promise.all(
+      INLINE_TYPESCRIPT_DIAGNOSTIC_COMMANDS.map((command) => vscode.commands.executeCommand(
+        TYPESCRIPT_TSSERVER_REQUEST_COMMAND_ID,
+        command,
+        { file: virtualUri },
+      )),
+    );
+
+    return responses.flatMap((response) => (
+      response && response.type === "response" && Array.isArray(response.body)
+        ? response.body
+        : []
+    ));
+  } catch {
+    return null;
+  }
+}
+
+function mapInlineTypeScriptProtocolDiagnostic(diagnostic, snapshot, virtualDocument) {
+  const virtualRange = resolveInlineTypeScriptProtocolRange(diagnostic, virtualDocument);
+  if (!virtualRange) {
+    return null;
+  }
+
+  const sourceRange = mapInlineTypeScriptVirtualRange(virtualRange, snapshot, virtualDocument);
+  if (!sourceRange) {
+    return null;
+  }
+
+  const mapped = new vscode.Diagnostic(
+    sourceRange,
+    readInlineTypeScriptProtocolDiagnosticMessage(diagnostic),
+    resolveInlineTypeScriptProtocolDiagnosticSeverity(diagnostic.category),
+  );
+  mapped.source = diagnostic.source ?? "ts";
+  if (typeof diagnostic.code === "number" || typeof diagnostic.code === "string") {
+    mapped.code = diagnostic.code;
+  }
+
+  const tags = [];
+  if (diagnostic.reportsUnnecessary) {
+    tags.push(vscode.DiagnosticTag.Unnecessary);
+  }
+  if (diagnostic.reportsDeprecated) {
+    tags.push(vscode.DiagnosticTag.Deprecated);
+  }
+  if (tags.length > 0) {
+    mapped.tags = tags;
+  }
+
+  return mapped;
+}
+
+function resolveInlineTypeScriptProtocolRange(diagnostic, virtualDocument) {
+  if (
+    diagnostic
+    && diagnostic.start
+    && diagnostic.end
+    && typeof diagnostic.start.line === "number"
+    && typeof diagnostic.start.offset === "number"
+    && typeof diagnostic.end.line === "number"
+    && typeof diagnostic.end.offset === "number"
+  ) {
+    return new vscode.Range(
+      new vscode.Position(Math.max(0, diagnostic.start.line - 1), Math.max(0, diagnostic.start.offset - 1)),
+      new vscode.Position(Math.max(0, diagnostic.end.line - 1), Math.max(0, diagnostic.end.offset - 1)),
+    );
+  }
+
+  if (typeof diagnostic?.start === "number") {
+    const startOffset = Math.max(0, diagnostic.start);
+    const endOffset = startOffset + Math.max(0, diagnostic.length ?? 0);
+    return new vscode.Range(
+      virtualDocument.positionAt(startOffset),
+      virtualDocument.positionAt(endOffset),
+    );
+  }
+
+  if (diagnostic?.textSpan && typeof diagnostic.textSpan.start === "number") {
+    const startOffset = Math.max(0, diagnostic.textSpan.start);
+    const endOffset = startOffset + Math.max(0, diagnostic.textSpan.length ?? 0);
+    return new vscode.Range(
+      virtualDocument.positionAt(startOffset),
+      virtualDocument.positionAt(endOffset),
+    );
+  }
+
+  return null;
+}
+
+function readInlineTypeScriptProtocolDiagnosticMessage(diagnostic) {
+  if (typeof diagnostic?.text === "string" && diagnostic.text.length > 0) {
+    return diagnostic.text;
+  }
+
+  const message = flattenInlineTypeScriptDiagnosticMessageText(diagnostic?.messageText);
+  return message.length > 0 ? message : "TypeScript diagnostic";
+}
+
+function flattenInlineTypeScriptDiagnosticMessageText(messageText) {
+  if (typeof messageText === "string") {
+    return messageText;
+  }
+
+  if (!messageText || typeof messageText.messageText !== "string") {
+    return "";
+  }
+
+  const next = Array.isArray(messageText.next)
+    ? messageText.next
+      .map((entry) => flattenInlineTypeScriptDiagnosticMessageText(entry))
+      .filter((entry) => entry.length > 0)
+    : [];
+  return next.length > 0 ? `${messageText.messageText} ${next.join(" ")}` : messageText.messageText;
+}
+
+function resolveInlineTypeScriptProtocolDiagnosticSeverity(category) {
+  switch (category) {
+    case "error":
+      return vscode.DiagnosticSeverity.Error;
+    case "warning":
+      return vscode.DiagnosticSeverity.Warning;
+    case "suggestion":
+      return vscode.DiagnosticSeverity.Hint;
+    default:
+      return vscode.DiagnosticSeverity.Information;
+  }
+}
+
+function dedupeInlineTypeScriptDiagnostics(diagnostics) {
+  const seen = new Set();
+  return diagnostics.filter((diagnostic) => {
+    const key = [
+      diagnostic.code ?? "",
+      diagnostic.message,
+      diagnostic.range.start.line,
+      diagnostic.range.start.character,
+      diagnostic.range.end.line,
+      diagnostic.range.end.character,
+    ].join(":");
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function waitForInlineTypeScriptDiagnosticsRetry() {
+  return new Promise((resolve) => {
+    setTimeout(resolve, INLINE_TYPESCRIPT_DIAGNOSTIC_RETRY_DELAY_MS);
+  });
+}
+
+function updateInlineTypeScriptDiagnostics(uris) {
+  const nextEntries = [];
+  for (const uri of uris) {
+    if (!uri || uri.scheme !== INLINE_TYPESCRIPT_SCHEME) {
+      continue;
+    }
+
+    const snapshot = inlineTypeScriptSnapshots.get(uri.toString());
+    const virtualDocument = vscode.workspace.textDocuments.find(
+      (document) => document.uri.toString() === uri.toString(),
+    );
+    if (!snapshot || !virtualDocument) {
+      continue;
+    }
+
+    const diagnostics = vscode.languages.getDiagnostics(uri)
+      .map((diagnostic) => mapInlineTypeScriptDiagnostic(diagnostic, snapshot, virtualDocument))
+      .filter(Boolean);
+    nextEntries.push([vscode.Uri.file(snapshot.sourcePath), diagnostics]);
+  }
+
+  if (nextEntries.length > 0) {
+    inlineTypeScriptDiagnostics.set(nextEntries);
+  }
+}
+
+function mapInlineTypeScriptDiagnostic(diagnostic, snapshot, virtualDocument) {
+  const range = mapInlineTypeScriptVirtualRange(diagnostic.range, snapshot, virtualDocument);
+  if (!range) {
+    return null;
+  }
+
+  const mapped = new vscode.Diagnostic(range, diagnostic.message, diagnostic.severity);
+  mapped.source = diagnostic.source;
+  mapped.code = diagnostic.code;
+  mapped.tags = diagnostic.tags;
+  return mapped;
+}
+
+function clearInlineTypeScriptSnapshotForSourcePath(sourcePath) {
+  const snapshotUriString = inlineTypeScriptSnapshotSourcePaths.get(sourcePath);
+  inlineTypeScriptDiagnostics.delete(vscode.Uri.file(sourcePath));
+  for (const [uriString, snapshot] of inlineTypeScriptSnapshots.entries()) {
+    if (snapshot.sourcePath === sourcePath) {
+      inlineTypeScriptSnapshots.delete(uriString);
+    }
+  }
+  if (!snapshotUriString) {
+    return;
+  }
+
+  inlineTypeScriptSnapshotSourcePaths.delete(sourcePath);
 }
 
 function deleteInlineTypeScriptSnapshot(documentUri) {
@@ -235,6 +784,7 @@ function deleteInlineTypeScriptSnapshot(documentUri) {
   for (const [sourcePath, snapshotUriString] of inlineTypeScriptSnapshotSourcePaths.entries()) {
     if (snapshotUriString === uriString) {
       inlineTypeScriptSnapshotSourcePaths.delete(sourcePath);
+      inlineTypeScriptDiagnostics.delete(vscode.Uri.file(sourcePath));
       break;
     }
   }

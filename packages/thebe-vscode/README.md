@@ -8,7 +8,7 @@ This package wires Thebe `.trs` files into VS Code with:
 - automatic `thebe-lsp` startup for saved and untitled `.trs` editors
 - command palette, editor title, and editor context menu actions for opening a route's generated `.thebe/client/**` mirror and `.thebe/types/**` props mirror beside the source `.trs` file, reusing Thebe definition results to preserve matching positions when available
 - an `Open Inline Rust View` command that opens the current route's `<script setup>` block as an untitled Rust snapshot with definition/reference jumps back into the source route
-- an `Open Inline TypeScript View` command that opens the current route's `<script lang="ts">` block as a stable provider-backed virtual TypeScript document with definition/reference jumps back into the source route, `Props` type definition jumps into the generated props mirror, and live refresh from source `.trs` edits
+- an `Open Inline TypeScript View` command that opens the current route's `<script lang="ts">` block as a stable provider-backed virtual TypeScript document with definition/reference jumps back into the source route, `Props` type definition jumps into the generated props mirror, built-in TypeScript hover, live refresh from source `.trs` edits, and source-side TypeScript completions plus mapped errors/warnings inside the original `.trs` editor
 
 ## Local Development
 
@@ -16,7 +16,7 @@ This package wires Thebe `.trs` files into VS Code with:
 2. Build the workspace `thebe-lsp` binary with `cargo build -p thebe-lsp`.
 3. If needed, set `thebe.lsp.path` in VS Code to the absolute path of the binary.
 4. Run `npm test` in this package to validate the extension's focused smoke checks for the Thebe document selector, project input watch glob, LSP server resolution precedence, generated artifact commands, and inline Rust/TypeScript bridge helpers.
-5. Run `npm run test:e2e` in this package to launch the lightweight extension-host harness that verifies the generated artifact commands plus the inline Rust snapshot and provider-backed TypeScript virtual document's editor-opening, refresh, and round-trip navigation behavior.
+5. Run `npm run test:e2e` in this package to launch the lightweight extension-host harness that verifies the generated artifact commands plus the inline Rust snapshot and provider-backed TypeScript virtual document's editor-opening, refresh, round-trip navigation behavior, source-side TypeScript completions, and mapped TypeScript diagnostics.
 
 When the setting is empty, the extension tries `target/debug/thebe-lsp` in the current workspace before falling back to `thebe-lsp` on `PATH`.
 

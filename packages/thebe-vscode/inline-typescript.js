@@ -91,6 +91,36 @@ function mapSourceOffsetToInlineOffset({ sourceOffset, scriptBlock, prefixLength
   return prefixLength + clampedOffset - scriptBlock.start;
 }
 
+function resolveInlineTargetRange({ view, startOffset, endOffset }) {
+  if (
+    typeof startOffset !== "number"
+    || typeof endOffset !== "number"
+    || startOffset < view.scriptStartOffset
+    || endOffset < view.scriptStartOffset
+    || startOffset > view.scriptEndOffset
+    || endOffset > view.scriptEndOffset
+  ) {
+    return null;
+  }
+
+  return {
+    startOffset: view.prefixLength + startOffset - view.scriptStartOffset,
+    endOffset: view.prefixLength + endOffset - view.scriptStartOffset,
+  };
+}
+
+function resolveInlineTargetPositionRange({ view, startOffset, endOffset }) {
+  const targetRange = resolveInlineTargetRange({ view, startOffset, endOffset });
+  if (!targetRange) {
+    return null;
+  }
+
+  return {
+    start: positionAtOffset(view.content, targetRange.startOffset),
+    end: positionAtOffset(view.content, targetRange.endOffset),
+  };
+}
+
 function mapInlineOffsetToSourceOffset({ inlineOffset, view }) {
   if (typeof inlineOffset !== "number") {
     return null;
@@ -295,5 +325,7 @@ module.exports = {
   INLINE_TYPESCRIPT_SCHEME,
   resolveInlineSourcePositionRange,
   resolveInlineSourceRange,
+  resolveInlineTargetPositionRange,
+  resolveInlineTargetRange,
   resolveInlineTypeScriptView,
 };

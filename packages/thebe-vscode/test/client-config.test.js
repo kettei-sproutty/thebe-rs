@@ -23,6 +23,7 @@ const {
   INLINE_TYPESCRIPT_SCHEME,
   resolveInlineSourcePositionRange,
   resolveInlineSourceRange,
+  resolveInlineTargetPositionRange,
   resolveInlineTypeScriptView,
 } = require("../inline-typescript");
 const {
@@ -441,6 +442,53 @@ test("inline typescript source positions preserve the route line and column", ()
     start: { line: 2, character: 9 },
     end: { line: 2, character: 18 },
   });
+});
+
+test("inline typescript target positions preserve the virtual document line and column", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<div />\n<script lang="ts">\nfunction increment() {}\n</script>\n`;
+  const view = resolveInlineTypeScriptView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    selectionStartOffset: 0,
+    selectionEndOffset: 0,
+    fileExists: () => false,
+  });
+  const sourceStart = source.indexOf("increment");
+  const sourceEnd = sourceStart + "increment".length;
+
+  const targetRange = resolveInlineTargetPositionRange({
+    view,
+    startOffset: sourceStart,
+    endOffset: sourceEnd,
+  });
+
+  assert.deepStrictEqual(targetRange, {
+    start: { line: 5, character: 9 },
+    end: { line: 5, character: 18 },
+  });
+});
+
+test("inline typescript target positions ignore offsets outside the script block", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<div />\n<script lang="ts">\nfunction increment() {}\n</script>\n`;
+  const view = resolveInlineTypeScriptView({
+    documentPath: path.join(workspacePath, "src", "routes", "counter.trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    selectionStartOffset: 0,
+    selectionEndOffset: 0,
+    fileExists: () => false,
+  });
+
+  const targetRange = resolveInlineTargetPositionRange({
+    view,
+    startOffset: 0,
+    endOffset: 4,
+  });
+
+  assert.strictEqual(targetRange, null);
 });
 
 test("inline rust source range maps snapshot offsets back into the route script", () => {

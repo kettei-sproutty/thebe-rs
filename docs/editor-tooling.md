@@ -13,7 +13,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
   - `.thebe/tsconfig.json` gives editors a self-contained TypeScript project without forcing a root `tsconfig.json`.
 - `.thebe/manifest.json` is currently version 6 and records route/layout/component metadata, generated paths, handler signatures, direct component dependencies, template bindings, exact field-level template symbol definitions, source spans, and route template symbols derived from `Props`.
 - `.thebe/diagnostics.json` is currently version 1 and records structured project and file diagnostics with relative paths and source spans.
-- `packages/thebe-vscode/` ships a packaged VS Code extension with `.trs` language registration, snippets, TextMate highlighting, automatic `thebe-lsp` startup, command palette plus editor title/context actions for opening a route's generated `.thebe/client/**` and `.thebe/types/**` mirrors beside the source `.trs` file while preserving matching locations when available, an `Open Inline TypeScript View` command that opens the current `<script lang="ts">` block as a stable provider-backed virtual TypeScript document with local definition/reference jumps back into the source route, `Props` type definition jumps into the generated `.thebe/types/**` mirror, and live refresh from source `.trs` edits, and an `Open Inline Rust View` command that opens the current `<script setup>` block as an untitled Rust snapshot with local definition/reference jumps back into the source route.
+- `packages/thebe-vscode/` ships a packaged VS Code extension with `.trs` language registration, snippets, TextMate highlighting, automatic `thebe-lsp` startup, command palette plus editor title/context actions for opening a route's generated `.thebe/client/**` and `.thebe/types/**` mirrors beside the source `.trs` file while preserving matching locations when available, an `Open Inline TypeScript View` command that opens the current `<script lang="ts">` block as a stable provider-backed virtual TypeScript document with local definition/reference jumps back into the source route, `Props` type definition jumps into the generated `.thebe/types/**` mirror, built-in TypeScript hover, live refresh from source `.trs` edits, and source-side TypeScript completions plus mapped errors/warnings back in the original `.trs` editor, and an `Open Inline Rust View` command that opens the current `<script setup>` block as an untitled Rust snapshot with local definition/reference jumps back into the source route.
 - `packages/tree-sitter-thebe/` ships an initial tree-sitter grammar for `.trs` block tags, nested generic component/html template elements, HTML comments, attributes, template bindings, and raw script/style injection points.
 
 ## Current LSP Features
@@ -50,7 +50,7 @@ The editor loop is not disk-only anymore.
 - `didChange` refreshes are debounced.
 - The LSP keeps last-good artifacts so hover, definition, and references can keep working during transient invalid edits.
 - Diagnostics publishing is coalesced so unchanged diagnostics are not republished on every refresh.
-- The extension package now has a lightweight extension-host harness that validates the generated client/types commands plus the inline TypeScript virtual document and inline Rust snapshot commands, including TypeScript live refresh and the source round-trips for both bridges, against a real VS Code instance.
+- The extension package now has a lightweight extension-host harness that validates the generated client/types commands plus the inline TypeScript virtual document and inline Rust snapshot commands, including TypeScript live refresh, built-in TypeScript hover on the virtual document, source-side TypeScript completions, mapped TypeScript diagnostics, and the source round-trips for both bridges, against a real VS Code instance.
 
 ## Remaining Gaps
 
@@ -77,7 +77,7 @@ If you open a route-oriented Thebe project in an editor today, the expected tool
 
 - compiler diagnostics work
 - generated TypeScript mirrors work
-- inline Rust snapshots and provider-backed inline TypeScript virtual documents work as explicit opt-in editor bridges
+- inline Rust snapshots and provider-backed inline TypeScript virtual documents work as explicit opt-in editor bridges, and the VS Code extension also projects TypeScript completions plus mapped errors/warnings back into `<script lang="ts">` blocks in the original `.trs` editor
 - route/layout navigation works
 - semantic highlighting, formatting, rename, hover, and code actions work for the currently supported Thebe surface
 - template, attribute, event, component, and named-slot completions work

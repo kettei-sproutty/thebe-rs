@@ -115,6 +115,80 @@ suite("Thebe extension commands", () => {
     assert.strictEqual(location.range.start.character, 9);
   });
 
+  test("inline typescript virtual document receives TypeScript hover", async () => {
+    await openFixtureRouteAt("count + 1");
+
+    await vscode.commands.executeCommand("thebe.openInlineTypeScriptView");
+
+    const editor = vscode.window.activeTextEditor;
+    assert.ok(editor);
+    const offset = editor.document.getText().indexOf("props.count") + "props.".length + 2;
+    const position = editor.document.positionAt(offset);
+    const hovers = await vscode.commands.executeCommand(
+      "vscode.executeHoverProvider",
+      editor.document.uri,
+      position,
+    );
+
+    const hoverText = hovers.flatMap((hover) => hover.contents).map(stringifyHoverContent).join("\n");
+    assert.match(hoverText, /count/i);
+    assert.match(hoverText, /bigint/i);
+  });
+
+  test("thebe source receives TypeScript completions inside script lang ts", async () => {
+    const editor = await openFixtureRouteAt("props.count");
+    const offset = editor.document.getText().indexOf("props.count") + "props.".length;
+    const position = editor.document.positionAt(offset);
+    const completions = await vscode.commands.executeCommand(
+      "vscode.executeCompletionItemProvider",
+      editor.document.uri,
+      position,
+      ".",
+    );
+
+    const labels = completions.items.map((item) => typeof item.label === "string" ? item.label : item.label.label);
+    assert.ok(labels.includes("count"));
+  });
+
+  test("thebe source receives mapped TypeScript diagnostics inside script lang ts", async () => {
+    const editor = await openFixtureRouteAt("props.count + 1");
+    const operatorDiagnostic = /Operator '\+' cannot be applied to types 'bigint' and '1'/i;
+    const invalidExpression = "props.count + 1";
+    const validExpression = "props.count + 1n";
+
+    await waitFor(() => {
+      const diagnostics = vscode.languages.getDiagnostics(editor.document.uri);
+      return diagnostics.some((diagnostic) => operatorDiagnostic.test(diagnostic.message));
+    });
+
+    let diagnostics = vscode.languages.getDiagnostics(editor.document.uri);
+    assert.ok(diagnostics.some((diagnostic) => operatorDiagnostic.test(diagnostic.message)));
+
+    await editor.edit((editBuilder) => {
+      const startOffset = editor.document.getText().indexOf(invalidExpression);
+      const start = editor.document.positionAt(startOffset);
+      const end = editor.document.positionAt(startOffset + invalidExpression.length);
+      editBuilder.replace(new vscode.Range(start, end), validExpression);
+    });
+
+    await waitFor(() => {
+      diagnostics = vscode.languages.getDiagnostics(editor.document.uri);
+      return diagnostics.every((diagnostic) => !operatorDiagnostic.test(diagnostic.message));
+    });
+
+    await editor.edit((editBuilder) => {
+      const startOffset = editor.document.getText().indexOf(validExpression);
+      const start = editor.document.positionAt(startOffset);
+      const end = editor.document.positionAt(startOffset + validExpression.length);
+      editBuilder.replace(new vscode.Range(start, end), invalidExpression);
+    });
+
+    await waitFor(() => {
+      diagnostics = vscode.languages.getDiagnostics(editor.document.uri);
+      return diagnostics.some((diagnostic) => operatorDiagnostic.test(diagnostic.message));
+    });
+  });
+
   test("inline typescript snapshot type definition returns generated props types", async () => {
     await openFixtureRouteAt("Props");
 
@@ -154,5 +228,17 @@ suite("Thebe extension commands", () => {
     }
 
     assert.fail("timed out waiting for inline snapshot update");
+  }
+
+  function stringifyHoverContent(content) {
+    if (typeof content === "string") {
+      return content;
+    }
+
+    if (content && typeof content.value === "string") {
+      return content.value;
+    }
+
+    return "";
   }
 });
