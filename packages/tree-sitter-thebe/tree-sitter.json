@@ -1,0 +1,34 @@
+{
+  "grammars": [
+    {
+      "name": "thebe",
+      "camelcase": "Thebe",
+      "scope": "text.html.thebe",
+      "path": ".",
+      "file-types": [
+        "trs"
+      ],
+      "highlights": "queries/highlights.scm",
+      "injections": "queries/injections.scm",
+      "external-files": [
+        "grammar.js",
+        "queries/highlights.scm",
+        "queries/injections.scm"
+      ]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Initial tree-sitter grammar for Thebe .trs files.",
+    "authors": [
+      {
+        "name": "Alessio Marchi",
+        "email": "alessio.marchi@proton.me"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/kettei-sproutty/thebe-rs"
+    }
+  }
+}

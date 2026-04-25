@@ -31,6 +31,12 @@
       "include": "#event-attribute"
     },
     {
+      "include": "#template-slot-attribute"
+    },
+    {
+      "include": "#slot-name-attribute"
+    },
+    {
       "include": "text.html.basic"
     }
   ],
@@ -158,6 +164,18 @@
     "event-attribute": {
       "match": "(?<=\\s)(on[A-Za-z]+)(?=\\s*=)",
       "name": "entity.name.function.event.thebe"
+    },
+    "template-slot-attribute": {
+      "match": "(<template\\b[^>]*\\s)(slot)(?=\\s*=)",
+      "captures": {
+        "2": { "name": "entity.other.attribute-name.slot.thebe" }
+      }
+    },
+    "slot-name-attribute": {
+      "match": "(<slot\\b[^>]*\\s)(name)(?=\\s*=)",
+      "captures": {
+        "2": { "name": "entity.other.attribute-name.slot.thebe" }
+      }
     }
   }
 }

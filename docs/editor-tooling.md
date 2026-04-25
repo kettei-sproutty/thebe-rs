@@ -14,7 +14,7 @@ Thebe already ships a compiler-backed editor integration layer, but the full lan
 - `.thebe/manifest.json` is currently version 6 and records route/layout/component metadata, generated paths, handler signatures, direct component dependencies, template bindings, exact field-level template symbol definitions, source spans, and route template symbols derived from `Props`.
 - `.thebe/diagnostics.json` is currently version 1 and records structured project and file diagnostics with relative paths and source spans.
 - `packages/thebe-vscode/` ships a packaged VS Code extension with `.trs` language registration, snippets, TextMate highlighting, and automatic `thebe-lsp` startup.
-- `packages/tree-sitter-thebe/` ships an initial tree-sitter grammar for `.trs` block structure and template bindings.
+- `packages/tree-sitter-thebe/` ships an initial tree-sitter grammar for `.trs` block tags, component/html tags, attributes, template bindings, and raw script/style injection points.
 
 ## Current LSP Features
 
@@ -54,7 +54,7 @@ The editor loop is not disk-only anymore.
 
 The editor story is broader now, but a few edges are still intentionally narrow:
 
-- The tree-sitter grammar is still initial and does not yet model full HTML-aware nesting or embedded Rust/TypeScript/CSS subgrammars.
+- The tree-sitter grammar is still initial and does not yet model full HTML-aware nesting or full embedded Rust/TypeScript/CSS subgrammars, even though it now exposes script/style raw-content injection queries.
 - Rename support is currently scoped to route handlers, route template symbols, component prop definitions/usages, component tag/import relationships across known `.trs` sources, and client event handlers rather than arbitrary Rust or TypeScript symbols.
 - Formatting now normalizes top-level `.trs` structure and uses best-effort block formatters for embedded Rust, TypeScript, and CSS, but it still does not provide full language-service formatting semantics inside those blocks.
 

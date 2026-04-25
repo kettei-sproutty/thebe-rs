@@ -1,0 +1,532 @@
+[
+  {
+    "type": "attribute",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "attribute_name",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "double_quoted_attribute_value",
+            "named": true
+          },
+          {
+            "type": "single_quoted_attribute_value",
+            "named": true
+          },
+          {
+            "type": "unquoted_attribute_value",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "binding_path",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "end_tag",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "component_tag_name",
+            "named": true
+          },
+          {
+            "type": "html_tag_name",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "lang_ts_attribute",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "attribute_name",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "double_quoted_attribute_value",
+            "named": true
+          },
+          {
+            "type": "single_quoted_attribute_value",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "raw_text",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "block_text",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "script_element",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "raw_text",
+          "named": true
+        },
+        {
+          "type": "script_end_tag",
+          "named": true
+        },
+        {
+          "type": "script_start_tag",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "script_end_tag",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "html_tag_name",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "script_setup_element",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "raw_text",
+          "named": true
+        },
+        {
+          "type": "script_end_tag",
+          "named": true
+        },
+        {
+          "type": "script_setup_start_tag",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "script_setup_start_tag",
+    "named": true,
+    "fields": {
+      "attribute": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "setup_attribute",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "html_tag_name",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "script_start_tag",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "html_tag_name",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "script_ts_element",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "raw_text",
+          "named": true
+        },
+        {
+          "type": "script_end_tag",
+          "named": true
+        },
+        {
+          "type": "script_ts_start_tag",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "script_ts_start_tag",
+    "named": true,
+    "fields": {
+      "attribute": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "lang_ts_attribute",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "html_tag_name",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "self_closing_tag",
+    "named": true,
+    "fields": {
+      "attribute": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "attribute",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "component_tag_name",
+            "named": true
+          },
+          {
+            "type": "html_tag_name",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "setup_attribute",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "attribute_name",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "source_file",
+    "named": true,
+    "root": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "end_tag",
+          "named": true
+        },
+        {
+          "type": "script_element",
+          "named": true
+        },
+        {
+          "type": "script_setup_element",
+          "named": true
+        },
+        {
+          "type": "script_ts_element",
+          "named": true
+        },
+        {
+          "type": "self_closing_tag",
+          "named": true
+        },
+        {
+          "type": "start_tag",
+          "named": true
+        },
+        {
+          "type": "style_element",
+          "named": true
+        },
+        {
+          "type": "template_binding",
+          "named": true
+        },
+        {
+          "type": "text",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "start_tag",
+    "named": true,
+    "fields": {
+      "attribute": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "attribute",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "component_tag_name",
+            "named": true
+          },
+          {
+            "type": "html_tag_name",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "style_element",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "raw_text",
+          "named": true
+        },
+        {
+          "type": "style_end_tag",
+          "named": true
+        },
+        {
+          "type": "style_start_tag",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "style_end_tag",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "html_tag_name",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "style_start_tag",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "html_tag_name",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "template_binding",
+    "named": true,
+    "fields": {
+      "path": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "binding_path",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": ".",
+    "named": false
+  },
+  {
+    "type": "/>",
+    "named": false
+  },
+  {
+    "type": "<",
+    "named": false
+  },
+  {
+    "type": "</",
+    "named": false
+  },
+  {
+    "type": "=",
+    "named": false
+  },
+  {
+    "type": ">",
+    "named": false
+  },
+  {
+    "type": "attribute_name",
+    "named": true
+  },
+  {
+    "type": "block_text",
+    "named": true
+  },
+  {
+    "type": "component_tag_name",
+    "named": true
+  },
+  {
+    "type": "double_quoted_attribute_value",
+    "named": true
+  },
+  {
+    "type": "html_tag_name",
+    "named": true
+  },
+  {
+    "type": "identifier",
+    "named": true
+  },
+  {
+    "type": "single_quoted_attribute_value",
+    "named": true
+  },
+  {
+    "type": "text",
+    "named": true
+  },
+  {
+    "type": "unquoted_attribute_value",
+    "named": true
+  },
+  {
+    "type": "{{",
+    "named": false
+  },
+  {
+    "type": "}}",
+    "named": false
+  }
+]

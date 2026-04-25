@@ -3,8 +3,8 @@
 This package wires Thebe `.trs` files into VS Code with:
 
 - `.trs` language registration
-- TextMate highlighting for Thebe block tags, template bindings, directives, and component tags
-- snippet contributions for routes, components, and common blocks
+- TextMate highlighting for Thebe block tags, template bindings, directives, events, component tags, and named-slot attributes
+- snippet contributions for routes, components, named slots, and common blocks
 - automatic `thebe-lsp` startup
 
 ## Local Development
