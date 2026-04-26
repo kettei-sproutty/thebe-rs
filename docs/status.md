@@ -16,7 +16,7 @@ This page tracks what is actually implemented in the repository today versus wha
 - `<head>` support in routes and layouts.
 - Fine-grained hydration markers for reactive template bindings.
 - Template attribute support for dynamic `:class` and generic `:attr` bindings.
-- Client `getProps<Props>()` bridge with `ts-rs`-generated types for client routes.
+- Client `getProps<Props>()` bridge with generated route types for client routes; project refresh now writes `.thebe/types/**` deterministically from local Rust analysis, and generated routes still keep a `ts-rs` runtime fallback.
 - Event-handler discovery and client runtime wiring for `on*` attributes.
 - Generated `.thebe/` workspace artifacts through `crates/thebe-project`.
 - Production route JS/CSS extraction into hashed `/.thebe/assets/*` assets served by generated route helpers.

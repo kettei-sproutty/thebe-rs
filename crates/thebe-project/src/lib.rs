@@ -441,6 +441,18 @@ pub fn generate_project_with_overlay(
     }
 
     if let Some(types_export_path) = &route.types_export_path {
+      let script_setup = route
+        .blocks
+        .script_setup
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("client route is missing `<script setup>`"))?;
+      write_typescript_props_export(project_root, types_export_path, script_setup).with_context(|| {
+        format!(
+          "failed to write props type export for {}",
+          route.trs_path.display()
+        )
+      })?;
+
       let client_ts = route
         .blocks
         .script_ts
@@ -1537,6 +1549,26 @@ fn write_typecheck_mirror(
   Ok(())
 }
 
+fn write_typescript_props_export(
+  project_root: &Path,
+  types_export_path: &str,
+  script_setup: &str,
+) -> anyhow::Result<()> {
+  let export_path = project_root.join(TYPECHECK_TYPES_DIR).join(types_export_path);
+  let contents = thebe_codegen::props_typescript_source(script_setup)
+    .context("failed to build props type bridge source")?;
+
+  if let Some(parent) = export_path.parent() {
+    std::fs::create_dir_all(parent)
+      .with_context(|| format!("failed to create {}", parent.display()))?;
+  }
+
+  std::fs::write(&export_path, contents)
+    .with_context(|| format!("failed to write {}", export_path.display()))?;
+
+  Ok(())
+}
+
 fn mirror_props_import_path(types_export_path: &Path) -> String {
   let depth = types_export_path
     .parent()
@@ -2405,8 +2437,8 @@ fn handler() -> Props {
   }
 
   #[test]
-  fn refresh_project_for_editor_with_overlay_preserves_existing_type_exports() {
-    let project = TestProject::new("overlay-preserve-type-exports");
+  fn refresh_project_for_editor_with_overlay_regenerates_type_exports() {
+    let project = TestProject::new("overlay-regenerate-type-exports");
     project.write("Cargo.toml", &fixture_cargo_toml(true));
     project.write(
       "src/routes/index.trs",
@@ -2435,8 +2467,7 @@ console.log(props.title);
     let types_path = project.path().join(TYPECHECK_TYPES_DIR).join("routes/index.ts");
     fs::create_dir_all(types_path.parent().expect("types path should have a parent"))
       .expect("types directory should create");
-    let existing_types = "type Props = {\n  title: string;\n};\n\nexport default Props;\n";
-    fs::write(&types_path, existing_types).expect("existing type export should write");
+    fs::write(&types_path, "stale").expect("stale type export should write");
 
     let mut overlay = ProjectOverlay::new();
     overlay.insert(
@@ -2444,12 +2475,14 @@ console.log(props.title);
       r#"<script setup>
 struct Props {
   title: String,
+  count: i64,
 }
 
 #[thebe::get]
 fn handler() -> Props {
   Props {
     title: String::from("After"),
+    count: 1,
   }
 }
 </script>
@@ -2468,10 +2501,64 @@ console.log(props.title);
       .expect("overlay refresh should succeed");
 
     assert!(matches!(refresh, EditorRefresh::Generated(_)));
-    assert_eq!(
-      fs::read_to_string(&types_path).expect("type export should remain after refresh"),
-      existing_types
+    let generated_types =
+      fs::read_to_string(&types_path).expect("type export should be regenerated after refresh");
+    assert!(generated_types.contains("export type Props = {"));
+    assert!(generated_types.contains("title: string;"));
+    assert!(generated_types.contains("count: number;"));
+    assert!(!generated_types.contains("stale"));
+  }
+
+  #[test]
+  fn generate_project_with_overlay_writes_type_exports_for_client_routes() {
+    let project = TestProject::new("overlay-generated-type-exports");
+    project.write("Cargo.toml", &fixture_cargo_toml(true));
+
+    let mut overlay = ProjectOverlay::new();
+    overlay.insert(
+      project.path().join("src/routes/index.trs"),
+      r#"<script setup>
+struct Props {
+  title: String,
+  profile: Profile,
+}
+
+struct Profile {
+  handle: String,
+}
+
+#[thebe::get]
+fn handler() -> Props {
+  Props {
+    title: String::from("Overlay"),
+    profile: Profile {
+      handle: String::from("thebe"),
+    },
+  }
+}
+</script>
+
+<script lang="ts">
+let props = getProps<Props>();
+console.log(props.profile.handle);
+</script>
+
+<main>{{ title }}</main>
+"#
+      .to_owned(),
     );
+
+    generate_project_with_overlay(project.path(), &overlay, BuildMode::Dev)
+      .expect("overlay generation should succeed");
+
+    let generated_types = fs::read_to_string(
+      project.path().join(TYPECHECK_TYPES_DIR).join("routes/index.ts"),
+    )
+    .expect("generated props type export should exist");
+    assert!(generated_types.contains("export type Props = {"));
+    assert!(generated_types.contains("profile: Profile;"));
+    assert!(generated_types.contains("type Profile = {"));
+    assert!(generated_types.contains("handle: string;"));
   }
 
   #[test]

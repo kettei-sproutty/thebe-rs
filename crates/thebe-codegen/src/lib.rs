@@ -7,6 +7,7 @@ pub use generator::{
   ComponentMacro, DevRouteArtifact, RouteEntry, RouteHandlerInfo, TemplateSymbolDefinition,
   default_app_html, dev_route_artifact_path, generate_component, generate_route,
   generate_routes_file, props_symbol_definitions,
+  props_typescript_source,
   route_handler_info, route_state_type, route_template_symbol_definitions, route_template_symbols,
   validate_app_html,
 };
