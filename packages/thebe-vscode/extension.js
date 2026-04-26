@@ -24,6 +24,7 @@ const {
 const {
   INLINE_RUST_COMMAND_ID,
   resolveInlineRustSourcePositionRange,
+  resolveInlineRustHandlerHover,
   resolveInlineRustView,
 } = require("./inline-rust");
 
@@ -32,6 +33,7 @@ const inlineRustSnapshots = new Map();
 const inlineTypeScriptSnapshots = new Map();
 const inlineTypeScriptSnapshotSourcePaths = new Map();
 const inlineTypeScriptSnapshotChanges = new vscode.EventEmitter();
+const inlineRustDiagnostics = vscode.languages.createDiagnosticCollection("thebe-inline-rust");
 const inlineTypeScriptDiagnostics = vscode.languages.createDiagnosticCollection("thebe-inline-typescript");
 const inlineTypeScriptDiagnosticRefreshes = new Map();
 const INLINE_RUST_SELECTOR = [{ language: "rust", scheme: "untitled" }];
@@ -45,6 +47,7 @@ const INLINE_TYPESCRIPT_DIAGNOSTIC_COMMANDS = [
   "semanticDiagnosticsSync",
   "suggestionDiagnosticsSync",
 ];
+const INLINE_RUST_HOVER_LSP_COMMAND_ID = "thebe.inlineRustHover";
 const INLINE_RUST_VIEW_LSP_COMMAND_ID = "thebe.inlineRustView";
 const INLINE_TYPESCRIPT_VIEW_LSP_COMMAND_ID = "thebe.inlineTypeScriptView";
 const INLINE_TYPESCRIPT_MAP_PROTOCOL_DIAGNOSTICS_LSP_COMMAND_ID = "thebe.mapInlineTypeScriptProtocolDiagnostics";
@@ -119,12 +122,19 @@ async function activate(context) {
   const subscriptions = [
     client.start(),
     inlineTypeScriptSnapshotChanges,
+    inlineRustDiagnostics,
     vscode.workspace.registerTextDocumentContentProvider(INLINE_TYPESCRIPT_SCHEME, {
       onDidChange: inlineTypeScriptSnapshotChanges.event,
       provideTextDocumentContent: provideInlineTypeScriptContent,
     }),
+    vscode.languages.onDidChangeDiagnostics((event) => {
+      updateInlineRustDiagnostics(event.uris);
+    }),
     vscode.languages.registerDefinitionProvider(INLINE_RUST_SELECTOR, {
       provideDefinition: provideInlineRustDefinition,
+    }),
+    vscode.languages.registerHoverProvider(INLINE_RUST_SELECTOR, {
+      provideHover: provideInlineRustHover,
     }),
     vscode.languages.registerReferenceProvider(INLINE_RUST_SELECTOR, {
       provideReferences: provideInlineRustReferences,
@@ -152,7 +162,7 @@ async function activate(context) {
       }
     }),
     vscode.workspace.onDidCloseTextDocument((document) => {
-      inlineRustSnapshots.delete(document.uri.toString());
+      deleteInlineRustSnapshot(document.uri);
       if (document.languageId === "thebe" && document.uri.scheme === "file") {
         clearInlineTypeScriptDiagnosticRefresh(document.uri.fsPath);
         clearInlineTypeScriptSnapshotForSourcePath(document.uri.fsPath);
@@ -1122,6 +1132,123 @@ function deleteInlineTypeScriptSnapshot(documentUri) {
   }
 }
 
+function deleteInlineRustSnapshot(documentUri) {
+  if (!documentUri) {
+    return;
+  }
+
+  const snapshot = inlineRustSnapshots.get(documentUri.toString());
+  inlineRustSnapshots.delete(documentUri.toString());
+  if (!snapshot) {
+    return;
+  }
+
+  refreshInlineRustDiagnosticsForSourcePath(snapshot.sourcePath);
+}
+
+function updateInlineRustDiagnostics(uris) {
+  const sourcePaths = new Set();
+  for (const uri of uris) {
+    if (!uri) {
+      continue;
+    }
+
+    const snapshot = inlineRustSnapshots.get(uri.toString());
+    if (snapshot) {
+      sourcePaths.add(snapshot.sourcePath);
+    }
+  }
+
+  for (const sourcePath of sourcePaths) {
+    refreshInlineRustDiagnosticsForSourcePath(sourcePath);
+  }
+}
+
+function refreshInlineRustDiagnosticsForSourcePath(sourcePath) {
+  const mappedDiagnostics = [];
+  for (const [uriString, snapshot] of inlineRustSnapshots.entries()) {
+    if (snapshot.sourcePath !== sourcePath) {
+      continue;
+    }
+
+    const virtualDocument = vscode.workspace.textDocuments.find(
+      (document) => document.uri.toString() === uriString,
+    );
+    if (!virtualDocument || virtualDocument.getText() !== snapshot.content) {
+      continue;
+    }
+
+    mappedDiagnostics.push(
+      ...vscode.languages.getDiagnostics(virtualDocument.uri)
+        .map((diagnostic) => mapInlineRustDiagnostic(diagnostic, snapshot, virtualDocument))
+        .filter(Boolean),
+    );
+  }
+
+  if (mappedDiagnostics.length === 0) {
+    inlineRustDiagnostics.delete(vscode.Uri.file(sourcePath));
+    return;
+  }
+
+  inlineRustDiagnostics.set(
+    vscode.Uri.file(sourcePath),
+    dedupeInlineRustDiagnostics(mappedDiagnostics),
+  );
+}
+
+function mapInlineRustDiagnostic(diagnostic, snapshot, virtualDocument) {
+  const range = mapInlineRustVirtualRange(diagnostic.range, snapshot, virtualDocument);
+  if (!range) {
+    return null;
+  }
+
+  const mapped = new vscode.Diagnostic(range, diagnostic.message, diagnostic.severity);
+  mapped.source = diagnostic.source;
+  mapped.code = diagnostic.code;
+  mapped.tags = diagnostic.tags;
+  return mapped;
+}
+
+function mapInlineRustVirtualRange(range, snapshot, virtualDocument) {
+  if (!range) {
+    return null;
+  }
+
+  const sourceRange = resolveInlineRustSourcePositionRange({
+    view: snapshot,
+    startOffset: virtualDocument.offsetAt(range.start),
+    endOffset: virtualDocument.offsetAt(range.end),
+  });
+  if (!sourceRange) {
+    return null;
+  }
+
+  return new vscode.Range(
+    new vscode.Position(sourceRange.start.line, sourceRange.start.character),
+    new vscode.Position(sourceRange.end.line, sourceRange.end.character),
+  );
+}
+
+function dedupeInlineRustDiagnostics(diagnostics) {
+  const seen = new Set();
+  return diagnostics.filter((diagnostic) => {
+    const key = [
+      diagnostic.code ?? "",
+      diagnostic.message,
+      diagnostic.range.start.line,
+      diagnostic.range.start.character,
+      diagnostic.range.end.line,
+      diagnostic.range.end.character,
+    ].join(":");
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
 function provideInlineRustDefinition(document, position) {
   const snapshot = inlineRustSnapshots.get(document.uri.toString());
   if (!snapshot || document.getText() !== snapshot.content) {
@@ -1140,6 +1267,168 @@ function provideInlineRustReferences(document, position) {
 
   const sourceLocation = resolveInlineRustSourceLocation(document, position, snapshot);
   return sourceLocation ? [sourceLocation] : undefined;
+}
+
+async function provideInlineRustHover(document, position) {
+  const snapshot = inlineRustSnapshots.get(document.uri.toString());
+  if (!snapshot || document.getText() !== snapshot.content) {
+    return undefined;
+  }
+
+  const sourceLocation = resolveInlineRustSourceLocation(document, position, snapshot);
+  if (!sourceLocation) {
+    return undefined;
+  }
+
+  try {
+    const sourceDocument = await vscode.workspace.openTextDocument(sourceLocation.uri);
+    const hover = await requestInlineRustHoverFromServer({
+      sourceDocument,
+      position: sourceLocation.range.start,
+    });
+    const lspHover = normalizeInlineRustLspHover(hover, snapshot, sourceDocument, document, position);
+    if (lspHover) {
+      return lspHover;
+    }
+
+    return createInlineRustFallbackHover({
+      sourceDocument,
+      sourceLocation,
+      snapshot,
+      virtualDocument: document,
+      fallbackPosition: position,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+async function requestInlineRustHoverFromServer({ sourceDocument, position }) {
+  if (!client || !sourceDocument || !position) {
+    return null;
+  }
+
+  try {
+    await client.onReady();
+    return await client.sendRequest("workspace/executeCommand", {
+      command: INLINE_RUST_HOVER_LSP_COMMAND_ID,
+      arguments: [{
+        uri: sourceDocument.uri.toString(),
+        source: sourceDocument.getText(),
+        position: {
+          line: position.line,
+          character: position.character,
+        },
+      }],
+    });
+  } catch {
+    return null;
+  }
+}
+
+function normalizeInlineRustLspHover(hover, snapshot, sourceDocument, virtualDocument, fallbackPosition) {
+  if (!hover || typeof hover !== "object") {
+    return undefined;
+  }
+
+  const contents = normalizeInlineRustLspHoverContents(hover.contents);
+  if (contents.length === 0) {
+    return undefined;
+  }
+
+  let mappedRange;
+  if (hover.range && hover.range.start && hover.range.end) {
+    mappedRange = mapInlineRustSourceHoverRange(
+      new vscode.Range(
+        new vscode.Position(hover.range.start.line, hover.range.start.character),
+        new vscode.Position(hover.range.end.line, hover.range.end.character),
+      ),
+      snapshot,
+      sourceDocument,
+      virtualDocument,
+    );
+  }
+
+  return new vscode.Hover(
+    contents,
+    mappedRange ?? virtualDocument.getWordRangeAtPosition(fallbackPosition) ?? new vscode.Range(fallbackPosition, fallbackPosition),
+  );
+}
+
+function normalizeInlineRustLspHoverContents(contents) {
+  if (!contents) {
+    return [];
+  }
+
+  if (typeof contents === "string") {
+    return [contents];
+  }
+
+  if (Array.isArray(contents)) {
+    return contents.flatMap((entry) => normalizeInlineRustLspHoverContents(entry));
+  }
+
+  if (typeof contents.value === "string") {
+    if (contents.kind === "markdown") {
+      return [new vscode.MarkdownString(contents.value)];
+    }
+    if (typeof contents.language === "string" && contents.language.length > 0) {
+      return [new vscode.MarkdownString(`\`\`\`${contents.language}\n${contents.value}\n\`\`\``)];
+    }
+    return [contents.value];
+  }
+
+  return [];
+}
+
+function mapInlineRustSourceHoverRange(range, snapshot, sourceDocument, virtualDocument) {
+  if (!range) {
+    return undefined;
+  }
+
+  const startOffset = sourceDocument.offsetAt(range.start);
+  const endOffset = sourceDocument.offsetAt(range.end);
+  const virtualStartOffset = Math.min(
+    Math.max(startOffset, snapshot.scriptStartOffset),
+    snapshot.scriptEndOffset,
+  ) - snapshot.scriptStartOffset + snapshot.prefixLength;
+  const virtualEndOffset = Math.min(
+    Math.max(endOffset, snapshot.scriptStartOffset),
+    snapshot.scriptEndOffset,
+  ) - snapshot.scriptStartOffset + snapshot.prefixLength;
+
+  return new vscode.Range(
+    virtualDocument.positionAt(virtualStartOffset),
+    virtualDocument.positionAt(virtualEndOffset),
+  );
+}
+
+function createInlineRustFallbackHover({
+  sourceDocument,
+  sourceLocation,
+  snapshot,
+  virtualDocument,
+  fallbackPosition,
+}) {
+  const hover = resolveInlineRustHandlerHover({
+    documentPath: sourceDocument.uri.fsPath,
+    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+    source: sourceDocument.getText(),
+    sourceOffset: sourceDocument.offsetAt(sourceLocation.range.start),
+  });
+  if (!hover) {
+    return undefined;
+  }
+
+  const sourceRange = new vscode.Range(
+    sourceDocument.positionAt(hover.startOffset),
+    sourceDocument.positionAt(hover.endOffset),
+  );
+  const mappedRange = mapInlineRustSourceHoverRange(sourceRange, snapshot, sourceDocument, virtualDocument);
+  return new vscode.Hover(
+    [new vscode.MarkdownString(hover.contents)],
+    mappedRange ?? virtualDocument.getWordRangeAtPosition(fallbackPosition) ?? new vscode.Range(fallbackPosition, fallbackPosition),
+  );
 }
 
 function provideInlineTypeScriptDefinition(document, position) {

@@ -94,6 +94,75 @@ suite("Thebe extension commands", () => {
     assert.strictEqual(location.range.start.character, 3);
   });
 
+  test("inline rust snapshot hover returns source-backed route hover", async () => {
+    await openFixtureRouteAt("handler");
+
+    await vscode.commands.executeCommand("thebe.openInlineRustView");
+
+    const editor = vscode.window.activeTextEditor;
+    assert.ok(editor);
+    const offset = editor.document.getText().indexOf("handler") + 2;
+    const position = editor.document.positionAt(offset);
+    const hovers = await vscode.commands.executeCommand(
+      "vscode.executeHoverProvider",
+      editor.document.uri,
+      position,
+    );
+
+    const hoverText = hovers.flatMap((hover) => hover.contents).map(stringifyHoverContent).join("\n");
+    assert.match(hoverText, /GET \//i);
+    assert.match(hoverText, /Handler `handler`/i);
+  });
+
+  test("thebe source receives mapped inline Rust diagnostics", async () => {
+    await openFixtureRouteAt("handler");
+
+    await vscode.commands.executeCommand("thebe.openInlineRustView");
+
+    const rustEditor = vscode.window.activeTextEditor;
+    assert.ok(rustEditor);
+    const diagnosticSource = "thebe-inline-rust-test";
+    const message = "Injected inline Rust diagnostic";
+    const sourceOffset = routeUri.fsPath && (await vscode.workspace.openTextDocument(routeUri)).getText().indexOf("Props { count: 0 }");
+    const expectedSourceDocument = await vscode.workspace.openTextDocument(routeUri);
+    const expectedStart = expectedSourceDocument.positionAt(sourceOffset + 2);
+    const expectedEnd = expectedSourceDocument.positionAt(sourceOffset + 7);
+    const rustOffset = rustEditor.document.getText().indexOf("Props { count: 0 }");
+    const rustStart = rustEditor.document.positionAt(rustOffset + 2);
+    const rustEnd = rustEditor.document.positionAt(rustOffset + 7);
+    const collection = vscode.languages.createDiagnosticCollection(diagnosticSource);
+
+    try {
+      collection.set(rustEditor.document.uri, [
+        new vscode.Diagnostic(
+          new vscode.Range(rustStart, rustEnd),
+          message,
+          vscode.DiagnosticSeverity.Error,
+        ),
+      ]);
+
+      await waitFor(() => {
+        const diagnostics = vscode.languages.getDiagnostics(routeUri);
+        return diagnostics.some((diagnostic) => diagnostic.message === message);
+      });
+
+      const diagnostics = vscode.languages.getDiagnostics(routeUri);
+      const diagnostic = diagnostics.find((entry) => entry.message === message);
+      assert.ok(diagnostic);
+      assert.strictEqual(diagnostic.range.start.line, expectedStart.line);
+      assert.strictEqual(diagnostic.range.start.character, expectedStart.character);
+      assert.strictEqual(diagnostic.range.end.line, expectedEnd.line);
+      assert.strictEqual(diagnostic.range.end.character, expectedEnd.character);
+    } finally {
+      collection.clear();
+      collection.dispose();
+      await waitFor(() => {
+        const diagnostics = vscode.languages.getDiagnostics(routeUri);
+        return diagnostics.every((diagnostic) => diagnostic.message !== message);
+      });
+    }
+  });
+
   test("inline typescript snapshot definition returns the source route", async () => {
     await openFixtureRouteAt("increment");
 

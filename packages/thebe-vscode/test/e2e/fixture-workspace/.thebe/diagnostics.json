@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "diagnostics": [
+    {
+      "kind": "file",
+      "severity": "error",
+      "category": "project",
+      "code": "missing-ts-rs",
+      "message": "typed `<script lang=\"ts\">` routes require `ts-rs = \"12\"` under `[dependencies]`",
+      "filePath": "Cargo.toml",
+      "sourceSpan": {
+        "startByte": 0,
+        "endByte": 77,
+        "startLine": 1,
+        "startColumn": 1,
+        "endLine": 6,
+        "endColumn": 15
+      }
+    }
+  ]
+}

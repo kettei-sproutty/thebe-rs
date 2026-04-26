@@ -41,6 +41,7 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{Client, LanguageServer};
 
 const CHANGE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
+const INLINE_RUST_HOVER_COMMAND: &str = "thebe.inlineRustHover";
 const INLINE_RUST_VIEW_COMMAND: &str = "thebe.inlineRustView";
 const INLINE_TYPESCRIPT_VIEW_COMMAND: &str = "thebe.inlineTypeScriptView";
 const INLINE_TYPESCRIPT_MAP_PROTOCOL_DIAGNOSTICS_COMMAND: &str =
@@ -703,6 +704,7 @@ impl LanguageServer for Backend {
         document_formatting_provider: Some(OneOf::Left(true)),
         execute_command_provider: Some(ExecuteCommandOptions {
           commands: vec![
+            INLINE_RUST_HOVER_COMMAND.to_owned(),
             INLINE_RUST_VIEW_COMMAND.to_owned(),
             INLINE_TYPESCRIPT_VIEW_COMMAND.to_owned(),
             INLINE_TYPESCRIPT_MAP_PROTOCOL_DIAGNOSTICS_COMMAND.to_owned(),
@@ -761,6 +763,28 @@ impl LanguageServer for Backend {
 
   async fn execute_command(&self, params: ExecuteCommandParams) -> LspResult<Option<Value>> {
     match params.command.as_str() {
+      INLINE_RUST_HOVER_COMMAND => {
+        let command_arguments = parse_inline_hover_command_arguments(&params.arguments)?;
+        let Some(document) = self.document_context_with_source(
+          &command_arguments.uri,
+          command_arguments.source,
+        ) else {
+          return Ok(Some(Value::Null));
+        };
+        let Some(artifacts) = document.cached_artifacts.as_ref() else {
+          return Ok(Some(Value::Null));
+        };
+
+        Ok(Some(
+          serde_json::to_value(hover_for_document(
+            &document.source,
+            &artifacts.manifest,
+            &document.relative_path,
+            command_arguments.position,
+          ))
+          .unwrap_or(Value::Null),
+        ))
+      }
       INLINE_RUST_VIEW_COMMAND => {
         let command_arguments = parse_inline_view_command_arguments(&params.arguments)?;
         let Some(document) = self.document_context_with_source(
@@ -2508,6 +2532,64 @@ fn parse_inline_view_command_arguments(
   })
 }
 
+fn parse_inline_hover_command_arguments(
+  arguments: &[Value],
+) -> std::result::Result<InlineHoverCommandArguments, tower_lsp::jsonrpc::Error> {
+  let Some(params) = arguments.first().and_then(Value::as_object) else {
+    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+      "expected inline hover arguments",
+    ));
+  };
+
+  let Some(uri_value) = params.get("uri").and_then(Value::as_str) else {
+    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+      "expected inline hover uri",
+    ));
+  };
+  let uri = Url::parse(uri_value)
+    .map_err(|_| tower_lsp::jsonrpc::Error::invalid_params("invalid inline hover uri"))?;
+
+  let Some(position_value) = params.get("position" ).and_then(Value::as_object) else {
+    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+      "expected inline hover position",
+    ));
+  };
+  let Some(line) = position_value
+    .get("line")
+    .and_then(Value::as_u64)
+    .and_then(|value| u32::try_from(value).ok())
+  else {
+    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+      "expected inline hover position line",
+    ));
+  };
+  let Some(character) = position_value
+    .get("character")
+    .and_then(Value::as_u64)
+    .and_then(|value| u32::try_from(value).ok())
+  else {
+    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+      "expected inline hover position character",
+    ));
+  };
+
+  let source = match params.get("source") {
+    Some(Value::String(source)) => Some(source.clone()),
+    Some(_) => {
+      return Err(tower_lsp::jsonrpc::Error::invalid_params(
+        "expected inline hover source",
+      ));
+    }
+    None => None,
+  };
+
+  Ok(InlineHoverCommandArguments {
+    uri,
+    position: Position::new(line, character),
+    source,
+  })
+}
+
 fn parse_inline_typescript_protocol_diagnostics_command_arguments(
   arguments: &[Value],
 ) -> std::result::Result<InlineTypeScriptProtocolDiagnosticsCommandArguments, tower_lsp::jsonrpc::Error> {
@@ -3215,6 +3297,13 @@ struct InlineViewCommandArguments {
   uri: Url,
   selection_start_offset: usize,
   selection_end_offset: usize,
+  source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InlineHoverCommandArguments {
+  uri: Url,
+  position: Position,
   source: Option<String>,
 }
 

@@ -29,6 +29,7 @@ const {
 const {
   INLINE_RUST_COMMAND_ID,
   resolveGeneratedServerMirrorPath,
+  resolveInlineRustHandlerHover,
   resolveInlineRustSourcePositionRange,
   resolveInlineRustSourceRange,
   resolveInlineRustView,
@@ -394,6 +395,27 @@ test("inline rust view normalizes dynamic route paths inside the wrapper", () =>
 
   assert.ok(view.ok);
   assert.match(view.content, /const __ROUTE_PATH: &str = "\/blog\/\{slug\}";/);
+});
+
+test("inline rust hover fallback resolves route handler metadata", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<script setup>\n#[thebe::post]\nasync fn handler(state: State<AppState>, Path(slug): Path<String>) -> Props {\n  Props {}\n}\n</script>\n`;
+
+  const hover = resolveInlineRustHandlerHover({
+    documentPath: path.join(workspacePath, "src", "routes", "blog", "[slug].trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    sourceOffset: source.indexOf("handler") + 2,
+  });
+
+  assert.ok(hover);
+  assert.match(hover.contents, /\*\*POST \/blog\/\{slug\}\*\*/);
+  assert.match(hover.contents, /Handler `handler`/);
+  assert.match(hover.contents, /- Async: yes/);
+  assert.match(hover.contents, /- Params: Path<String>/);
+  assert.match(hover.contents, /- State: AppState/);
+  assert.strictEqual(hover.startOffset, source.indexOf("handler"));
+  assert.strictEqual(hover.endOffset, source.indexOf("handler") + "handler".length);
 });
 
 test("inline typescript view falls back to unknown props without generated types", () => {

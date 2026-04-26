@@ -198,6 +198,45 @@ function resolveInlineRustSourcePositionRange({ view, startOffset, endOffset }) 
   };
 }
 
+function resolveInlineRustHandlerHover({
+  documentPath,
+  workspaceFolders,
+  source,
+  sourceOffset,
+}) {
+  if (typeof sourceOffset !== "number") {
+    return null;
+  }
+
+  const routeEntry = resolveRouteSourceEntry({ documentPath, workspaceFolders });
+  if (!routeEntry) {
+    return null;
+  }
+
+  const scriptBlock = findRustSetupBlock(source);
+  if (!scriptBlock) {
+    return null;
+  }
+
+  if (sourceOffset < scriptBlock.start || sourceOffset > scriptBlock.end) {
+    return null;
+  }
+
+  const handler = findRustRouteHandlerAtOffset(scriptBlock.content, sourceOffset - scriptBlock.start);
+  if (!handler) {
+    return null;
+  }
+
+  const routePath = resolveRoutePathPattern({ documentPath, workspaceFolders });
+  const params = handler.paramTypes.length === 0 ? "none" : handler.paramTypes.join(", ");
+  const state = handler.stateType ?? "none";
+  return {
+    contents: `**${handler.method} ${routePath}**\n\nHandler \`${handler.name}\`\n\n- Async: ${handler.isAsync ? "yes" : "no"}\n- Params: ${params}\n- State: ${state}`,
+    startOffset: scriptBlock.start + handler.nameStartOffset,
+    endOffset: scriptBlock.start + handler.nameEndOffset,
+  };
+}
+
 function positionAtOffset(source, offset) {
   const targetOffset = Math.min(Math.max(offset, 0), source.length);
   let line = 0;
@@ -224,6 +263,222 @@ function positionAtOffset(source, offset) {
   }
 
   return { line, character };
+}
+
+function findRustRouteHandlerAtOffset(scriptSource, offset) {
+  const handlerPattern = /((?:^\s*#\[[^\r\n]+\]\s*$\r?\n?)*)^\s*(?:pub\s+)?(?:(async)\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/gm;
+  let match;
+  while ((match = handlerPattern.exec(scriptSource)) !== null) {
+    const attributeMatch = match[1].match(/#\[\s*thebe::([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^\]\r\n]*\))?\s*\]/m);
+    if (!attributeMatch) {
+      continue;
+    }
+
+    const openParenOffset = handlerPattern.lastIndex - 1;
+    const closeParenOffset = findMatchingDelimiter(scriptSource, openParenOffset, "(", ")");
+    if (closeParenOffset === -1) {
+      continue;
+    }
+
+    const fnTokenOffset = match[0].lastIndexOf("fn");
+    const nameOffsetInMatch = match[0].indexOf(match[3], fnTokenOffset);
+    if (nameOffsetInMatch === -1) {
+      continue;
+    }
+
+    const nameStartOffset = match.index + nameOffsetInMatch;
+    const nameEndOffset = nameStartOffset + match[3].length;
+    if (offset < nameStartOffset || offset > nameEndOffset) {
+      continue;
+    }
+
+    const paramsSource = scriptSource.slice(openParenOffset + 1, closeParenOffset);
+    const { paramTypes, stateType } = parseHandlerParameterTypes(paramsSource);
+    return {
+      method: attributeMatch[1].toUpperCase(),
+      isAsync: Boolean(match[2]),
+      name: match[3],
+      nameStartOffset,
+      nameEndOffset,
+      paramTypes,
+      stateType,
+    };
+  }
+
+  return null;
+}
+
+function parseHandlerParameterTypes(paramsSource) {
+  const paramTypes = [];
+  let stateType = null;
+
+  for (const segment of splitTopLevelSegments(paramsSource, ",")) {
+    const trimmed = collapseWhitespace(segment);
+    if (trimmed.length === 0) {
+      continue;
+    }
+
+    const colonOffset = findTopLevelDelimiterIndex(trimmed, ":");
+    const typeText = collapseWhitespace(colonOffset === -1 ? trimmed : trimmed.slice(colonOffset + 1));
+    if (typeText.length === 0) {
+      continue;
+    }
+
+    const extractedStateType = extractStateType(typeText);
+    if (extractedStateType && !stateType) {
+      stateType = collapseWhitespace(extractedStateType);
+      continue;
+    }
+
+    paramTypes.push(typeText);
+  }
+
+  return {
+    paramTypes,
+    stateType,
+  };
+}
+
+function splitTopLevelSegments(source, delimiter) {
+  const segments = [];
+  let segmentStart = 0;
+  let angleDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "<") {
+      angleDepth += 1;
+      continue;
+    }
+    if (char === ">") {
+      angleDepth = Math.max(0, angleDepth - 1);
+      continue;
+    }
+    if (char === "(") {
+      parenDepth += 1;
+      continue;
+    }
+    if (char === ")") {
+      parenDepth = Math.max(0, parenDepth - 1);
+      continue;
+    }
+    if (char === "[") {
+      bracketDepth += 1;
+      continue;
+    }
+    if (char === "]") {
+      bracketDepth = Math.max(0, bracketDepth - 1);
+      continue;
+    }
+    if (char === "{") {
+      braceDepth += 1;
+      continue;
+    }
+    if (char === "}") {
+      braceDepth = Math.max(0, braceDepth - 1);
+      continue;
+    }
+
+    if (
+      char === delimiter
+      && angleDepth === 0
+      && parenDepth === 0
+      && bracketDepth === 0
+      && braceDepth === 0
+    ) {
+      segments.push(source.slice(segmentStart, index));
+      segmentStart = index + 1;
+    }
+  }
+
+  segments.push(source.slice(segmentStart));
+  return segments;
+}
+
+function findTopLevelDelimiterIndex(source, delimiter) {
+  let angleDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "<") {
+      angleDepth += 1;
+      continue;
+    }
+    if (char === ">") {
+      angleDepth = Math.max(0, angleDepth - 1);
+      continue;
+    }
+    if (char === "(") {
+      parenDepth += 1;
+      continue;
+    }
+    if (char === ")") {
+      parenDepth = Math.max(0, parenDepth - 1);
+      continue;
+    }
+    if (char === "[") {
+      bracketDepth += 1;
+      continue;
+    }
+    if (char === "]") {
+      bracketDepth = Math.max(0, bracketDepth - 1);
+      continue;
+    }
+    if (char === "{") {
+      braceDepth += 1;
+      continue;
+    }
+    if (char === "}") {
+      braceDepth = Math.max(0, braceDepth - 1);
+      continue;
+    }
+
+    if (
+      char === delimiter
+      && angleDepth === 0
+      && parenDepth === 0
+      && bracketDepth === 0
+      && braceDepth === 0
+    ) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function findMatchingDelimiter(source, openOffset, openChar, closeChar) {
+  let depth = 0;
+  for (let index = openOffset; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === openChar) {
+      depth += 1;
+      continue;
+    }
+    if (char === closeChar) {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+
+  return -1;
+}
+
+function extractStateType(typeText) {
+  const match = typeText.trim().match(/State\s*<([\s\S]+)>$/);
+  return match ? match[1].trim() : null;
+}
+
+function collapseWhitespace(source) {
+  return source.trim().replace(/\s+/g, " ");
 }
 
 function findRustSetupBlock(source) {
@@ -358,6 +613,7 @@ function skipWhitespace(source, startOffset) {
 module.exports = {
   INLINE_RUST_COMMAND_ID,
   resolveGeneratedServerMirrorPath,
+  resolveInlineRustHandlerHover,
   resolveInlineRustSourcePositionRange,
   resolveInlineRustSourceRange,
   resolveInlineRustView,
