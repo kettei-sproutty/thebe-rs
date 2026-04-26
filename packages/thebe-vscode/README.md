@@ -7,10 +7,12 @@ This package wires Thebe `.trs` files into VS Code with:
 - snippet contributions for routes, components, named slots, and common blocks
 - automatic `thebe-lsp` startup for saved and untitled `.trs` editors
 - command palette, editor title, and editor context menu actions for opening a route's generated `.thebe/client/**` mirror and `.thebe/types/**` props mirror beside the source `.trs` file, reusing Thebe definition results to preserve matching positions when available
-- an `Open Inline Rust View` command that opens the current route's `<script setup>` block as an untitled Rust snapshot with definition/reference jumps back into the source route
+- an `Open Inline Rust View` command that opens the current route's `<script setup>` block inside a generated-route-shaped Rust snapshot with definition/reference jumps back into the source route
 - an `Open Inline TypeScript View` command that opens the current route's `<script lang="ts">` block as a stable provider-backed virtual TypeScript document with definition/reference jumps back into the source route, `Props` type definition jumps into the generated props mirror, built-in TypeScript hover, live refresh from source `.trs` edits, and source-side TypeScript completions plus mapped errors/warnings inside the original `.trs` editor
 
 The inline TypeScript snapshot now comes from `thebe-lsp` first through a `workspace/executeCommand` bridge, with the older extension-local resolver kept only as a compatibility fallback for older servers or startup timing gaps.
+
+The inline Rust snapshot now follows the same pattern: the extension asks `thebe-lsp` for the generated-route-shaped Rust view first and only falls back to the local resolver for older servers or startup races.
 
 Source-side TypeScript completions plus mapped errors and warnings now also come from `thebe-lsp` after startup through an embedded TypeScript bridge that uses VS Code's bundled runtime. The extension keeps the older source-side completion and diagnostics provider only until `client.onReady()` so authoring still works during server bootstrap.
 

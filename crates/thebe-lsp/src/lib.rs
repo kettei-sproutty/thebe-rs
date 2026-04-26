@@ -13,7 +13,8 @@ use thebe_project::{
   ComponentMetadata, ComponentPropMetadata, EditorRefresh, LayoutMetadata, ProjectArtifacts,
   ProjectOverlay, RouteMetadata, SourceSpanMetadata, TemplateBindingMetadata,
   TemplateSymbolMetadata, ThebeDiagnostic, ThebeDiagnosticsFile, ThebeManifest,
-  THEBE_DIAGNOSTICS_FILE, THEBE_MANIFEST_FILE, TYPECHECK_TYPES_DIR,
+  THEBE_DIAGNOSTICS_FILE, THEBE_MANIFEST_FILE, THEBE_SERVER_ROUTES_DIR,
+  TYPECHECK_TYPES_DIR,
 };
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::{
@@ -40,6 +41,7 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{Client, LanguageServer};
 
 const CHANGE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
+const INLINE_RUST_VIEW_COMMAND: &str = "thebe.inlineRustView";
 const INLINE_TYPESCRIPT_VIEW_COMMAND: &str = "thebe.inlineTypeScriptView";
 const INLINE_TYPESCRIPT_MAP_PROTOCOL_DIAGNOSTICS_COMMAND: &str =
   "thebe.mapInlineTypeScriptProtocolDiagnostics";
@@ -261,6 +263,26 @@ struct InlineTypeScriptSnapshot {
   script_end_offset: usize,
   selection_start_offset: usize,
   selection_end_offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InlineRustSnapshot {
+  target_path: String,
+  source_path: String,
+  source_text: String,
+  content: String,
+  prefix_length: usize,
+  script_start_offset: usize,
+  script_end_offset: usize,
+  selection_start_offset: usize,
+  selection_end_offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InlineRustViewResolution {
+  Snapshot(InlineRustSnapshot),
+  NotRoute,
+  NoScript,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,6 +703,7 @@ impl LanguageServer for Backend {
         document_formatting_provider: Some(OneOf::Left(true)),
         execute_command_provider: Some(ExecuteCommandOptions {
           commands: vec![
+            INLINE_RUST_VIEW_COMMAND.to_owned(),
             INLINE_TYPESCRIPT_VIEW_COMMAND.to_owned(),
             INLINE_TYPESCRIPT_MAP_PROTOCOL_DIAGNOSTICS_COMMAND.to_owned(),
           ],
@@ -738,9 +761,27 @@ impl LanguageServer for Backend {
 
   async fn execute_command(&self, params: ExecuteCommandParams) -> LspResult<Option<Value>> {
     match params.command.as_str() {
+      INLINE_RUST_VIEW_COMMAND => {
+        let command_arguments = parse_inline_view_command_arguments(&params.arguments)?;
+        let Some(document) = self.document_context_with_source(
+          &command_arguments.uri,
+          command_arguments.source,
+        ) else {
+          return Ok(Some(inline_rust_view_resolution_value(
+            InlineRustViewResolution::NotRoute,
+          )));
+        };
+
+        Ok(Some(inline_rust_view_resolution_value(
+          resolve_inline_rust_view(
+            &document,
+            command_arguments.selection_start_offset,
+            command_arguments.selection_end_offset,
+          ),
+        )))
+      }
       INLINE_TYPESCRIPT_VIEW_COMMAND => {
-        let command_arguments =
-          parse_inline_typescript_view_command_arguments(&params.arguments)?;
+        let command_arguments = parse_inline_view_command_arguments(&params.arguments)?;
         let Some(document) = self.document_context_with_source(
           &command_arguments.uri,
           command_arguments.source,
@@ -2424,42 +2465,42 @@ fn generated_client_definition_for_script_position(
   file_start_definition(project_root, generated_client_path).map(Some)
 }
 
-fn parse_inline_typescript_view_command_arguments(
+fn parse_inline_view_command_arguments(
   arguments: &[Value],
-) -> std::result::Result<InlineTypeScriptViewCommandArguments, tower_lsp::jsonrpc::Error> {
+) -> std::result::Result<InlineViewCommandArguments, tower_lsp::jsonrpc::Error> {
   let Some(params) = arguments.first().and_then(Value::as_object) else {
     return Err(tower_lsp::jsonrpc::Error::invalid_params(
-      "expected inline TypeScript view arguments",
+      "expected inline view arguments",
     ));
   };
 
   let Some(uri_value) = params.get("uri").and_then(Value::as_str) else {
     return Err(tower_lsp::jsonrpc::Error::invalid_params(
-      "expected inline TypeScript view uri",
+      "expected inline view uri",
     ));
   };
   let uri = Url::parse(uri_value)
-    .map_err(|_| tower_lsp::jsonrpc::Error::invalid_params("invalid inline TypeScript view uri"))?;
+    .map_err(|_| tower_lsp::jsonrpc::Error::invalid_params("invalid inline view uri"))?;
 
-  let selection_start_offset = parse_inline_typescript_view_offset_argument(
+  let selection_start_offset = parse_inline_view_offset_argument(
     params.get("selectionStartOffset"),
     "selectionStartOffset",
   )?;
   let selection_end_offset = match params.get("selectionEndOffset") {
-    Some(value) => parse_inline_typescript_view_offset_argument(Some(value), "selectionEndOffset")?,
+    Some(value) => parse_inline_view_offset_argument(Some(value), "selectionEndOffset")?,
     None => selection_start_offset,
   };
   let source = match params.get("source") {
     Some(Value::String(source)) => Some(source.clone()),
     Some(_) => {
       return Err(tower_lsp::jsonrpc::Error::invalid_params(
-        "expected inline TypeScript view source",
+        "expected inline view source",
       ));
     }
     None => None,
   };
 
-  Ok(InlineTypeScriptViewCommandArguments {
+  Ok(InlineViewCommandArguments {
     uri,
     selection_start_offset,
     selection_end_offset,
@@ -2510,21 +2551,48 @@ fn parse_inline_typescript_protocol_diagnostics_command_arguments(
   })
 }
 
-fn parse_inline_typescript_view_offset_argument(
+fn parse_inline_view_offset_argument(
   value: Option<&Value>,
   name: &str,
 ) -> std::result::Result<usize, tower_lsp::jsonrpc::Error> {
   let Some(value) = value.and_then(Value::as_u64) else {
     return Err(tower_lsp::jsonrpc::Error::invalid_params(format!(
-      "expected inline TypeScript view {name}",
+      "expected inline view {name}",
     )));
   };
 
   usize::try_from(value).map_err(|_| {
     tower_lsp::jsonrpc::Error::invalid_params(format!(
-      "inline TypeScript view {name} is out of range",
+      "inline view {name} is out of range",
     ))
   })
+}
+
+fn inline_rust_view_resolution_value(
+  resolution: InlineRustViewResolution,
+) -> Value {
+  match resolution {
+    InlineRustViewResolution::Snapshot(snapshot) => json!({
+      "ok": true,
+      "targetPath": snapshot.target_path,
+      "sourcePath": snapshot.source_path,
+      "sourceText": snapshot.source_text,
+      "content": snapshot.content,
+      "prefixLength": snapshot.prefix_length,
+      "scriptStartOffset": snapshot.script_start_offset,
+      "scriptEndOffset": snapshot.script_end_offset,
+      "selectionStartOffset": snapshot.selection_start_offset,
+      "selectionEndOffset": snapshot.selection_end_offset,
+    }),
+    InlineRustViewResolution::NotRoute => json!({
+      "ok": false,
+      "reason": "not-route",
+    }),
+    InlineRustViewResolution::NoScript => json!({
+      "ok": false,
+      "reason": "no-script",
+    }),
+  }
 }
 
 fn inline_typescript_view_resolution_value(
@@ -2896,6 +2964,61 @@ fn resolve_inline_typescript_view(
   })
 }
 
+fn resolve_inline_rust_view(
+  document: &DocumentContext,
+  selection_start_offset: usize,
+  selection_end_offset: usize,
+) -> InlineRustViewResolution {
+  let Some(generated_server_path) = generated_route_rust_artifact_path(&document.relative_path)
+  else {
+    return InlineRustViewResolution::NotRoute;
+  };
+
+  let Ok(blocks) = parse_source_blocks(&document.source) else {
+    return InlineRustViewResolution::NoScript;
+  };
+  let Some(script_setup) = blocks.script_setup.as_deref() else {
+    return InlineRustViewResolution::NoScript;
+  };
+  let Some(script_span) = blocks.script_setup_span else {
+    return InlineRustViewResolution::NoScript;
+  };
+
+  let route_path = inline_rust_route_path(&document.relative_path).unwrap_or_else(|| "/".to_owned());
+  let prefix = thebe_codegen::inline_rust_view_source(&route_path, "");
+  let prefix_length = prefix.len();
+
+  InlineRustViewResolution::Snapshot(InlineRustSnapshot {
+    target_path: document
+      .project_root
+      .join(&generated_server_path)
+      .to_string_lossy()
+      .into_owned(),
+    source_path: document
+      .project_root
+      .join(&document.relative_path)
+      .to_string_lossy()
+      .into_owned(),
+    source_text: document.source.clone(),
+    content: thebe_codegen::inline_rust_view_source(&route_path, script_setup),
+    prefix_length,
+    script_start_offset: script_span.start,
+    script_end_offset: script_span.end,
+    selection_start_offset: map_source_offset_to_inline_offset(
+      selection_start_offset,
+      script_span.start,
+      script_span.end,
+      prefix_length,
+    ),
+    selection_end_offset: map_source_offset_to_inline_offset(
+      selection_end_offset,
+      script_span.start,
+      script_span.end,
+      prefix_length,
+    ),
+  })
+}
+
 fn generated_route_typescript_artifact_path(
   relative_path: &str,
   artifact_dir: &str,
@@ -2907,6 +3030,45 @@ fn generated_route_typescript_artifact_path(
     "{artifact_dir}/routes/{}",
     artifact_path.to_string_lossy().replace('\\', "/")
   ))
+}
+
+fn generated_route_rust_artifact_path(relative_path: &str) -> Option<String> {
+  let relative_route_path = route_source_relative_path(relative_path)?;
+  let artifact_path = Path::new(relative_route_path).with_extension("rs");
+
+  Some(format!(
+    "{THEBE_SERVER_ROUTES_DIR}/{}",
+    artifact_path.to_string_lossy().replace('\\', "/")
+  ))
+}
+
+fn inline_rust_route_path(relative_path: &str) -> Option<String> {
+  let relative_route_path = route_source_relative_path(relative_path)?;
+  let relative_route_path = relative_route_path.strip_suffix(".trs")?;
+  let mut segments = Path::new(relative_route_path)
+    .components()
+    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+    .collect::<Vec<_>>();
+
+  if segments.last().is_some_and(|segment| segment == "index") {
+    segments.pop();
+  }
+
+  let segments = segments
+    .into_iter()
+    .filter(|segment| !segment.is_empty())
+    .map(|segment| {
+      segment
+        .strip_prefix('[')
+        .and_then(|segment| segment.strip_suffix(']'))
+        .map_or(segment.clone(), |dynamic| format!("{{{dynamic}}}"))
+    })
+    .collect::<Vec<_>>();
+  if segments.is_empty() {
+    Some("/".to_owned())
+  } else {
+    Some(format!("/{}", segments.join("/")))
+  }
 }
 
 fn inline_typescript_prefix(project_root: &Path, generated_types_path: Option<&str>) -> String {
@@ -3049,7 +3211,7 @@ fn inline_typescript_completion_item_kind(kind: Option<&str>) -> CompletionItemK
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct InlineTypeScriptViewCommandArguments {
+struct InlineViewCommandArguments {
   uri: Url,
   selection_start_offset: usize,
   selection_end_offset: usize,
@@ -7202,6 +7364,57 @@ const props = getProps<Props>();
   }
 
   #[test]
+  fn inline_rust_view_for_document_builds_generated_route_snapshot() {
+    let project = TempProject::new();
+    let source = r#"<script setup>
+#[thebe::get]
+fn handler() -> Props {
+  Props {}
+}
+</script>
+"#;
+    let selection_offset = source.find("handler").expect("handler") + 2;
+
+    project.write("src/routes/counter.trs", source);
+
+    let document = DocumentContext {
+      project_root: project.root.clone(),
+      relative_path: "src/routes/counter.trs".to_owned(),
+      source: source.to_owned(),
+      cached_artifacts: None,
+    };
+
+    let InlineRustViewResolution::Snapshot(snapshot) =
+      resolve_inline_rust_view(&document, selection_offset, selection_offset)
+    else {
+      panic!("expected inline Rust snapshot");
+    };
+
+    assert!(snapshot.target_path.ends_with("/.thebe/server/routes/counter.rs"));
+    assert!(snapshot.content.contains("const __ROUTE_PATH: &str = \"/counter\";"));
+    assert!(snapshot.content.contains("fn handler() -> Props"));
+    assert!(snapshot.content.contains("pub fn router<S>() -> axum::Router<S>"));
+    assert!(snapshot.selection_start_offset > snapshot.content.find("fn handler").unwrap_or(0));
+  }
+
+  #[test]
+  fn inline_rust_view_for_document_normalizes_dynamic_route_paths() {
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/blog/[slug].trs".to_owned(),
+      source: "<script setup>fn handler() {}</script>".to_owned(),
+      cached_artifacts: None,
+    };
+
+    let InlineRustViewResolution::Snapshot(snapshot) = resolve_inline_rust_view(&document, 0, 0)
+    else {
+      panic!("expected inline Rust snapshot");
+    };
+
+    assert!(snapshot.content.contains("const __ROUTE_PATH: &str = \"/blog/{slug}\";"));
+  }
+
+  #[test]
   fn inline_typescript_view_for_document_rejects_layout_routes() {
     let document = DocumentContext {
       project_root: PathBuf::from("/tmp/app"),
@@ -7213,6 +7426,21 @@ const props = getProps<Props>();
     assert_eq!(
       resolve_inline_typescript_view(&document, 0, 0),
       InlineTypeScriptViewResolution::NotRoute,
+    );
+  }
+
+  #[test]
+  fn inline_rust_view_for_document_rejects_layout_routes() {
+    let document = DocumentContext {
+      project_root: PathBuf::from("/tmp/app"),
+      relative_path: "src/routes/_layout.trs".to_owned(),
+      source: "<script setup>fn handler() {}</script>".to_owned(),
+      cached_artifacts: None,
+    };
+
+    assert_eq!(
+      resolve_inline_rust_view(&document, 0, 0),
+      InlineRustViewResolution::NotRoute,
     );
   }
 

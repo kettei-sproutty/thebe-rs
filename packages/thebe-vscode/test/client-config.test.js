@@ -373,8 +373,27 @@ test("inline rust view builds route snapshot from script setup", () => {
     path.join(workspacePath, ".thebe", "server", "routes", "counter.rs"),
   );
   assert.match(view.content, /inline Rust view/);
+  assert.match(view.content, /const __ROUTE_PATH: &str = "\/counter";/);
   assert.match(view.content, /fn handler\(\) -> Props/);
+  assert.match(view.content, /type __ThebeResponse = Result<axum::response::Html<String>, axum::response::Response>;/);
+  assert.match(view.content, /pub fn router<S>\(\) -> axum::Router<S>/);
   assert.ok(view.selectionStartOffset > view.content.indexOf("fn handler"));
+});
+
+test("inline rust view normalizes dynamic route paths inside the wrapper", () => {
+  const workspacePath = path.join("/tmp", "thebe-app");
+  const source = `<script setup>\nfn handler() {}\n</script>\n`;
+
+  const view = resolveInlineRustView({
+    documentPath: path.join(workspacePath, "src", "routes", "blog", "[slug].trs"),
+    workspaceFolders: [workspacePath],
+    source,
+    selectionStartOffset: 0,
+    selectionEndOffset: 0,
+  });
+
+  assert.ok(view.ok);
+  assert.match(view.content, /const __ROUTE_PATH: &str = "\/blog\/\{slug\}";/);
 });
 
 test("inline typescript view falls back to unknown props without generated types", () => {

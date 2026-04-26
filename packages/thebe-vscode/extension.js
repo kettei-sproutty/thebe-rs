@@ -45,6 +45,7 @@ const INLINE_TYPESCRIPT_DIAGNOSTIC_COMMANDS = [
   "semanticDiagnosticsSync",
   "suggestionDiagnosticsSync",
 ];
+const INLINE_RUST_VIEW_LSP_COMMAND_ID = "thebe.inlineRustView";
 const INLINE_TYPESCRIPT_VIEW_LSP_COMMAND_ID = "thebe.inlineTypeScriptView";
 const INLINE_TYPESCRIPT_MAP_PROTOCOL_DIAGNOSTICS_LSP_COMMAND_ID = "thebe.mapInlineTypeScriptProtocolDiagnostics";
 const TYPESCRIPT_TSSERVER_REQUEST_COMMAND_ID = "typescript.tsserverRequest";
@@ -213,12 +214,12 @@ async function openInlineRustView() {
     return;
   }
 
-  const view = resolveInlineRustView({
-    documentPath: editor.document.uri.fsPath,
-    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
-    source: editor.document.getText(),
-    selectionStartOffset: editor.document.offsetAt(editor.selection.start),
-    selectionEndOffset: editor.document.offsetAt(editor.selection.end),
+  const selectionStartOffset = editor.document.offsetAt(editor.selection.start);
+  const selectionEndOffset = editor.document.offsetAt(editor.selection.end);
+  const view = await resolveInlineRustViewForDocument({
+    document: editor.document,
+    selectionStartOffset,
+    selectionEndOffset,
   });
   if (!view.ok) {
     const message = view.reason === "no-script"
@@ -247,6 +248,85 @@ async function openInlineRustView() {
   } catch {
     void vscode.window.showErrorMessage("Unable to open the inline Rust snapshot for this route.");
   }
+}
+
+async function resolveInlineRustViewForDocument({
+  document,
+  selectionStartOffset = 0,
+  selectionEndOffset = selectionStartOffset,
+}) {
+  if (!document || document.languageId !== "thebe" || document.uri.scheme !== "file") {
+    return null;
+  }
+
+  const serverView = await requestInlineRustViewFromServer({
+    document,
+    selectionStartOffset,
+    selectionEndOffset,
+  });
+  if (serverView) {
+    return serverView;
+  }
+
+  return resolveInlineRustView({
+    documentPath: document.uri.fsPath,
+    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+    source: document.getText(),
+    selectionStartOffset,
+    selectionEndOffset,
+  });
+}
+
+async function requestInlineRustViewFromServer({
+  document,
+  selectionStartOffset,
+  selectionEndOffset,
+}) {
+  if (!client) {
+    return null;
+  }
+
+  try {
+    await client.onReady();
+    const response = await client.sendRequest("workspace/executeCommand", {
+      command: INLINE_RUST_VIEW_LSP_COMMAND_ID,
+      arguments: [{
+        uri: document.uri.toString(),
+        source: document.getText(),
+        selectionStartOffset,
+        selectionEndOffset,
+      }],
+    });
+    return normalizeInlineRustView(response);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeInlineRustView(response) {
+  if (!response || typeof response !== "object" || typeof response.ok !== "boolean") {
+    return null;
+  }
+
+  if (!response.ok) {
+    return typeof response.reason === "string" ? response : null;
+  }
+
+  if (
+    typeof response.targetPath !== "string"
+    || typeof response.sourcePath !== "string"
+    || typeof response.sourceText !== "string"
+    || typeof response.content !== "string"
+    || typeof response.prefixLength !== "number"
+    || typeof response.scriptStartOffset !== "number"
+    || typeof response.scriptEndOffset !== "number"
+    || typeof response.selectionStartOffset !== "number"
+    || typeof response.selectionEndOffset !== "number"
+  ) {
+    return null;
+  }
+
+  return response;
 }
 
 async function openInlineTypeScriptView() {
